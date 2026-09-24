@@ -3,7 +3,8 @@
 Danbooru tag lookup MCP server (Go). With no arguments it serves 4 tools over
 stdio (`search_tags` / `get_tag_info` / `get_related_tags` / `search_posts`) to
 help local AI image generation pick correct Danbooru tags; it is also a
-self-updatable CLI (`upgrade` / `version` subcommands). No README, no CI.
+self-updatable CLI (`upgrade` / `version` subcommands). User-facing docs live
+in `README.md`; agent-facing conventions live here.
 
 ## Language convention (important)
 
@@ -19,6 +20,8 @@ make build                          # dev build (ldflags injects Bootstrap=off, 
 make build-dist                     # release build (bootstrap on)
 make run ARGS="version"             # build and run a subcommand
 make release                        # portable zip + checksums.txt -> dist/ (for GitHub Releases)
+make installer                      # NSIS setup exe -> dist/danbooru-tag-mcp-windows-<arch>-setup.exe
+make dist-all                       # both release assets (current GOARCH)
 go vet ./...                        # static check
 make test / make test-race          # tests / race detector
 ```
@@ -83,14 +86,28 @@ must always append `rating:general`.
 - Credentials come from `DANBOORU_LOGIN` / `DANBOORU_API_KEY` env vars; when
   unset the client is anonymous (rate and content limits apply).
 - Release: push a `v*` tag and `.github/workflows/release.yml` runs tests,
-  builds amd64+arm64 portable zips via `make release`, generates
-  `checksums.txt`, and publishes the GitHub Release (with `install.ps1` as an
-  asset). Release notes come from a `## [x.y.z]` section in `CHANGELOG.md`
-  when present, otherwise auto-generated. `make` targets accept `VERSION=`
-  and `GOARCH=` overrides, which is how the workflow pins them.
-- Install: `install.ps1` (PowerShell 5.1+). **Keep script strings ASCII-only** —
-  under `iwr | iex` the body is decoded with the host's default code page; a
-  UTF-8 BOM breaks parsing on PowerShell 5.1.
+  builds amd64+arm64 NSIS setup exes via `make installer` and portable zips
+  via `make release`, generates `checksums.txt` (zips only), and publishes
+  the GitHub Release (with `install.ps1` as an asset). Release notes come
+  from a `## [x.y.z]` section in `CHANGELOG.md` when present, otherwise
+  auto-generated. `make` targets accept `VERSION=` and `GOARCH=` overrides,
+  which is how the workflow pins them.
+- Install: two routes kept in sync — `install.ps1` (PowerShell 5.1+) and the
+  NSIS installer `installer/danbooru-tag-mcp.nsi` (`make installer`; CI
+  installs NSIS via `choco install nsis` because choco does not refresh the
+  job PATH, the workflow adds `C:\Program Files (x86)\NSIS` explicitly).
+  Both install per-user to `%LOCALAPPDATA%\Programs\danbooru-tag-mcp` (no
+  UAC) and share the install-dir registry value
+  `HKCU\Software\danbooru-tag-mcp\InstallDir`, so they reuse each other's
+  directory. PATH registration is delegated to the exe itself: the installer
+  runs `danbooru-tag-mcp.exe version` once (nsExec, no console flash) to
+  trigger the startup bootstrap. The NSIS stub is x86 and runs under
+  emulation on ARM64 while dropping the native arch exe. The uninstaller
+  removes files, Start Menu shortcut, and both registry keys — it does NOT
+  touch the user PATH (same behavior as jvm).
+  **Keep script strings ASCII-only** — under `iwr | iex` the install.ps1 body
+  is decoded with the host's default code page; a UTF-8 BOM breaks parsing on
+  PowerShell 5.1.
 - Test style: api layer uses `httptest.Server`; service layer uses mock
   structs implementing `TagFetcher`; api tests use `WithReqGap(0)` to disable
   real throttling; pure logic is extracted into private functions taking
