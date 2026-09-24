@@ -16,9 +16,14 @@ type Tag struct {
 	PostCount int    `json:"post_count"`
 }
 
+// RelatedTag is one co-occurring tag from /related_tag.json, with the
+// similarity metrics Danbooru reports for the pair.
 type RelatedTag struct {
-	Tag     string `json:"tag"`
-	Overlap int    `json:"overlap"`
+	Tag        string  `json:"tag"`
+	Category   int     `json:"category"`   // 0=general, 1=artist, 3=copyright, 4=character, 5=meta
+	PostCount  int     `json:"post_count"` // total posts carrying this related tag
+	Similarity float64 `json:"similarity"` // cosine similarity to the query tag (0-1)
+	Frequency  float64 `json:"frequency"`  // share of query-tag posts that also carry this tag (0-1)
 }
 
 type Post struct {
@@ -78,9 +83,26 @@ func (s *TagService) Info(ctx context.Context, name string) (*Tag, error) {
 	return &tags[0], nil
 }
 
+// danbooruRelatedTag is the nested tag object inside a related_tags entry.
+type danbooruRelatedTag struct {
+	Name      string `json:"name"`
+	Category  int    `json:"category"`
+	PostCount int    `json:"post_count"`
+}
+
+// danbooruRelatedEntry is one element of the related_tags array. Danbooru
+// revamped /related_tag.json around 2024: entries stopped being [name, count]
+// pairs and became objects with the tag nested under "tag" plus similarity
+// metrics (cosine_similarity, frequency, ...).
+type danbooruRelatedEntry struct {
+	Tag        danbooruRelatedTag `json:"tag"`
+	Similarity float64            `json:"cosine_similarity"`
+	Frequency  float64            `json:"frequency"`
+}
+
 type danbooruRelatedResponse struct {
-	Query       string              `json:"query"`
-	RelatedTags [][]json.RawMessage `json:"related_tags"`
+	Query       string                 `json:"query"`
+	RelatedTags []danbooruRelatedEntry `json:"related_tags"`
 }
 
 func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]RelatedTag, error) {
@@ -96,19 +118,19 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]Rela
 	}
 
 	var results []RelatedTag
-	for _, pair := range resp.RelatedTags {
-		if len(pair) < 2 {
+	for _, entry := range resp.RelatedTags {
+		// The API lists the query tag itself first (similarity 1.0); skip it
+		// so the limit is spent on actual co-occurring tags.
+		if entry.Tag.Name == resp.Query {
 			continue
 		}
-		var tagName string
-		var overlap int
-		if err := json.Unmarshal(pair[0], &tagName); err != nil {
-			continue
-		}
-		if err := json.Unmarshal(pair[1], &overlap); err != nil {
-			continue
-		}
-		results = append(results, RelatedTag{Tag: tagName, Overlap: overlap})
+		results = append(results, RelatedTag{
+			Tag:        entry.Tag.Name,
+			Category:   entry.Tag.Category,
+			PostCount:  entry.Tag.PostCount,
+			Similarity: entry.Similarity,
+			Frequency:  entry.Frequency,
+		})
 	}
 
 	if limit > 0 && len(results) > limit {
@@ -117,16 +139,52 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]Rela
 	return results, nil
 }
 
-// SearchPosts core business rule: force safe content by appending rating:general
+// hasRatingMetatag reports whether the caller already pinned a rating filter
+// (e.g. "rating:g") so SearchPosts does not override their choice.
+func hasRatingMetatag(tags string) bool {
+	for _, field := range strings.Fields(tags) {
+		if strings.HasPrefix(field, "rating:") {
+			return true
+		}
+	}
+	return false
+}
+
+// maxContentTags caps content tags per post search: free/anonymous Danbooru
+// accounts allow 2 tags per query (Gold unlocks 6).
+const maxContentTags = 2
+
+// countContentTags counts fields that count toward Danbooru's per-account
+// tag limit: content tags (no ':') plus order: metatags. Other metatags
+// (rating:, status:, id:, ...) are exempt — verified empirically against
+// danbooru.donmai.us, which 422s on "a b order:count" but not on
+// "a b status:any" for anonymous accounts.
+func countContentTags(tags string) int {
+	count := 0
+	for _, field := range strings.Fields(tags) {
+		if !strings.Contains(field, ":") || strings.HasPrefix(field, "order:") {
+			count++
+		}
+	}
+	return count
+}
+
+// SearchPosts core business rule: default to rating:explicit (R-18 allowed);
+// a rating:<x> metatag supplied by the caller is kept as-is.
 func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int) ([]Post, error) {
-	safeTags := strings.TrimSpace(tags)
-	if safeTags == "" {
-		safeTags = "rating:general"
-	} else {
-		safeTags = fmt.Sprintf("%s rating:general", safeTags)
+	query := strings.TrimSpace(tags)
+	if n := countContentTags(query); n > maxContentTags {
+		return nil, fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query", n, maxContentTags)
+	}
+	if !hasRatingMetatag(query) {
+		if query == "" {
+			query = "rating:explicit"
+		} else {
+			query = fmt.Sprintf("%s rating:explicit", query)
+		}
 	}
 
-	body, err := s.fetcher.FetchPosts(ctx, safeTags, limit)
+	body, err := s.fetcher.FetchPosts(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}

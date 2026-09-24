@@ -91,10 +91,10 @@ var (
 	)
 
 	SearchPostsTool = mcp.NewTool("search_posts",
-		mcp.WithDescription("Search posts by tag combination (safe content only)"),
+		mcp.WithDescription("Search posts by tag combination. Defaults to rating:explicit (R-18); pass your own rating metatag (rating:g / rating:s / rating:q / rating:e) in tags to override. Ratings: g=General (all-ages SFW), s=Sensitive (swimwear/underwear, borderline), q=Questionable (suggestive nudity), e=Explicit (R-18). At most 2 tags per query for free accounts, counting content tags and order: metatags (rating: and other metatags do not count); more is rejected with an error."),
 		mcp.WithString("tags",
 			mcp.Required(),
-			mcp.Description("space-separated tags"),
+			mcp.Description("space-separated tags; a rating:g/s/q/e metatag overrides the default rating:explicit"),
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("max posts to return (default: 5)"),

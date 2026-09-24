@@ -64,14 +64,45 @@ func TestInfo_NotFound(t *testing.T) {
 	}
 }
 
+func TestRelated_ParsesCurrentApiFormat(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: []byte(`{
+			"query": "blue_hair",
+			"post_count": 1207874,
+			"tag": {"id": 10953, "name": "blue_hair", "post_count": 1207874, "category": 0},
+			"related_tags": [
+				{"tag": {"name": "blue_hair", "post_count": 1207874, "category": 0}, "cosine_similarity": 1.0, "frequency": 1.0},
+				{"tag": {"name": "highres", "post_count": 8211186, "category": 5}, "cosine_similarity": 0.261, "frequency": 0.6828}
+			],
+			"wiki_page_tags": [{"name": "aqua_hair", "post_count": 179981, "category": 0}]
+		}`),
+	}
+	svc := NewTagService(mock)
+
+	rel, err := svc.Related(context.Background(), "blue_hair", 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(rel) != 1 {
+		t.Fatalf("expected 1 related tag (query tag itself skipped), got %d", len(rel))
+	}
+	if rel[0].Tag != "highres" || rel[0].Category != 5 || rel[0].PostCount != 8211186 {
+		t.Errorf("unexpected tag fields: %+v", rel[0])
+	}
+	if rel[0].Similarity != 0.261 || rel[0].Frequency != 0.6828 {
+		t.Errorf("unexpected similarity metrics: %+v", rel[0])
+	}
+}
+
 func TestRelated_TruncatesToLimit(t *testing.T) {
 	mock := &mockFetcher{
 		relatedResp: []byte(`{
 			"query": "solo",
 			"related_tags": [
-				["solo", 1000],
-				["1girl", 900],
-				["looking_at_viewer", 800]
+				{"tag": {"name": "solo", "post_count": 1000, "category": 0}, "cosine_similarity": 1.0, "frequency": 1.0},
+				{"tag": {"name": "1girl", "post_count": 900, "category": 0}, "cosine_similarity": 0.9, "frequency": 0.8},
+				{"tag": {"name": "looking_at_viewer", "post_count": 800, "category": 0}, "cosine_similarity": 0.8, "frequency": 0.7},
+				{"tag": {"name": "smile", "post_count": 700, "category": 0}, "cosine_similarity": 0.7, "frequency": 0.6}
 			]
 		}`),
 	}
@@ -84,14 +115,14 @@ func TestRelated_TruncatesToLimit(t *testing.T) {
 	if len(rel) != 2 {
 		t.Fatalf("expected 2 tags truncated by limit, got %d", len(rel))
 	}
-	if rel[0].Tag != "solo" || rel[1].Tag != "1girl" {
+	if rel[0].Tag != "1girl" || rel[1].Tag != "looking_at_viewer" {
 		t.Errorf("unexpected content: %+v", rel)
 	}
 }
 
-func TestSearchPosts_AppendsRatingSafe(t *testing.T) {
+func TestSearchPosts_DefaultsToExplicitRating(t *testing.T) {
 	mock := &mockFetcher{
-		postsResp: []byte(`[{"id":100,"rating":"g","preview_file_url":"https://danbooru.donmai.us/sample.jpg"}]`),
+		postsResp: []byte(`[{"id":100,"rating":"e","preview_file_url":"https://danbooru.donmai.us/sample.jpg"}]`),
 	}
 	svc := NewTagService(mock)
 
@@ -100,10 +131,63 @@ func TestSearchPosts_AppendsRatingSafe(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	if !strings.Contains(mock.lastPostsArg, "rating:general") {
-		t.Errorf("expected tags to include rating:general, got: %s", mock.lastPostsArg)
+	if !strings.Contains(mock.lastPostsArg, "rating:explicit") {
+		t.Errorf("expected tags to include rating:explicit, got: %s", mock.lastPostsArg)
 	}
-	if len(posts) != 1 || posts[0].ID != 100 || posts[0].Rating != "g" {
+	if len(posts) != 1 || posts[0].ID != 100 || posts[0].Rating != "e" {
 		t.Errorf("parsed post mismatch: %+v", posts)
+	}
+}
+
+func TestSearchPosts_RejectsTooManyContentTags(t *testing.T) {
+	mock := &mockFetcher{postsResp: []byte(`[]`)}
+	svc := NewTagService(mock)
+
+	_, err := svc.SearchPosts(context.Background(), "1girl blue_hair long_hair", 5)
+	if err == nil || !strings.Contains(err.Error(), "too many content tags") {
+		t.Fatalf("expected too-many-tags error, got: %v", err)
+	}
+	if mock.lastPostsArg != "" {
+		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
+	}
+}
+
+func TestSearchPosts_MetatagCounting(t *testing.T) {
+	mock := &mockFetcher{
+		postsResp: []byte(`[{"id":101,"rating":"e","preview_file_url":""}]`),
+	}
+	svc := NewTagService(mock)
+
+	// rating:/status: are exempt from the limit; the query below is 2 content tags.
+	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair status:any", 5); err != nil {
+		t.Fatalf("unexpected error for exempt metatag: %v", err)
+	}
+	if !strings.Contains(mock.lastPostsArg, "status:any") {
+		t.Errorf("metatag must be passed through, got: %s", mock.lastPostsArg)
+	}
+
+	// order: counts toward the limit; 2 content tags + order: must be rejected locally.
+	mock.lastPostsArg = ""
+	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair order:count", 5); err == nil {
+		t.Fatalf("expected too-many-tags error for order: metatag, got nil")
+	}
+	if mock.lastPostsArg != "" {
+		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
+	}
+}
+
+func TestSearchPosts_KeepsCallerRating(t *testing.T) {
+	mock := &mockFetcher{postsResp: []byte(`[]`)}
+	svc := NewTagService(mock)
+
+	if _, err := svc.SearchPosts(context.Background(), "cat_ears rating:general", 5); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if strings.Contains(mock.lastPostsArg, "rating:explicit") {
+		t.Errorf("caller rating must not be overridden, got: %s", mock.lastPostsArg)
+	}
+	if !strings.Contains(mock.lastPostsArg, "rating:general") {
+		t.Errorf("caller rating must be kept, got: %s", mock.lastPostsArg)
 	}
 }
