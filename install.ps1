@@ -1,0 +1,241 @@
+#requires -Version 5.1
+<#
+.SYNOPSIS
+    danbooru-tag-mcp one-line installer (PowerShell).
+.DESCRIPTION
+    Downloads the latest Release's portable zip, verifies SHA256, extracts to a
+    user directory, and runs danbooru-tag-mcp.exe once to trigger its built-in
+    self-bootstrap (registers the install directory in the user PATH).
+    Behavior mirrors internal/upgrade's conventions (checksums.txt, .bak).
+
+    NOTE: Script output is intentionally English. Under `iwr | iex` the response
+    body is decoded by the host's default code page; a UTF-8 BOM would be treated
+    as content bytes and break parsing on PowerShell 5.1. Keeping the file BOM-less
+    with ASCII-only string literals makes `iwr -useb <url> | iex` work everywhere.
+
+    Usage:
+      One-line install (all defaults):
+        iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/install.ps1" | iex
+      Local with params:
+        .\install.ps1 -InstallDir "D:\tools\danbooru-tag-mcp"
+
+    Environment variables:
+      DANBOORU_MCP_INSTALLER_MIRROR  Download URL prefix override (trailing slash optional).
+                                     Useful for a mirror / self-hosted source.
+                                     Defaults to the GitHub Release feed.
+      HTTPS_PROXY / HTTP_PROXY       Honored natively by Invoke-WebRequest.
+#>
+[CmdletBinding()]
+param(
+    [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\danbooru-tag-mcp')
+)
+
+# Force TLS 1.2 (old systems may default to TLS 1.0 only).
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocol]::Tls12
+} catch {
+    # PS 7+ uses HttpClient and ignores this setting.
+}
+
+$ErrorActionPreference = 'Stop'
+
+# -----------------------------------------------------------------------------
+# Colored output helpers.
+# -----------------------------------------------------------------------------
+function Write-Info { param([string]$Msg) Write-Host $Msg -ForegroundColor Cyan }
+function Write-Ok   { param([string]$Msg) Write-Host $Msg -ForegroundColor Green }
+function Write-Warn { param([string]$Msg) Write-Host $Msg -ForegroundColor Yellow }
+function Write-Err  { param([string]$Msg) Write-Host $Msg -ForegroundColor Red }
+
+# -----------------------------------------------------------------------------
+# Download a URL to a local file (PS 5.1 compatible; -UseBasicParsing avoids
+# the IE engine dependency).
+# -----------------------------------------------------------------------------
+function Save-Url {
+    param([string]$Url, [string]$Destination)
+    Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -ErrorAction Stop
+}
+
+# -----------------------------------------------------------------------------
+# Parse GNU coreutils sha256sum text, supporting both formats:
+#   "<hash>  <filename>"  text mode   (two spaces, no asterisk)
+#   "<hash> *<filename>"  binary mode (one space + leading asterisk)
+# Mirrors internal/upgrade parseChecksum exactly.
+# Returns the lowercase hex hash, or $null if not found.
+# -----------------------------------------------------------------------------
+function Get-ExpectedChecksum {
+    param([string]$ChecksumText, [string]$Filename)
+    foreach ($line in ($ChecksumText -split "`n")) {
+        $line = $line.Trim()
+        if (-not $line) { continue }
+        $fields = $line -split '\s+'
+        if ($fields.Count -ne 2) { continue }
+        $hash = $fields[0]
+        $name = $fields[1] -replace '^\*', ''
+        if ($name -eq $Filename) { return $hash.ToLower() }
+    }
+    return $null
+}
+
+# =============================================================================
+# Main flow
+# =============================================================================
+try {
+    Write-Info '==> danbooru-tag-mcp installer'
+
+    # ---- 1. Environment check ------------------------------------------------
+    if (-not [System.Environment]::Is64BitOperatingSystem) {
+        throw 'This system is not 64-bit Windows. danbooru-tag-mcp supports Windows x64 / ARM64 only.'
+    }
+
+    # Detect the OS CPU arch to pick the matching asset (amd64 / arm64).
+    # RuntimeInformation.OSArchitecture reports the real OS arch even from an
+    # emulated x64 process on ARM64 Windows; PROCESSOR_ARCHITECTURE (which an
+    # emulated process sees as AMD64/x86) is only the fallback for old .NET.
+    $osArch = $null
+    try {
+        $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    } catch {
+        $osArch = $env:PROCESSOR_ARCHITECTURE
+    }
+    switch -Regex ($osArch) {
+        '^(X64|AMD64)$'   { $assetArch = 'amd64' }
+        '^(Arm64|ARM64)$' { $assetArch = 'arm64' }
+        default { throw "Unsupported CPU architecture: $osArch. danbooru-tag-mcp supports Windows x64 / ARM64 only." }
+    }
+
+    # ---- 2. Resolve download source ------------------------------------------
+    $base = if ($env:DANBOORU_MCP_INSTALLER_MIRROR) { $env:DANBOORU_MCP_INSTALLER_MIRROR.TrimEnd('/') + '/' } else { 'https://github.com/BaixuanZhu/danbooru-tag-mcp/releases/latest/download/' }
+    $exeName = 'danbooru-tag-mcp.exe'
+    $zipName = "danbooru-tag-mcp-windows-$assetArch.zip"
+    $checksumName = 'checksums.txt'
+    $zipUrl = $base + $zipName
+    $checksumUrl = $base + $checksumName
+    Write-Info "Source: $base"
+    Write-Info "Arch:   $assetArch (OS: $osArch)"
+
+    # ---- 3. Prepare working directory ----------------------------------------
+    $workDir = Join-Path $env:TEMP ("danbooru-mcp-install-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $workDir -Force | Out-Null
+    $zipPath = Join-Path $workDir $zipName
+    $checksumPath = Join-Path $workDir $checksumName
+
+    try {
+        # ---- 4. Download the zip ---------------------------------------------
+        Write-Info "Downloading $zipName ..."
+        Save-Url -Url $zipUrl -Destination $zipPath
+        Write-Ok "Downloaded: $zipPath"
+
+        # ---- 5. Verify SHA256 (shares checksums.txt with `upgrade`) ----------
+        $expected = $null
+        $hasChecksum = $false
+        try {
+            Save-Url -Url $checksumUrl -Destination $checksumPath
+            $checksumText = Get-Content -Path $checksumPath -Raw
+            $expected = Get-ExpectedChecksum -ChecksumText $checksumText -Filename $zipName
+            $hasChecksum = $true
+        } catch {
+            # Release has no checksums.txt (old version / mirror missing): warn but continue,
+            # matching upgrade.go's backward-compatible behavior.
+            Write-Warn "Could not fetch $checksumName; skipping SHA256 verification."
+        }
+
+        if ($hasChecksum) {
+            if (-not $expected) {
+                throw "No entry for $zipName in $checksumName; aborting verification."
+            }
+            $actual = (Get-FileHash -Algorithm SHA256 -Path $zipPath).Hash.ToLower()
+            Write-Info "Expected SHA256: $expected"
+            Write-Info "Actual   SHA256: $actual"
+            if ($actual -ne $expected) {
+                throw 'SHA256 verification failed; the download may be corrupted or tampered with. Aborting.'
+            }
+            Write-Ok 'SHA256 verified'
+        }
+
+        # ---- 6. Install dir + handle existing exe (upgrade scenario) ---------
+        Write-Info "Install dir: $InstallDir"
+        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+        $exePath = Join-Path $InstallDir $exeName
+        if (Test-Path $exePath) {
+            # A running exe cannot be overwritten but can be renamed (mirrors
+            # internal/upgrade replaceExeAt's .bak strategy). The MCP server may
+            # still be running under the old exe; that is fine.
+            $bak = Join-Path $InstallDir "$exeName.bak"
+            if (Test-Path $bak) { Remove-Item $bak -Force }
+            try {
+                Rename-Item -Path $exePath -NewName "$exeName.bak" -Force
+                Write-Warn "Existing $exeName found; backed up as $exeName.bak."
+            } catch {
+                throw "Cannot replace the existing $exeName (it may be running): $($_.Exception.Message). Stop the MCP server and retry."
+            }
+        }
+
+        # ---- 7. Extract the exe from the zip (single file, ExtractToFile) ----
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        try {
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+            try {
+                $entry = $archive.Entries | Where-Object { $_.Name -eq $exeName } | Select-Object -First 1
+                if (-not $entry) {
+                    throw "$exeName not found inside the zip; the package is malformed."
+                }
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $exePath, $true)
+            } finally {
+                $archive.Dispose()
+            }
+        } catch {
+            throw "Extraction failed: $($_.Exception.Message)"
+        }
+        Write-Ok "Extracted: $exePath"
+
+        # ---- 8. Record install location (HKCU\Software\danbooru-tag-mcp) -----
+        # Informational only: bootstrap derives its dir via os.Executable(),
+        # the key documents the chosen location for later manual reinstalls.
+        try {
+            New-Item -Path 'HKCU:\Software\danbooru-tag-mcp' -Force | Out-Null
+            Set-ItemProperty -Path 'HKCU:\Software\danbooru-tag-mcp' -Name 'InstallDir' -Value $InstallDir
+        } catch {
+            Write-Warn "Failed to write HKCU\Software\danbooru-tag-mcp\InstallDir (non-fatal): $($_.Exception.Message)"
+        }
+
+        # ---- 9. Run the exe once to trigger self-bootstrap (user PATH) -------
+        # Equivalent of main's startup bootstrap, executed with the freshly
+        # extracted binary so the install dir lands in PATH immediately.
+        Write-Info 'Triggering bootstrap (user PATH registration) ...'
+        $versionLine = $null
+        try {
+            $versionOutput = & $exePath version 2>&1 | Out-String
+            $versionLine = ($versionOutput -split "`n" | Where-Object { $_ -match '\S' } | Select-Object -First 1)
+        } catch {
+            # Bootstrap failure does not roll back the extracted exe; the user
+            # can manually run the exe once to diagnose.
+            Write-Warn "First run failed (PATH registration may be incomplete): $($_.Exception.Message)"
+        }
+
+        # ---- 10. Done --------------------------------------------------------
+        Write-Ok ''
+        Write-Ok 'Installation complete.'
+        if ($versionLine) { Write-Ok "   version: $($versionLine.Trim())" }
+        Write-Ok "   path:    $exePath"
+        Write-Info ''
+        Write-Info 'Next steps:'
+        Write-Info '  1. Open a new terminal (so the PATH change takes effect)'
+        Write-Info "  2. Register the MCP server with the bare command name: { ""command"": ""danbooru-tag-mcp"", ""args"": [] }"
+        Write-Info '  3. Optional Danbooru credentials: set DANBOORU_LOGIN / DANBOORU_API_KEY'
+        Write-Info ''
+        Write-Info "Upgrade later: danbooru-tag-mcp upgrade"
+        Write-Info "Uninstall: delete the install dir, then remove it from the user PATH if desired."
+    } finally {
+        # Clean up the temp dir (on both success and failure).
+        if (Test-Path $workDir) {
+            Remove-Item -Path $workDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+} catch {
+    # Friendly message + rethrow so `.\install.ps1` exits non-zero.
+    # Under `iwr | iex`, throw does not close the session, it just prints the error record.
+    Write-Err ''
+    Write-Err "Installation failed: $($_.Exception.Message)"
+    throw
+}

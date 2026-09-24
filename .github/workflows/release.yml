@@ -1,0 +1,108 @@
+# Build and publish on tag push (v0.1.0): produces portable zips for both
+# architectures and publishes a GitHub Release.
+# Artifacts (amd64 / arm64):
+#   danbooru-tag-mcp-windows-amd64.zip   portable zip (fetched by `upgrade` self-update)
+#   danbooru-tag-mcp-windows-arm64.zip   ARM64 portable zip (fetched by ARM64 self-update)
+#   checksums.txt                        sha256sum manifest shared by upgrade and install.ps1
+#   install.ps1                          one-line PowerShell installer (stable URL on main)
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write  # softprops/action-gh-release needs this to create the release and upload assets
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+
+      - name: go test (pre-release unit test gate)
+        # Red tests fail the job and block the release. Publishing is an
+        # irreversible outward-facing action and this project is security
+        # sensitive (downloads binaries, writes PATH/registry, self-updates),
+        # so confirm the suite is green before publishing.
+        run: go test ./...
+
+      - name: Derive version from tag
+        id: ver
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build danbooru-tag-mcp.exe (amd64 + arm64)
+        # Both arches built sequentially into dist/amd64/ and dist/arm64/.
+        # build-dist is the release flavor (startup bootstrap on); make build
+        # is the dev flavor with bootstrap off.
+        run: |
+          make build-dist VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
+          make build-dist VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
+
+      - name: Build portable zip (amd64 + arm64)
+        # windows-latest ships with zip support, so make release works directly
+        run: |
+          make release VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
+          make release VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
+
+      - name: Generate checksum
+        # GNU coreutils sha256sum format checksums.txt, shared by `upgrade`
+        # self-update and install.ps1 for download integrity verification
+        shell: bash
+        run: |
+          cd dist
+          sha256sum danbooru-tag-mcp-windows-amd64.zip danbooru-tag-mcp-windows-arm64.zip > checksums.txt
+          echo "--- checksums.txt ---"
+          cat checksums.txt
+
+      - name: Extract release notes from CHANGELOG.md
+        # Pulls the section matching the current tag from CHANGELOG.md as the
+        # release body; falls back to auto-generated notes when the file is
+        # missing or has no matching section.
+        id: notes
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "current version: $VERSION"
+          BODY=""
+          if [ -f CHANGELOG.md ]; then
+            # awk: print the section starting at "## [$VERSION]" up to the next "## ["
+            BODY=$(awk -v v="$VERSION" '
+              $0 ~ "^## \\[" v "\\]" {found=1; next}
+              found && /^## \[/ {exit}
+              found {print}
+            ' CHANGELOG.md)
+          fi
+          if [ -n "$BODY" ]; then
+            {
+              echo "RELEASE_BODY<<EOF"
+              echo "$BODY"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+            echo "use_changelog=true" >> "$GITHUB_OUTPUT"
+            echo "--- release notes extracted from CHANGELOG.md ---"
+            echo "$BODY"
+          else
+            echo "no [$VERSION] section in CHANGELOG.md, falling back to auto-generated notes"
+            echo "use_changelog=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release and upload assets
+        uses: softprops/action-gh-release@v3
+        with:
+          body: ${{ env.RELEASE_BODY }}
+          generate_release_notes: ${{ steps.notes.outputs.use_changelog != 'true' }}
+          files: |
+            dist/danbooru-tag-mcp-windows-amd64.zip
+            dist/danbooru-tag-mcp-windows-arm64.zip
+            dist/checksums.txt
+            install.ps1
