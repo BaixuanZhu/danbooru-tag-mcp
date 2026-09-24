@@ -59,10 +59,18 @@ layers are decoupled via interfaces for mock-based unit tests:
 zero-config client compatibility); `upgrade` / `version` / `help` are CLI
 mode, where writing to stdout is allowed.
 
-**NSFW filtering boundary (test-enforced, do not break)**: the api layer's
+**Rating filter boundary (test-enforced, do not break)**: the api layer's
 `FetchPosts` must NOT inject a rating filter (see
 `TestFetchPosts_DoesNotAddRatingFilter`); the service layer's `SearchPosts`
-must always append `rating:general`.
+defaults to `rating:explicit` (R-18 allowed — a deliberate product choice for
+local image generation) and appends it only when the caller's tags contain no
+`rating:` metatag, so callers can override the rating per query. The
+`search_posts` tool description documents the default and the g/s/q/e ladder
+so MCP clients know the rule without extra configuration. `SearchPosts` also
+pre-validates the tag count locally (max 2; content tags and `order:`
+metatags count, `rating:`/`status:`/`id:` style metatags are exempt —
+verified empirically) so over-limit queries fail with a clear error instead
+of a Danbooru 422.
 
 ## Key conventions and gotchas
 

@@ -9,10 +9,10 @@ composing prompts, which noticeably improves tag accuracy in generated images.
 ## Features
 
 - **4 MCP tools**: tag search, exact tag info, related (co-occurring) tags, and post search
-- **SFW by default**: `search_posts` always appends `rating:general`, so image results stay general-rated
+- **R-18 by default**: `search_posts` defaults to `rating:explicit`; pass your own `rating:g/s/q/e` metatag to narrow a query
 - **Self-updating**: `danbooru-tag-mcp upgrade` checks GitHub Releases, verifies SHA256 and replaces the binary atomically
 - **Zero-config install**: per-user installer (setup wizard or one-line PowerShell) that registers the install directory into the user PATH automatically
-- **Polite API usage**: requests are throttled to one per 1.5 seconds; anonymous access works, credentials raise the limits
+- **Polite API usage**: requests are throttled to one per 1.5 seconds; anonymous access works, credentials raise the limits (free/anonymous post searches are still capped at 2 content tags per query)
 
 ## Install
 
@@ -70,7 +70,7 @@ alternatively use the full exe path.
 | `search_tags` | Search tags by keyword, ordered by post count | `query` (required, e.g. `blue hair`), `limit` (default 10) |
 | `get_tag_info` | Exact info for one tag (aliases, category, counts) | `name` (required, e.g. `blue_hair`) |
 | `get_related_tags` | Tags that co-occur with the given tag | `tag` (required), `limit` (default 10) |
-| `search_posts` | Search posts by a tag combination (general rating only) | `tags` (required, space-separated), `limit` (default 5) |
+| `search_posts` | Search posts by a tag combination (defaults to `rating:explicit`; a `rating:` metatag overrides it) | `tags` (required, space-separated), `limit` (default 5) |
 
 ## CLI
 
@@ -83,10 +83,15 @@ danbooru-tag-mcp help       show help
 
 ## Environment variables
 
-| Variable | Purpose |
-|----------|---------|
-| `DANBOORU_LOGIN` / `DANBOORU_API_KEY` | Danbooru API credentials (optional; without them the client is anonymous and Danbooru applies lower rate/content limits) |
-| `DANBOORU_MCP_NO_BOOTSTRAP` | Skip the startup PATH registration when non-empty |
+- `DANBOORU_LOGIN` — your Danbooru account name (the login you use on the
+  site). Optional.
+- `DANBOORU_API_KEY` — your Danbooru API key, generated from the API key
+  section of your Danbooru profile. Optional. When both `DANBOORU_LOGIN` and
+  `DANBOORU_API_KEY` are set, every request is sent authenticated with your
+  account (higher rate limits and content access); otherwise the client is
+  anonymous and Danbooru applies lower limits.
+- `DANBOORU_MCP_NO_BOOTSTRAP` — skip the startup PATH registration when
+  non-empty.
 
 ## Building from source
 
