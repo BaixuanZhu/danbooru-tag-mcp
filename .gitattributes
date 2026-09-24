@@ -1,0 +1,21 @@
+# Normalize line endings to LF in both the repo and the working tree.
+# core.autocrlf=true on Windows caused phantom "modified" files in git
+# status and CRLF breakage in shell scripts run through Git Bash (local
+# and CI windows runners report "$'\r': command not found"); forcing LF
+# removes the whole class of problems.
+* text=auto eol=lf
+
+# Explicit declarations for the main text types
+*.go     text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.sh     text eol=lf
+*.nsi    text eol=lf
+*.ps1    text eol=lf
+Makefile text eol=lf
+
+# Binaries / build artifacts: never convert
+*.exe  binary
+*.zip  binary

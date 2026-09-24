@@ -102,6 +102,7 @@ Requires Go 1.26+ and GNU Make (bundled with Git Bash):
 
 ```bash
 make test        # unit tests
+make integration # online smoke test against the live Danbooru API (~1 min)
 make build       # dev build -> dist/<arch>/ (bootstrap disabled)
 make release     # portable zip + checksums.txt
 make installer   # NSIS setup exe (requires makensis: scoop install nsis)

@@ -110,6 +110,16 @@ test:
 test-race:
 	$(GO) test -race ./...
 
+# ---- Online integration smoke (live Danbooru API, anonymous, ~1 min) ----
+# Calls every MCP tool once over stdio and asserts response shapes; this is
+# the canary for upstream API drift (fixture tests cannot catch it). The
+# script exports DANBOORU_MCP_NO_BOOTSTRAP=1 itself, so the test binary
+# never touches the user PATH or registry.
+.PHONY: integration
+integration: build
+	@echo "[integration] online smoke against the live Danbooru API..."
+	@bash scripts/integration-test.sh $(TARGET)
+
 # ---- Help ----
 .PHONY: help
 help:
@@ -126,3 +136,4 @@ help:
 	@echo "  make vet                      static check"
 	@echo "  make test                     run unit tests"
 	@echo "  make test-race                run unit tests with -race detector"
+	@echo "  make integration              online smoke: every tool once against live Danbooru"

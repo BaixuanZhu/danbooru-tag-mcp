@@ -1,0 +1,51 @@
+# CI: unit tests on every push/PR; the online smoke (live Danbooru API) runs
+# only on the weekly schedule or manual dispatch — external network can be
+# flaky and Danbooru may throttle GitHub runner IPs, so it never sits in the
+# release-blocking path (release.yml keeps running unit tests only).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 3 * * 1' # weekly, Monday 03:00 UTC
+  workflow_dispatch: # manual trigger (also runs the online smoke)
+
+jobs:
+  unit-test:
+    name: Unit tests (every push/PR)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - name: go test -race
+        run: go test -race ./...
+      - name: go build
+        run: go build ./...
+
+  online-smoke:
+    name: Online smoke (schedule + manual only)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    env:
+      # Never let the test binary write the runner PATH or registry
+      DANBOORU_MCP_NO_BOOTSTRAP: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+      - name: Build dev binary (bootstrap off)
+        run: make build
+      - name: Run online smoke against live Danbooru
+        shell: bash
+        run: bash scripts/integration-test.sh

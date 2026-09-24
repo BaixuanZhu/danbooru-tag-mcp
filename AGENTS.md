@@ -25,6 +25,7 @@ make installer                      # NSIS setup exe -> dist/danbooru-tag-mcp-wi
 make dist-all                       # both release assets (current GOARCH)
 go vet ./...                        # static check
 make test / make test-race          # tests / race detector
+make integration                # online smoke: all 6 tools once against live Danbooru
 ```
 
 Smoke test (verifies MCP handshake and tool listing):
@@ -94,6 +95,15 @@ of a Danbooru 422.
   run` temp binary). Prevents ephemeral paths from being written into user PATH.
 - Credentials come from `DANBOORU_LOGIN` / `DANBOORU_API_KEY` env vars; when
   unset the client is anonymous (rate and content limits apply).
+- **CI** (`.github/workflows/ci.yml`): unit tests run on every push/PR; the
+  online smoke (`make integration` / `scripts/integration-test.sh` — all 6
+  tools called once against the live API, anonymous, PATH-isolated via
+  `DANBOORU_MCP_NO_BOOTSTRAP`) runs only on the weekly schedule or manual
+  dispatch, never in the release path. It is the canary for upstream API
+  drift (the 2024 related_tag.json revamp broke parsing while unit tests
+  stayed green). The repo pins LF line endings via `.gitattributes`
+  (shell scripts break under Git Bash / CI windows runners when autocrlf
+  converts them to CRLF).
 - Release: push a `v*` tag and `.github/workflows/release.yml` runs tests,
   builds amd64+arm64 NSIS setup exes via `make installer` and portable zips
   via `make release`, generates `checksums.txt` (zips only), and publishes
