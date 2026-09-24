@@ -10,10 +10,14 @@ type mockFetcher struct {
 	tagsResp    []byte
 	exactResp   []byte
 	relatedResp []byte
+	aliasResp   []byte
+	wikiResp    []byte
 	postsResp   []byte
 
-	lastTagsArg  string
-	lastPostsArg string
+	lastTagsArg   string
+	lastWikiTitle string
+	lastWikiOther string
+	lastPostsArg  string
 }
 
 func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool) ([]byte, error) {
@@ -27,6 +31,16 @@ func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) ([]byte, e
 
 func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
 	return m.relatedResp, nil
+}
+
+func (m *mockFetcher) FetchAlias(ctx context.Context, name string) ([]byte, error) {
+	return m.aliasResp, nil
+}
+
+func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error) {
+	m.lastWikiTitle = title
+	m.lastWikiOther = otherNames
+	return m.wikiResp, nil
 }
 
 func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
@@ -117,6 +131,87 @@ func TestRelated_TruncatesToLimit(t *testing.T) {
 	}
 	if rel[0].Tag != "1girl" || rel[1].Tag != "looking_at_viewer" {
 		t.Errorf("unexpected content: %+v", rel)
+	}
+}
+
+func TestAlias_ParsesMapping(t *testing.T) {
+	mock := &mockFetcher{
+		aliasResp: []byte(`[{"id":7315,"antecedent_name":"sailor_suit","consequent_name":"sailor","status":"active"}]`),
+	}
+	svc := NewTagService(mock)
+
+	alias, err := svc.Alias(context.Background(), "sailor suit")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if alias == nil || alias.Antecedent != "sailor_suit" || alias.Consequent != "sailor" {
+		t.Fatalf("unexpected alias: %+v", alias)
+	}
+}
+
+func TestAlias_NoActiveAliasReturnsNull(t *testing.T) {
+	mock := &mockFetcher{aliasResp: []byte(`[]`)}
+	svc := NewTagService(mock)
+
+	alias, err := svc.Alias(context.Background(), "blue_hair")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if alias != nil {
+		t.Fatalf("expected nil alias for canonical input, got: %+v", alias)
+	}
+}
+
+func TestWiki_ExtractsLinkedTags(t *testing.T) {
+	mock := &mockFetcher{
+		wikiResp: []byte(`[{
+			"id": 118420,
+			"title": "firefly_(honkai:_star_rail)",
+			"body": "Firefly is a character from [[Honkai: Star Rail]].\n\n=== Appearance ===\n* [[grey_hair]]\n* [[cyan_eyes|cyan eyes]]\n* [[grey_hair]]",
+			"other_names": ["ホタル (崩壊:スターレイル)", "流萤 (崩坏:星穹铁道)"],
+			"is_deleted": false
+		}]`),
+	}
+	svc := NewTagService(mock)
+
+	pages, err := svc.Wiki(context.Background(), "firefly_(honkai:_star_rail)", "", 5)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(pages) != 1 {
+		t.Fatalf("expected 1 page, got %d", len(pages))
+	}
+	p := pages[0]
+	if p.Title != "firefly_(honkai:_star_rail)" {
+		t.Errorf("unexpected title: %s", p.Title)
+	}
+	if len(p.OtherNames) != 2 || p.OtherNames[1] != "流萤 (崩坏:星穹铁道)" {
+		t.Errorf("unexpected other_names: %+v", p.OtherNames)
+	}
+	// Deduplicated, pipe display text stripped, order of first appearance kept.
+	want := []string{"Honkai: Star Rail", "grey_hair", "cyan_eyes"}
+	if len(p.LinkedTags) != len(want) {
+		t.Fatalf("expected linked tags %v, got %v", want, p.LinkedTags)
+	}
+	for i, tag := range want {
+		if p.LinkedTags[i] != tag {
+			t.Errorf("linked tag %d: expected %s, got %s", i, tag, p.LinkedTags[i])
+		}
+	}
+	if mock.lastWikiTitle != "firefly_(honkai:_star_rail)" || mock.lastWikiOther != "" {
+		t.Errorf("title mode must pass the title only, got title=%q other=%q", mock.lastWikiTitle, mock.lastWikiOther)
+	}
+}
+
+func TestWiki_OtherNamesMode(t *testing.T) {
+	mock := &mockFetcher{wikiResp: []byte(`[]`)}
+	svc := NewTagService(mock)
+
+	if _, err := svc.Wiki(context.Background(), "", "流萤", 5); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastWikiTitle != "" || mock.lastWikiOther != "流萤" {
+		t.Errorf("other-names mode must pass the alias only, got title=%q other=%q", mock.lastWikiTitle, mock.lastWikiOther)
 	}
 }
 

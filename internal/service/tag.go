@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 )
 
@@ -26,6 +27,22 @@ type RelatedTag struct {
 	Frequency  float64 `json:"frequency"`  // share of query-tag posts that also carry this tag (0-1)
 }
 
+// TagAlias maps a user-typed alias (antecedent) to the canonical Danbooru tag
+// (consequent) it was merged into.
+type TagAlias struct {
+	Antecedent string `json:"antecedent"`
+	Consequent string `json:"consequent"`
+}
+
+// WikiPage is a Danbooru wiki entry for a tag, with the [[tag]] links
+// extracted from the DText body (appearance traits, related concepts).
+type WikiPage struct {
+	Title      string   `json:"title"`
+	Body       string   `json:"body"`
+	OtherNames []string `json:"other_names"`
+	LinkedTags []string `json:"linked_tags"`
+}
+
 type Post struct {
 	ID         int    `json:"id"`
 	Rating     string `json:"rating"`
@@ -37,6 +54,8 @@ type TagFetcher interface {
 	FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool) ([]byte, error)
 	FetchTagExact(ctx context.Context, name string) ([]byte, error)
 	FetchRelated(ctx context.Context, tag string) ([]byte, error)
+	FetchAlias(ctx context.Context, name string) ([]byte, error)
+	FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error)
 	FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error)
 }
 
@@ -137,6 +156,93 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]Rela
 		results = results[:limit]
 	}
 	return results, nil
+}
+
+// Alias resolves a user-typed alias to its canonical Danbooru tag via
+// /tag_aliases.json. Returns nil when no active alias exists, meaning the
+// input is likely already canonical.
+func (s *TagService) Alias(ctx context.Context, name string) (*TagAlias, error) {
+	cleanName := normalizeTag(name)
+	body, err := s.fetcher.FetchAlias(ctx, cleanName)
+	if err != nil {
+		return nil, err
+	}
+
+	var aliases []danbooruAliasResponse
+	if err := json.Unmarshal(body, &aliases); err != nil {
+		return nil, fmt.Errorf("failed to parse tag alias response: %w", err)
+	}
+	if len(aliases) == 0 {
+		return nil, nil
+	}
+	return &TagAlias{Antecedent: aliases[0].AntecedentName, Consequent: aliases[0].ConsequentName}, nil
+}
+
+type danbooruAliasResponse struct {
+	AntecedentName string `json:"antecedent_name"`
+	ConsequentName string `json:"consequent_name"`
+	Status         string `json:"status"`
+}
+
+type danbooruWikiResponse struct {
+	Title      string   `json:"title"`
+	Body       string   `json:"body"`
+	OtherNames []string `json:"other_names"`
+	IsDeleted  bool     `json:"is_deleted"`
+}
+
+// Wiki fetches wiki pages by exact title, or by multilingual other-names
+// substring when title is empty. The DText [[tag]] links of each body are
+// extracted into LinkedTags for direct prompt assembly.
+func (s *TagService) Wiki(ctx context.Context, title, otherNames string, limit int) ([]WikiPage, error) {
+	cleanTitle := normalizeTag(title)
+	cleanOther := ""
+	if cleanTitle == "" {
+		cleanOther = strings.TrimSpace(otherNames)
+	}
+
+	body, err := s.fetcher.FetchWiki(ctx, cleanTitle, cleanOther, limit)
+	if err != nil {
+		return nil, err
+	}
+
+	var pages []danbooruWikiResponse
+	if err := json.Unmarshal(body, &pages); err != nil {
+		return nil, fmt.Errorf("failed to parse wiki response: %w", err)
+	}
+
+	results := make([]WikiPage, 0, len(pages))
+	for _, p := range pages {
+		if p.OtherNames == nil {
+			p.OtherNames = []string{}
+		}
+		results = append(results, WikiPage{
+			Title:      p.Title,
+			Body:       p.Body,
+			OtherNames: p.OtherNames,
+			LinkedTags: extractLinkedTags(p.Body),
+		})
+	}
+	return results, nil
+}
+
+// wikiLinkRe matches DText links: [[tag_name]] or [[tag_name|display text]].
+var wikiLinkRe = regexp.MustCompile(`\[\[([^\]|]+)(?:\|[^\]]*)?\]\]`)
+
+// extractLinkedTags returns the unique [[tag]] link targets of a DText body,
+// in order of first appearance.
+func extractLinkedTags(body string) []string {
+	seen := make(map[string]bool)
+	var tags []string
+	for _, m := range wikiLinkRe.FindAllStringSubmatch(body, -1) {
+		name := strings.TrimSpace(m[1])
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		tags = append(tags, name)
+	}
+	return tags
 }
 
 // hasRatingMetatag reports whether the caller already pinned a rating filter

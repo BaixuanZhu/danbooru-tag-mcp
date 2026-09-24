@@ -156,6 +156,32 @@ func (c *Client) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
 	return c.Get(ctx, "/related_tag.json", q)
 }
 
+// FetchAlias looks up active tag aliases whose antecedent matches name exactly.
+func (c *Client) FetchAlias(ctx context.Context, name string) ([]byte, error) {
+	q := make(url.Values)
+	q.Set("search[antecedent_name]", name)
+	q.Set("search[status]", "active")
+	q.Set("limit", "1")
+	return c.Get(ctx, "/tag_aliases.json", q)
+}
+
+// FetchWiki queries wiki pages by exact title, or by substring match on the
+// multilingual other_names list when title is empty. Deleted pages are
+// excluded either way.
+func (c *Client) FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error) {
+	q := make(url.Values)
+	if title != "" {
+		q.Set("search[title]", title)
+	} else {
+		q.Set("search[other_names_match]", "*"+otherNames+"*")
+	}
+	q.Set("search[is_deleted]", "false")
+	if limit > 0 {
+		q.Set("limit", strconv.Itoa(limit))
+	}
+	return c.Get(ctx, "/wiki_pages.json", q)
+}
+
 // FetchPosts sends tags as-is; NSFW filtering is injected by the service layer.
 func (c *Client) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
 	q := make(url.Values)

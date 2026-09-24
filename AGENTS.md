@@ -1,7 +1,8 @@
 # AGENTS.md
 
-Danbooru tag lookup MCP server (Go). With no arguments it serves 4 tools over
-stdio (`search_tags` / `get_tag_info` / `get_related_tags` / `search_posts`) to
+Danbooru tag lookup MCP server (Go). With no arguments it serves 6 tools over
+stdio (`search_tags` / `get_tag_info` / `get_related_tags` / `get_tag_alias` /
+`get_tag_wiki` / `search_posts`) to
 help local AI image generation pick correct Danbooru tags; it is also a
 self-updatable CLI (`upgrade` / `version` subcommands). User-facing docs live
 in `README.md`; agent-facing conventions live here.

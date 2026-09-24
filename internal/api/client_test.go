@@ -153,6 +153,63 @@ func TestFetchTagExact_ReturnsSingle(t *testing.T) {
 	}
 }
 
+func TestFetchAlias_BuildsCorrectURL(t *testing.T) {
+	var gotName, gotStatus, gotLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotName = r.URL.Query().Get("search[antecedent_name]")
+		gotStatus = r.URL.Query().Get("search[status]")
+		gotLimit = r.URL.Query().Get("limit")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(srv.URL)
+	_, err := cli.FetchAlias(context.Background(), "sailor_suit")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotName != "sailor_suit" || gotStatus != "active" || gotLimit != "1" {
+		t.Errorf("unexpected query params: name=%s, status=%s, limit=%s", gotName, gotStatus, gotLimit)
+	}
+}
+
+func TestFetchWiki_BuildsCorrectURL(t *testing.T) {
+	cases := []struct {
+		name                 string
+		title, otherNames    string
+		wantTitle, wantOther string
+	}{
+		{"by title", "firefly_(honkai:_star_rail)", "", "firefly_(honkai:_star_rail)", ""},
+		{"by other names", "", "流萤", "", "*流萤*"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotTitle, gotOther, gotDeleted, gotLimit string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotTitle = r.URL.Query().Get("search[title]")
+				gotOther = r.URL.Query().Get("search[other_names_match]")
+				gotDeleted = r.URL.Query().Get("search[is_deleted]")
+				gotLimit = r.URL.Query().Get("limit")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`[]`))
+			}))
+			defer srv.Close()
+
+			cli := newTestClient(srv.URL)
+			if _, err := cli.FetchWiki(context.Background(), tc.title, tc.otherNames, 5); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotTitle != tc.wantTitle || gotOther != tc.wantOther {
+				t.Errorf("unexpected query: title=%q other=%q", gotTitle, gotOther)
+			}
+			if gotDeleted != "false" || gotLimit != "5" {
+				t.Errorf("unexpected is_deleted=%q limit=%q", gotDeleted, gotLimit)
+			}
+		})
+	}
+}
+
 func TestFetchPosts_DoesNotAddRatingFilter(t *testing.T) {
 	var gotTags string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

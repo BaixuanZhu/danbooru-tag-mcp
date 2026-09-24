@@ -16,6 +16,8 @@ type TagService interface {
 	Search(ctx context.Context, query string, limit int) ([]service.Tag, error)
 	Info(ctx context.Context, name string) (*service.Tag, error)
 	Related(ctx context.Context, tag string, limit int) ([]service.RelatedTag, error)
+	Alias(ctx context.Context, name string) (*service.TagAlias, error)
+	Wiki(ctx context.Context, title, otherNames string, limit int) ([]service.WikiPage, error)
 	SearchPosts(ctx context.Context, tags string, limit int) ([]service.Post, error)
 }
 
@@ -90,6 +92,27 @@ var (
 		),
 	)
 
+	GetTagAliasTool = mcp.NewTool("get_tag_alias",
+		mcp.WithDescription("Resolve a tag alias, abbreviation or common misspelling to its canonical Danbooru tag. Returns alias: null when the input has no active alias, meaning it is likely already canonical; use the consequent tag in prompts when an alias is returned."),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("alias or candidate tag, e.g. 'sailor_suit'"),
+		),
+	)
+
+	GetTagWikiTool = mcp.NewTool("get_tag_wiki",
+		mcp.WithDescription("Get the Danbooru wiki page of a tag: description, DText body, multilingual other_names, and linked_tags (the [[tag]] links extracted from the body, typically the character's appearance traits). Pass either title (exact canonical tag) or other_names (substring match on multilingual aliases, e.g. a Chinese or Japanese character name)."),
+		mcp.WithString("title",
+			mcp.Description("exact wiki title, i.e. the canonical tag, e.g. 'firefly_(honkai:_star_rail)'"),
+		),
+		mcp.WithString("other_names",
+			mcp.Description("multilingual alias substring, e.g. '流萤' or 'ホタル'; matched with wildcards"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("max pages to return when searching by other_names (default: 5)"),
+		),
+	)
+
 	SearchPostsTool = mcp.NewTool("search_posts",
 		mcp.WithDescription("Search posts by tag combination. Defaults to rating:explicit (R-18); pass your own rating metatag (rating:g / rating:s / rating:q / rating:e) in tags to override. Ratings: g=General (all-ages SFW), s=Sensitive (swimwear/underwear, borderline), q=Questionable (suggestive nudity), e=Explicit (R-18). At most 2 tags per query for free accounts, counting content tags and order: metatags (rating: and other metatags do not count); more is rejected with an error."),
 		mcp.WithString("tags",
@@ -150,7 +173,39 @@ func Register(s *server.MCPServer, svc TagService) {
 		return jsonResult(map[string]any{"related": related})
 	})
 
-	// tool 4: search_posts
+	// tool 4: get_tag_alias
+	s.AddTool(GetTagAliasTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, _ := req.Params.Arguments.(map[string]any)
+		name := getStringArg(args, "name")
+		if name == "" {
+			return mcp.NewToolResultText(errResp("alias_failed", "name parameter is required")), nil
+		}
+
+		alias, err := svc.Alias(ctx, name)
+		if err != nil {
+			return mcp.NewToolResultText(errResp("alias_failed", err.Error())), nil
+		}
+		return jsonResult(map[string]any{"alias": alias})
+	})
+
+	// tool 5: get_tag_wiki
+	s.AddTool(GetTagWikiTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, _ := req.Params.Arguments.(map[string]any)
+		title := getStringArg(args, "title")
+		otherNames := getStringArg(args, "other_names")
+		if title == "" && otherNames == "" {
+			return mcp.NewToolResultText(errResp("wiki_failed", "title or other_names parameter is required")), nil
+		}
+		limit := getIntArg(args, "limit", 5)
+
+		pages, err := svc.Wiki(ctx, title, otherNames, limit)
+		if err != nil {
+			return mcp.NewToolResultText(errResp("wiki_failed", err.Error())), nil
+		}
+		return jsonResult(map[string]any{"wiki_pages": pages})
+	})
+
+	// tool 6: search_posts
 	s.AddTool(SearchPostsTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args, _ := req.Params.Arguments.(map[string]any)
 		tags := getStringArg(args, "tags")
