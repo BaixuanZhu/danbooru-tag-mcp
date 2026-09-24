@@ -108,6 +108,8 @@ Commands:
   help             Show this help
 
 Install:
+  Double-click installer (GitHub Release page):
+    danbooru-tag-mcp-windows-<arch>-setup.exe   (per-user setup wizard)
   PowerShell one-liner (installs to %LOCALAPPDATA%\Programs\danbooru-tag-mcp by default,
   use -InstallDir for another directory; registers the user PATH automatically):
     iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/install.ps1" | iex

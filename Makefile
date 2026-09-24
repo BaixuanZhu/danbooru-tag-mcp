@@ -64,6 +64,23 @@ release: build-dist
 	@echo "[release] $(DIST)/$(BINARY)-windows-$(GOARCH).zip + checksums.txt"
 	@echo "          Upload to the GitHub Release (tag: v$(VERSION)); `upgrade` self-update then works"
 
+# ---- NSIS installer (requires makensis on PATH: scoop install nsis / choco install nsis) ----
+# Output: dist/danbooru-tag-mcp-windows-$(GOARCH)-setup.exe (double-click setup
+# wizard; upload alongside the portable zip on the GitHub Release). The
+# installer stub is x86 and runs under emulation on ARM64, while dropping the
+# native $(GOARCH) exe. The /D flags are not POSIX paths, so MSYS_NO_PATHCONV=1
+# stops Git Bash / MSYS from mangling them.
+.PHONY: installer
+installer: build-dist
+	@echo "[installer] building setup exe (v$(VERSION), $(GOARCH))..."
+	@MSYS_NO_PATHCONV=1 makensis /DAPP_VERSION=$(VERSION) /DAPP_ARCH=$(GOARCH) installer/danbooru-tag-mcp.nsi
+	@echo "[ok]   $(DIST)/$(BINARY)-windows-$(GOARCH)-setup.exe"
+
+# ---- One-shot: build all release assets for the current GOARCH ----
+.PHONY: dist-all
+dist-all: installer release
+	@echo "[dist-all] setup exe + portable zip ready under $(DIST)/ (windows/$(GOARCH))"
+
 # ---- Clean ----
 .PHONY: clean
 clean:
@@ -101,6 +118,8 @@ help:
 	@echo "  make build-dist               release-flavor build (bootstrap on)"
 	@echo "  make run ARGS=\"version\"        dev build and run (GOARCH=arm64 for ARM64 cross build)"
 	@echo "  make release                  build portable zip + checksums.txt -> $(DIST)/"
+	@echo "  make installer                build NSIS setup exe -> $(DIST)/$(BINARY)-windows-<arch>-setup.exe"
+	@echo "  make dist-all                 build both release assets (current GOARCH)"
 	@echo "  make clean                    remove $(DIST)/"
 	@echo "  make tidy                     go mod tidy"
 	@echo "  make fmt                      format code"

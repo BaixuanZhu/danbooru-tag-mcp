@@ -1,10 +1,11 @@
-# Build and publish on tag push (v0.1.0): produces portable zips for both
-# architectures and publishes a GitHub Release.
+# Build and publish on tag push (v0.1.0): produces the double-click NSIS
+# setup exes and portable zips for both architectures and publishes a GitHub
+# Release.
 # Artifacts (amd64 / arm64):
-#   danbooru-tag-mcp-windows-amd64.zip   portable zip (fetched by `upgrade` self-update)
-#   danbooru-tag-mcp-windows-arm64.zip   ARM64 portable zip (fetched by ARM64 self-update)
-#   checksums.txt                        sha256sum manifest shared by upgrade and install.ps1
-#   install.ps1                          one-line PowerShell installer (stable URL on main)
+#   danbooru-tag-mcp-windows-<arch>-setup.exe   double-click installer (for new users)
+#   danbooru-tag-mcp-windows-<arch>.zip         portable zip (fetched by `upgrade` self-update)
+#   checksums.txt                               sha256sum manifest shared by upgrade and install.ps1
+#   install.ps1                                 one-line PowerShell installer (stable URL on main)
 
 name: release
 
@@ -47,6 +48,33 @@ jobs:
         run: |
           make build-dist VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
           make build-dist VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
+
+      - name: Install NSIS
+        shell: pwsh
+        # choco installs NSIS into C:\Program Files (x86)\NSIS but does not
+        # refresh the current job's PATH, so a later plain "makensis" call
+        # would fail with command not found. makensis.exe sits directly in
+        # that directory (no version subdirectory), so add it explicitly.
+        run: |
+          choco install nsis -y --no-progress
+          $nsisDir = 'C:\Program Files (x86)\NSIS'
+          if (-not (Test-Path "$nsisDir\makensis.exe")) {
+            throw "makensis.exe not found under $nsisDir"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $nsisDir
+          Write-Host "Added to GITHUB_PATH: $nsisDir"
+
+      - name: Verify makensis
+        # Fail here with a clear error instead of buried inside make
+        shell: pwsh
+        run: makensis /VERSION
+
+      - name: Build installer (amd64 + arm64)
+        # Each invocation rebuilds its arch's exe (build-dist dependency) and
+        # packs it into dist/danbooru-tag-mcp-windows-<arch>-setup.exe
+        run: |
+          make installer VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
+          make installer VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
 
       - name: Build portable zip (amd64 + arm64)
         # windows-latest ships with zip support, so make release works directly
@@ -102,6 +130,8 @@ jobs:
           body: ${{ env.RELEASE_BODY }}
           generate_release_notes: ${{ steps.notes.outputs.use_changelog != 'true' }}
           files: |
+            dist/danbooru-tag-mcp-windows-amd64-setup.exe
+            dist/danbooru-tag-mcp-windows-arm64-setup.exe
             dist/danbooru-tag-mcp-windows-amd64.zip
             dist/danbooru-tag-mcp-windows-arm64.zip
             dist/checksums.txt
