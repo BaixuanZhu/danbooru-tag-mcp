@@ -51,10 +51,12 @@ layers are decoupled via interfaces for mock-based unit tests:
   `TagService` interface. Tool instances (`SearchTagsTool` etc.) are
   package-level exported vars and `register_test.go` statically validates
   their schemas — changing tool definitions requires updating those tests.
-- **internal/vocab/**: WD14 tagger vocabularies as go:embed'd pinned CSV
-  snapshots (see the paragraph on tagger-era detection below); leaf package
-  with no dependencies, nil `*Store` answers miss so callers can run
-  unenriched.
+- **internal/vocab/**: WD14 tagger vocabularies as a plugin directory —
+  every `data/*.csv` is go:embed'd as one vocabulary whose id is the file
+  name minus the extension; adding, updating or removing a vocabulary is a
+  data change only (provenance and rules in `internal/vocab/data/README.md`).
+  Leaf package with no dependencies; nil `*Store` answers miss so callers
+  can run unenriched.
 - **internal/app/**: `Version` (ldflags injected), `Fail`, `UserAgent`, and
   the bootstrap switch (`BootstrapEnabled`).
 - **internal/env/**: user PATH injection (registry `HKCU\Environment` +
@@ -91,10 +93,11 @@ integration script.
 
 **Tagger-era detection (WD14 layer, test-enforced, do not break)**:
 `internal/vocab` embeds the WD14 tagger vocabularies (`wd-v1-4-moat-tagger-v2`
-and `wd-eva02-large-tagger-v3`, provenance in `internal/vocab/data/README.md`)
-as immutable snapshots — the whole value is historical lookup, so they are
+and `wd-eva02-large-tagger-v3`) as immutable snapshots loaded from the plugin
+directory `data/*.csv` — the whole value is historical lookup, so they are
 never refreshed; re-pinning is deliberate and trips
-`TestDefault_PinnedSnapshots`. CSV `category` uses Danbooru numbering plus
+`TestDefault_PinnedSnapshots`, while `TestDefault_PluginDirectoryIsTheRegistry`
+pins the load-exactly-what's-in-data contract. CSV `category` uses Danbooru numbering plus
 **9 = the tagger's rating buckets** (`general`/`sensitive`/...), which are
 tagger output columns, not Danbooru tags. `get_tag_info` attaches a `wd14`
 verdict computed locally (available even when the API call fails): `live`

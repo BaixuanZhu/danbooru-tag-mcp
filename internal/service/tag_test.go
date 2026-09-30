@@ -142,7 +142,7 @@ func TestWD14Info_TaggerEraVsUnknown(t *testing.T) {
 
 	era := svc.WD14Info("barefoot_sandals")
 	if era.Status != wd14TaggerEra || len(era.Sources) != 1 ||
-		era.Sources[0].Vocab != vocab.MoatV2 || era.Sources[0].Count != 931 {
+		era.Sources[0].Vocab != "wd-v1-4-moat-tagger-v2" || era.Sources[0].Count != 931 {
 		t.Errorf("expected tagger_era with the v2 snapshot (931), got: %+v", era)
 	}
 

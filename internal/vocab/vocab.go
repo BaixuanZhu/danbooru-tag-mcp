@@ -1,30 +1,33 @@
-// Package vocab embeds pinned snapshots of the WD14 tagger vocabularies
-// (SmilingWolf's selected_tags.csv) and answers exact and substring lookups
-// against them. Those vocabularies are the tag universes of the taggers that
-// captioned most LoRA training data: a name present here but absent from
-// current Danbooru is a tagger-era name (likely renamed since), not a
-// made-up word. See data/README.md for provenance.
+// Package vocab embeds the WD14 tagger vocabularies (SmilingWolf's
+// selected_tags.csv) and answers exact and substring lookups against them.
+// Those vocabularies are the tag universes of the taggers that captioned
+// most LoRA training data: a name present here but absent from current
+// Danbooru is a tagger-era name (likely renamed since), not a made-up word.
+//
+// data/ is the plugin directory: every *.csv dropped there becomes a
+// vocabulary whose id is the file name minus the extension (e.g.
+// wd-eva02-large-tagger-v3.csv -> "wd-eva02-large-tagger-v3"). Adding,
+// updating or removing a vocabulary is a data/ change only — there are no
+// vocabulary-specific code touch points. Provenance and re-pinning rules
+// live in data/README.md; the pinned snapshot counts in vocab_test.go trip
+// on any data change.
 package vocab
 
 import (
-	_ "embed"
+	"embed"
+	"fmt"
+	"io/fs"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-//go:embed data/wd-v1-4-moat-tagger-v2.csv
-var moatV2CSV []byte
-
-//go:embed data/wd-eva02-large-tagger-v3.csv
-var eva02V3CSV []byte
-
-// Vocabulary identifiers, identical to the Hugging Face dataset names.
-const (
-	MoatV2  = "wd-v1-4-moat-tagger-v2"
-	Eva02V3 = "wd-eva02-large-tagger-v3"
-)
+// vocabFS holds the plugin directory described in the package comment.
+//
+//go:embed data/*.csv
+var vocabFS embed.FS
 
 // Source is one vocabulary's snapshot record of a tag name.
 type Source struct {
@@ -50,15 +53,33 @@ type VocabData struct {
 type Store struct {
 	byName map[string]*Hit
 	names  []string // all names, sorted, for substring scans
+	vocabs []string // ids of the loaded vocabularies, in load order
+}
+
+// Vocabs returns the ids of the loaded vocabularies, in load order. A nil
+// Store answers nil.
+func (s *Store) Vocabs() []string {
+	if s == nil {
+		return nil
+	}
+	return s.vocabs
 }
 
 // NewStore parses and merges CSV payloads in "tag_id,name,category,count"
 // format (header row skipped). A name carried by several vocabularies gets
-// one Source per vocabulary, in the order the vocabularies were given.
+// one Source per vocabulary, in the order the vocabularies were given. It
+// panics on a vocabulary that yields no parseable records — a broken plugin
+// — which is fail-fast by design: the test suite exercises Default(), so CI
+// catches it before any release.
 func NewStore(vocabs ...VocabData) *Store {
 	s := &Store{byName: make(map[string]*Hit, 11000)}
 	for _, v := range vocabs {
-		for _, rec := range parseCSV(v.CSV) {
+		recs := parseCSV(v.CSV)
+		if len(recs) == 0 {
+			panic(fmt.Sprintf("vocab: vocabulary %q yielded no parseable records", v.Name))
+		}
+		s.vocabs = append(s.vocabs, v.Name)
+		for _, rec := range recs {
 			name := normalizeName(rec.name)
 			if name == "" {
 				continue
@@ -180,14 +201,29 @@ var (
 	defaultStore *Store
 )
 
-// Default is the store over both embedded snapshots, parsed on first use so
-// CLI subcommands (version, upgrade) never pay the parse cost.
+// Default is the store over every vocabulary in the plugin directory,
+// parsed on first use so CLI subcommands (version, upgrade) never pay the
+// parse cost. Files are loaded in sorted path order, which makes the
+// per-hit Sources order deterministic.
 func Default() *Store {
 	defaultOnce.Do(func() {
-		defaultStore = NewStore(
-			VocabData{Name: MoatV2, CSV: moatV2CSV},
-			VocabData{Name: Eva02V3, CSV: eva02V3CSV},
-		)
+		paths, err := fs.Glob(vocabFS, "data/*.csv")
+		if err != nil {
+			panic(fmt.Sprintf("vocab: glob data/*.csv: %v", err))
+		}
+		sort.Strings(paths)
+		vocabs := make([]VocabData, 0, len(paths))
+		for _, p := range paths {
+			data, err := vocabFS.ReadFile(p)
+			if err != nil {
+				panic(fmt.Sprintf("vocab: read %s: %v", p, err))
+			}
+			vocabs = append(vocabs, VocabData{
+				Name: strings.TrimSuffix(filepath.Base(p), ".csv"),
+				CSV:  data,
+			})
+		}
+		defaultStore = NewStore(vocabs...)
 	})
 	return defaultStore
 }
