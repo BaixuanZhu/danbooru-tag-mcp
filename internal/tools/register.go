@@ -82,7 +82,7 @@ var (
 	)
 
 	GetRelatedTagsTool = mcp.NewTool("get_related_tags",
-		mcp.WithDescription("Get co-occurring tags for a given tag"),
+		mcp.WithDescription("Get co-occurring tags for a given tag (meta-category tags excluded)"),
 		mcp.WithString("tag",
 			mcp.Required(),
 			mcp.Description("tag to find co-occurring tags for"),
@@ -93,7 +93,7 @@ var (
 	)
 
 	GetTagAliasTool = mcp.NewTool("get_tag_alias",
-		mcp.WithDescription("Resolve a tag alias, abbreviation or common misspelling to its canonical Danbooru tag. Returns alias: null when the input has no active alias, meaning it is likely already canonical; use the consequent tag in prompts when an alias is returned."),
+		mcp.WithDescription("Resolve a tag alias or misspelling to its canonical Danbooru tag; null means the input is already canonical"),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("alias or candidate tag, e.g. 'sailor_suit'"),
@@ -101,7 +101,7 @@ var (
 	)
 
 	GetTagWikiTool = mcp.NewTool("get_tag_wiki",
-		mcp.WithDescription("Get the Danbooru wiki page of a tag: description, DText body, multilingual other_names, and linked_tags (the [[tag]] links extracted from the body, typically the character's appearance traits). Pass either title (exact canonical tag) or other_names (substring match on multilingual aliases, e.g. a Chinese or Japanese character name)."),
+		mcp.WithDescription("Get a tag's wiki page: body, multilingual other_names, and linked_tags (appearance traits). Pass title (exact canonical tag) or other_names (multilingual alias substring)"),
 		mcp.WithString("title",
 			mcp.Description("exact wiki title, i.e. the canonical tag, e.g. 'firefly_(honkai:_star_rail)'"),
 		),
@@ -114,10 +114,10 @@ var (
 	)
 
 	SearchPostsTool = mcp.NewTool("search_posts",
-		mcp.WithDescription("Search posts by tag combination. Defaults to rating:explicit (R-18); pass your own rating metatag (rating:g / rating:s / rating:q / rating:e) in tags to override. Ratings: g=General (all-ages SFW), s=Sensitive (swimwear/underwear, borderline), q=Questionable (suggestive nudity), e=Explicit (R-18). At most 2 tags per query for free accounts, counting content tags and order: metatags (rating: and other metatags do not count); more is rejected with an error."),
+		mcp.WithDescription("Search posts by tags. Defaults to rating:explicit (R-18); a rating:g/s/q/e metatag in tags overrides it (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries its tag list split by category (copyright/artist/character/general/meta)"),
 		mcp.WithString("tags",
 			mcp.Required(),
-			mcp.Description("space-separated tags; a rating:g/s/q/e metatag overrides the default rating:explicit"),
+			mcp.Description("space-separated tags"),
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("max posts to return (default: 5)"),

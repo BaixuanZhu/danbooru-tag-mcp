@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -86,6 +87,7 @@ func TestRelated_ParsesCurrentApiFormat(t *testing.T) {
 			"tag": {"id": 10953, "name": "blue_hair", "post_count": 1207874, "category": 0},
 			"related_tags": [
 				{"tag": {"name": "blue_hair", "post_count": 1207874, "category": 0}, "cosine_similarity": 1.0, "frequency": 1.0},
+				{"tag": {"name": "aqua_hair", "post_count": 179981, "category": 0}, "cosine_similarity": 0.45, "frequency": 0.11},
 				{"tag": {"name": "highres", "post_count": 8211186, "category": 5}, "cosine_similarity": 0.261, "frequency": 0.6828}
 			],
 			"wiki_page_tags": [{"name": "aqua_hair", "post_count": 179981, "category": 0}]
@@ -97,13 +99,16 @@ func TestRelated_ParsesCurrentApiFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// The query tag itself (similarity 1.0) and meta-category entries
+	// (highres, category 5) must both be dropped; the limit is spent on
+	// content tags only.
 	if len(rel) != 1 {
-		t.Fatalf("expected 1 related tag (query tag itself skipped), got %d", len(rel))
+		t.Fatalf("expected 1 related tag (self + meta dropped), got %d", len(rel))
 	}
-	if rel[0].Tag != "highres" || rel[0].Category != 5 || rel[0].PostCount != 8211186 {
+	if rel[0].Tag != "aqua_hair" || rel[0].Category != 0 || rel[0].PostCount != 179981 {
 		t.Errorf("unexpected tag fields: %+v", rel[0])
 	}
-	if rel[0].Similarity != 0.261 || rel[0].Frequency != 0.6828 {
+	if rel[0].Similarity != 0.45 || rel[0].Frequency != 0.11 {
 		t.Errorf("unexpected similarity metrics: %+v", rel[0])
 	}
 }
@@ -231,6 +236,59 @@ func TestSearchPosts_DefaultsToExplicitRating(t *testing.T) {
 	}
 	if len(posts) != 1 || posts[0].ID != 100 || posts[0].Rating != "e" {
 		t.Errorf("parsed post mismatch: %+v", posts)
+	}
+
+	// Posts without tag_string_* fields must still serialize every category
+	// as an empty array, never null.
+	raw, err := json.Marshal(posts)
+	if err != nil {
+		t.Fatalf("failed to marshal posts: %v", err)
+	}
+	if strings.Contains(string(raw), "null") {
+		t.Errorf("post JSON must not contain nulls, got: %s", raw)
+	}
+}
+
+func TestSearchPosts_ParsesCategorizedTags(t *testing.T) {
+	mock := &mockFetcher{
+		postsResp: []byte(`[{
+			"id": 900,
+			"rating": "e",
+			"preview_file_url": "https://cdn.donmai.us/preview/x.jpg",
+			"tag_string_copyright": "touhou",
+			"tag_string_artist": "kantoku",
+			"tag_string_character": "hakurei_reimu",
+			"tag_string_general": "1girl solo long_hair",
+			"tag_string_meta": "highres absurdres"
+		}]`),
+	}
+	svc := NewTagService(mock)
+
+	posts, err := svc.SearchPosts(context.Background(), "touhou", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(posts) != 1 {
+		t.Fatalf("expected 1 post, got %d", len(posts))
+	}
+	tags := posts[0].Tags
+	if len(tags.Copyright) != 1 || tags.Copyright[0] != "touhou" {
+		t.Errorf("unexpected copyright tags: %+v", tags.Copyright)
+	}
+	if len(tags.Artist) != 1 || tags.Artist[0] != "kantoku" {
+		t.Errorf("unexpected artist tags: %+v", tags.Artist)
+	}
+	if len(tags.Character) != 1 || tags.Character[0] != "hakurei_reimu" {
+		t.Errorf("unexpected character tags: %+v", tags.Character)
+	}
+	if len(tags.General) != 3 || tags.General[0] != "1girl" || tags.General[2] != "long_hair" {
+		t.Errorf("unexpected general tags: %+v", tags.General)
+	}
+	if len(tags.Meta) != 2 || tags.Meta[1] != "absurdres" {
+		t.Errorf("unexpected meta tags: %+v", tags.Meta)
+	}
+	if posts[0].PreviewURL != "https://cdn.donmai.us/preview/x.jpg" {
+		t.Errorf("unexpected preview URL: %s", posts[0].PreviewURL)
 	}
 }
 

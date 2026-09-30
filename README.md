@@ -10,6 +10,7 @@ composing prompts, which noticeably improves tag accuracy in generated images.
 ## Features
 
 - **6 MCP tools**: tag search, exact tag info, related tags, alias resolution, wiki lookup, and post search
+- **Tag lists back from post search**: `search_posts` returns each post's full tag list split by category (copyright/artist/character/general/meta), so mining a few posts reveals which tags naturally go together
 - **R-18 by default**: `search_posts` defaults to `rating:explicit`; pass your own `rating:g/s/q/e` metatag to narrow a query
 - **Self-updating**: `danbooru-tag-mcp upgrade` checks GitHub Releases, verifies SHA256 and replaces the binary atomically
 - **Zero-config install**: per-user installer (setup wizard or one-line PowerShell) that registers the install directory into the user PATH automatically
@@ -70,10 +71,10 @@ alternatively use the full exe path.
 |------|-------------|------------|
 | `search_tags` | Search tags by keyword, ordered by post count | `query` (required, e.g. `blue hair`), `limit` (default 10) |
 | `get_tag_info` | Exact info for one tag (aliases, category, counts) | `name` (required, e.g. `blue_hair`) |
-| `get_related_tags` | Tags that co-occur with the given tag | `tag` (required), `limit` (default 10) |
+| `get_related_tags` | Tags that co-occur with the given tag (meta-category tags like `highres` are filtered out as noise) | `tag` (required), `limit` (default 10) |
 | `get_tag_alias` | Resolve an alias or misspelling to its canonical tag (`null` = input is already canonical) | `name` (required, e.g. `sailor_suit`) |
 | `get_tag_wiki` | Wiki page of a tag: description, multilingual names, and the `[[tag]]` links extracted from the body | `title` or `other_names` (one required), `limit` (default 5) |
-| `search_posts` | Search posts by a tag combination (defaults to `rating:explicit`; a `rating:` metatag overrides it) | `tags` (required, space-separated), `limit` (default 5) |
+| `search_posts` | Search posts by a tag combination (defaults to `rating:explicit`; a `rating:` metatag overrides it). Each post carries `tags` split by category: `copyright` / `artist` / `character` / `general` / `meta` | `tags` (required, space-separated), `limit` (default 5) |
 
 ## CLI
 

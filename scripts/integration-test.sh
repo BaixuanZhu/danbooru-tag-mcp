@@ -113,8 +113,9 @@ check(tag.get('name') == 'blue_hair' and tag.get('post_count', 0) > 0,
 # 5. get_related_tags: the upstream drift canary (broken by the 2024 revamp)
 related = payload(5).get('related')
 check(bool(related) and bool(related[0].get('tag'))
-      and isinstance(related[0].get('similarity'), float),
-      'get_related_tags: entries carry tag + similarity')
+      and isinstance(related[0].get('similarity'), float)
+      and all(e.get('category') != 5 for e in related),
+      'get_related_tags: entries carry tag + similarity, meta tags excluded')
 
 # 6. get_tag_alias
 alias = payload(6).get('alias')
@@ -126,10 +127,12 @@ pages = payload(7).get('wiki_pages')
 check(bool(pages) and len(pages[0].get('linked_tags', [])) > 0,
       'get_tag_wiki: linked_tags extracted from body')
 
-# 8. search_posts default rating
+# 8. search_posts default rating + per-post categorized tag list
 posts = payload(8).get('posts')
-check(bool(posts) and all(p.get('rating') == 'e' for p in posts),
-      'search_posts: default rating filter is explicit')
+check(bool(posts) and all(p.get('rating') == 'e' for p in posts)
+      and all(isinstance(p.get('tags', {}).get('general'), list)
+              and len(p['tags']['general']) > 0 for p in posts),
+      'search_posts: explicit rating + categorized tag list per post')
 
 # 9. tag-count pre-validation (rejected locally, no network round trip)
 err = payload(9)

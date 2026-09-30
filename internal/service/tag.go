@@ -43,10 +43,23 @@ type WikiPage struct {
 	LinkedTags []string `json:"linked_tags"`
 }
 
+// PostTags is one post's tag list split by Danbooru category (sidebar order),
+// so consumers can pick identity tags and content tags without re-parsing.
+type PostTags struct {
+	Copyright []string `json:"copyright"`
+	Artist    []string `json:"artist"`
+	Character []string `json:"character"`
+	General   []string `json:"general"`
+	Meta      []string `json:"meta"`
+}
+
+// Post is a trimmed search result entry: identity, rating, the full tag list
+// by category, and a preview URL for a quick visual check.
 type Post struct {
-	ID         int    `json:"id"`
-	Rating     string `json:"rating"`
-	PreviewURL string `json:"preview_file_url"`
+	ID         int      `json:"id"`
+	Rating     string   `json:"rating"`
+	Tags       PostTags `json:"tags"`
+	PreviewURL string   `json:"preview_file_url"`
 }
 
 // TagFetcher decouples the service from the concrete api.Client for mock-based unit tests
@@ -124,6 +137,10 @@ type danbooruRelatedResponse struct {
 	RelatedTags []danbooruRelatedEntry `json:"related_tags"`
 }
 
+// danbooruCategoryMeta is the category id of meta tags (highres, absurdres,
+// commentary, ...) as returned by tags.json / related_tag.json.
+const danbooruCategoryMeta = 5
+
 func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]RelatedTag, error) {
 	cleanTag := normalizeTag(tag)
 	body, err := s.fetcher.FetchRelated(ctx, cleanTag)
@@ -141,6 +158,11 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]Rela
 		// The API lists the query tag itself first (similarity 1.0); skip it
 		// so the limit is spent on actual co-occurring tags.
 		if entry.Tag.Name == resp.Query {
+			continue
+		}
+		// Meta tags co-occur with nearly every upload and would fill the
+		// top-N with prompt-irrelevant noise; drop them.
+		if entry.Tag.Category == danbooruCategoryMeta {
 			continue
 		}
 		results = append(results, RelatedTag{
@@ -275,6 +297,32 @@ func countContentTags(tags string) int {
 	return count
 }
 
+// danbooruPost is the subset of /posts.json entries the service consumes;
+// the tag_string_* fields are space-separated tag names grouped by category.
+type danbooruPost struct {
+	ID                 int    `json:"id"`
+	Rating             string `json:"rating"`
+	PreviewFileURL     string `json:"preview_file_url"`
+	TagStringCopyright string `json:"tag_string_copyright"`
+	TagStringArtist    string `json:"tag_string_artist"`
+	TagStringCharacter string `json:"tag_string_character"`
+	TagStringGeneral   string `json:"tag_string_general"`
+	TagStringMeta      string `json:"tag_string_meta"`
+}
+
+// parsePostTags splits the raw tag_string_* fields into per-category lists.
+// strings.Fields of an empty string yields an empty non-nil slice, so absent
+// categories marshal as [] rather than null.
+func parsePostTags(p danbooruPost) PostTags {
+	return PostTags{
+		Copyright: strings.Fields(p.TagStringCopyright),
+		Artist:    strings.Fields(p.TagStringArtist),
+		Character: strings.Fields(p.TagStringCharacter),
+		General:   strings.Fields(p.TagStringGeneral),
+		Meta:      strings.Fields(p.TagStringMeta),
+	}
+}
+
 // SearchPosts core business rule: default to rating:explicit (R-18 allowed);
 // a rating:<x> metatag supplied by the caller is kept as-is.
 func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int) ([]Post, error) {
@@ -295,9 +343,18 @@ func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int) ([
 		return nil, err
 	}
 
-	var posts []Post
-	if err := json.Unmarshal(body, &posts); err != nil {
+	var rawPosts []danbooruPost
+	if err := json.Unmarshal(body, &rawPosts); err != nil {
 		return nil, fmt.Errorf("failed to parse posts: %w", err)
+	}
+	posts := make([]Post, 0, len(rawPosts))
+	for _, p := range rawPosts {
+		posts = append(posts, Post{
+			ID:         p.ID,
+			Rating:     p.Rating,
+			Tags:       parsePostTags(p),
+			PreviewURL: p.PreviewFileURL,
+		})
 	}
 	return posts, nil
 }

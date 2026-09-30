@@ -74,6 +74,16 @@ metatags count, `rating:`/`status:`/`id:` style metatags are exempt —
 verified empirically) so over-limit queries fail with a clear error instead
 of a Danbooru 422.
 
+**Result shaping (inspiration discovery, the product's weak spot turned
+strength)**: `SearchPosts` returns each post's full tag list split by category
+(`PostTags`, parsed from the API's `tag_string_*` fields — no extra request);
+`Related` drops both the query tag itself and meta-category (5) entries,
+because meta tags like `highres` co-occur with everything and drown out
+content tags. Category ids are 0=general, 1=artist, 3=copyright, 4=character,
+5=meta (Danbooru's actual API numbering — verified live, do not "fix" to the
+0-4 continuous scheme). Both behaviors are pinned by unit tests and the
+integration script.
+
 ## Key conventions and gotchas
 
 - **stdout carries JSON-RPC only**: in MCP server mode all logs must go to
@@ -127,6 +137,11 @@ of a Danbooru 422.
   **Keep script strings ASCII-only** — under `iwr | iex` the install.ps1 body
   is decoded with the host's default code page; a UTF-8 BOM breaks parsing on
   PowerShell 5.1.
+- **Tool descriptions are context cost**: every MCP client injects the
+  tools/list payload into each session, so keep descriptions in
+  `internal/tools` terse English — one clause per behavioral rule (defaults,
+  limits, output shape), no rationale prose, no usage coaching. Deeper
+  explanation belongs in README.
 - Test style: api layer uses `httptest.Server`; service layer uses mock
   structs implementing `TagFetcher`; api tests use `WithReqGap(0)` to disable
   real throttling; pure logic is extracted into private functions taking
