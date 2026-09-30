@@ -11,13 +11,9 @@ Danbooru tags — exact names, aliases, categories, post counts, co-occurrence
 statistics, wiki descriptions, and the tag lists of real posts — before
 composing prompts, which noticeably improves tag accuracy in generated images.
 
-<!-- Demo GIF: record a ~30s session (ask the client for character tags, show
-     it calling search_posts / get_tag_wiki, show the image result), save it as
-     docs/demo.gif, then uncomment the block below.
 <p align="center">
-  <img src="docs/demo.gif" alt="danbooru-tag-mcp demo" width="720">
+  <img src="docs/demo.gif" alt="danbooru-tag-mcp demo: verifying Danbooru tags with search_tags, get_tag_wiki and search_posts before composing a prompt" width="720">
 </p>
--->
 
 ## Quick start
 
