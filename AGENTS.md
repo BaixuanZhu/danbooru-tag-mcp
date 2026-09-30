@@ -120,7 +120,8 @@ integration script.
   the GitHub Release (with `install.ps1` as an asset). Release notes come
   from a `## [x.y.z]` section in `CHANGELOG.md` when present, otherwise
   auto-generated. `make` targets accept `VERSION=` and `GOARCH=` overrides,
-  which is how the workflow pins them.
+  which is how the workflow pins them. Bump the `version` in `server.json`
+  (MCP registry metadata) to match the tag before pushing a release tag.
 - Install: two routes kept in sync — `install.ps1` (PowerShell 5.1+) and the
   NSIS installer `installer/danbooru-tag-mcp.nsi` (`make installer`; CI
   installs NSIS via `choco install nsis` because choco does not refresh the
