@@ -5,8 +5,10 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"danbooru-tag-mcp/internal/service"
+	"danbooru-tag-mcp/internal/vocab"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -14,12 +16,18 @@ import (
 
 type TagService interface {
 	Search(ctx context.Context, query string, limit int) ([]service.Tag, error)
-	Info(ctx context.Context, name string) (*service.Tag, error)
+	Info(ctx context.Context, name string) (*service.TagInfo, error)
+	WD14Info(name string) service.WD14Status
+	TaggerVocabHits(query string, limit int) []vocab.Hit
 	Related(ctx context.Context, tag string, limit int) ([]service.RelatedTag, error)
 	Alias(ctx context.Context, name string) (*service.TagAlias, error)
 	Wiki(ctx context.Context, title, otherNames string, limit int) ([]service.WikiPage, error)
 	SearchPosts(ctx context.Context, tags string, limit int) ([]service.Post, error)
 }
+
+// wd14HitsLimit caps the search_tags fallback: enough nearby candidates to
+// act on, few enough not to bloat the empty-result payload.
+const wd14HitsLimit = 8
 
 func errResp(code, message string) string {
 	b, _ := json.Marshal(map[string]any{
@@ -63,7 +71,7 @@ func getIntArg(args map[string]any, key string, defaultVal int) int {
 // Exported tool instances so register_test.go can statically validate their schemas
 var (
 	SearchTagsTool = mcp.NewTool("search_tags",
-		mcp.WithDescription("Search Danbooru tags by keyword, ordered by post count"),
+		mcp.WithDescription("Search Danbooru tags by keyword, ordered by post count. When no result has posts, adds wd14_hits (WD14 tagger vocab names containing the query)"),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("keyword, e.g. 'blue hair'"),
@@ -74,7 +82,7 @@ var (
 	)
 
 	GetTagInfoTool = mcp.NewTool("get_tag_info",
-		mcp.WithDescription("Get exact info for a Danbooru tag"),
+		mcp.WithDescription("Get exact info for a Danbooru tag. wd14 field: live (current Danbooru), tagger_era (WD14 tagger vocab only, likely renamed), unknown (neither)"),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("exact tag name, e.g. 'blue_hair'"),
@@ -125,6 +133,18 @@ var (
 	)
 )
 
+// hasLiveTag reports whether any search result carries posts. Danbooru keeps
+// 0-post placeholder rows (renamed-away antecedents, unused tags), so a
+// result list without a single live tag is the real dead end.
+func hasLiveTag(tags []service.Tag) bool {
+	for _, t := range tags {
+		if t.PostCount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 func Register(s *server.MCPServer, svc TagService) {
 	// tool 1: search_tags
 	s.AddTool(SearchTagsTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -139,7 +159,14 @@ func Register(s *server.MCPServer, svc TagService) {
 		if err != nil {
 			return mcp.NewToolResultText(errResp("search_failed", err.Error())), nil
 		}
-		return jsonResult(map[string]any{"tags": tags})
+		payload := map[string]any{"tags": tags}
+		if !hasLiveTag(tags) {
+			// Dead end made actionable: nearby WD14 tagger-vocab names.
+			if hits := svc.TaggerVocabHits(query, wd14HitsLimit); len(hits) > 0 {
+				payload["wd14_hits"] = hits
+			}
+		}
+		return jsonResult(payload)
 	})
 
 	// tool 2: get_tag_info
@@ -150,11 +177,22 @@ func Register(s *server.MCPServer, svc TagService) {
 			return mcp.NewToolResultText(errResp("tag_not_found", "name parameter is required")), nil
 		}
 
-		tag, err := svc.Info(ctx, name)
+		info, err := svc.Info(ctx, name)
 		if err != nil {
+			var nf *service.NotFoundError
+			if errors.As(err, &nf) {
+				// Deliver the local WD14 verdict with the not-found error,
+				// so a tagger-era name stays actionable instead of dead-ending.
+				b, _ := json.Marshal(map[string]any{
+					"error":   "tag_not_found",
+					"message": nf.Error(),
+					"wd14":    svc.WD14Info(name),
+				})
+				return mcp.NewToolResultText(string(b)), nil
+			}
 			return mcp.NewToolResultText(errResp("tag_not_found", err.Error())), nil
 		}
-		return jsonResult(tag)
+		return jsonResult(info)
 	})
 
 	// tool 3: get_related_tags

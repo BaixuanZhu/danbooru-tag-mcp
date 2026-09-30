@@ -3,8 +3,11 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"danbooru-tag-mcp/internal/vocab"
 )
 
 type mockFetcher struct {
@@ -53,7 +56,7 @@ func TestSearch_ParsesTags(t *testing.T) {
 	mock := &mockFetcher{
 		tagsResp: []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":500}]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	tags, err := svc.Search(context.Background(), "blue hair", 10)
 	if err != nil {
@@ -71,11 +74,107 @@ func TestInfo_NotFound(t *testing.T) {
 	mock := &mockFetcher{
 		exactResp: []byte(`[]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	_, err := svc.Info(context.Background(), "non_existent_tag")
-	if err == nil || !strings.Contains(err.Error(), "tag not found") {
-		t.Fatalf("expected 'tag not found' error, got: %v", err)
+	var nf *NotFoundError
+	if !errors.As(err, &nf) || nf.Name != "non_existent_tag" {
+		t.Fatalf("expected *NotFoundError with the queried name, got: %v", err)
+	}
+}
+
+func TestInfo_WD14SectionRidesLiveRow(t *testing.T) {
+	mock := &mockFetcher{
+		exactResp: []byte(`[{"id":165438,"name":"anklet","category":0,"post_count":30000}]`),
+	}
+	svc := NewTagService(mock, vocab.Default())
+
+	info, err := svc.Info(context.Background(), "anklet")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.WD14.Status != wd14Live {
+		t.Errorf("expected wd14 status live, got %q", info.WD14.Status)
+	}
+	if len(info.WD14.Sources) != 2 {
+		t.Errorf("expected both vocabulary sources for anklet, got: %+v", info.WD14.Sources)
+	}
+
+	// The tag row must stay flat: found responses keep their old shape and
+	// only gain the wd14 key.
+	raw, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("failed to marshal info: %v", err)
+	}
+	for _, want := range []string{`"name":"anklet"`, `"post_count":30000`, `"wd14"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("expected %s in payload, got: %s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), `"Tag"`) {
+		t.Errorf("tag row must be flat, not nested, got: %s", raw)
+	}
+}
+
+func TestInfo_ZeroCountRowIsTaggerEra(t *testing.T) {
+	// Verified live: Danbooru returns 0-post placeholder rows for names the
+	// taggers knew but Danbooru has since emptied (renamed-away antecedents,
+	// unused tags) — they must not classify as live.
+	mock := &mockFetcher{
+		exactResp: []byte(`[
+			{"id":1441951,"name":"gold_footwear","category":0,"post_count":0},
+			{"id":604897,"name":"painted_toenails","category":0,"post_count":0}
+		]`),
+	}
+	svc := NewTagService(mock, vocab.Default())
+
+	info, err := svc.Info(context.Background(), "gold_footwear")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.WD14.Status != wd14TaggerEra || len(info.WD14.Sources) != 2 {
+		t.Errorf("expected tagger_era with both sources, got: %+v", info.WD14)
+	}
+}
+
+func TestWD14Info_TaggerEraVsUnknown(t *testing.T) {
+	svc := NewTagService(&mockFetcher{}, vocab.Default())
+
+	era := svc.WD14Info("barefoot_sandals")
+	if era.Status != wd14TaggerEra || len(era.Sources) != 1 ||
+		era.Sources[0].Vocab != vocab.MoatV2 || era.Sources[0].Count != 931 {
+		t.Errorf("expected tagger_era with the v2 snapshot (931), got: %+v", era)
+	}
+
+	unknown := svc.WD14Info("painted_toenails")
+	if unknown.Status != wd14Unknown {
+		t.Errorf("expected unknown for a made-up word, got %+v", unknown)
+	}
+	raw, _ := json.Marshal(unknown)
+	if strings.Contains(string(raw), "sources") {
+		t.Errorf("unknown must omit sources, got: %s", raw)
+	}
+
+	// With no vocab store the verdict degrades to unknown instead of panicking.
+	bare := NewTagService(&mockFetcher{}, nil)
+	if got := bare.WD14Info("barefoot_sandals").Status; got != wd14Unknown {
+		t.Errorf("nil vocab store must degrade to unknown, got %q", got)
+	}
+}
+
+func TestTaggerVocabHits(t *testing.T) {
+	svc := NewTagService(&mockFetcher{}, vocab.Default())
+
+	hits := svc.TaggerVocabHits("gold_foot", 8)
+	if len(hits) != 1 || hits[0].Name != "gold_footwear" || len(hits[0].Sources) != 2 {
+		t.Fatalf("expected merged gold_footwear, got: %+v", hits)
+	}
+	if got := svc.TaggerVocabHits("gold_foot", 0); got != nil {
+		t.Errorf("non-positive limit must yield no hits, got: %+v", got)
+	}
+	bare := NewTagService(&mockFetcher{}, nil)
+	if got := bare.TaggerVocabHits("gold_foot", 8); got != nil {
+		t.Errorf("nil vocab store must yield no hits, got: %+v", got)
 	}
 }
 
@@ -93,7 +192,7 @@ func TestRelated_ParsesCurrentApiFormat(t *testing.T) {
 			"wiki_page_tags": [{"name": "aqua_hair", "post_count": 179981, "category": 0}]
 		}`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	rel, err := svc.Related(context.Background(), "blue_hair", 10)
 	if err != nil {
@@ -125,7 +224,7 @@ func TestRelated_TruncatesToLimit(t *testing.T) {
 			]
 		}`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	rel, err := svc.Related(context.Background(), "solo", 2)
 	if err != nil {
@@ -143,7 +242,7 @@ func TestAlias_ParsesMapping(t *testing.T) {
 	mock := &mockFetcher{
 		aliasResp: []byte(`[{"id":7315,"antecedent_name":"sailor_suit","consequent_name":"sailor","status":"active"}]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	alias, err := svc.Alias(context.Background(), "sailor suit")
 	if err != nil {
@@ -156,7 +255,7 @@ func TestAlias_ParsesMapping(t *testing.T) {
 
 func TestAlias_NoActiveAliasReturnsNull(t *testing.T) {
 	mock := &mockFetcher{aliasResp: []byte(`[]`)}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	alias, err := svc.Alias(context.Background(), "blue_hair")
 	if err != nil {
@@ -177,7 +276,7 @@ func TestWiki_ExtractsLinkedTags(t *testing.T) {
 			"is_deleted": false
 		}]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	pages, err := svc.Wiki(context.Background(), "firefly_(honkai:_star_rail)", "", 5)
 	if err != nil {
@@ -210,7 +309,7 @@ func TestWiki_ExtractsLinkedTags(t *testing.T) {
 
 func TestWiki_OtherNamesMode(t *testing.T) {
 	mock := &mockFetcher{wikiResp: []byte(`[]`)}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	if _, err := svc.Wiki(context.Background(), "", "流萤", 5); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -224,7 +323,7 @@ func TestSearchPosts_DefaultsToExplicitRating(t *testing.T) {
 	mock := &mockFetcher{
 		postsResp: []byte(`[{"id":100,"rating":"e","preview_file_url":"https://danbooru.donmai.us/sample.jpg"}]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	posts, err := svc.SearchPosts(context.Background(), "cat_ears 1girl", 5)
 	if err != nil {
@@ -262,7 +361,7 @@ func TestSearchPosts_ParsesCategorizedTags(t *testing.T) {
 			"tag_string_meta": "highres absurdres"
 		}]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	posts, err := svc.SearchPosts(context.Background(), "touhou", 1)
 	if err != nil {
@@ -294,7 +393,7 @@ func TestSearchPosts_ParsesCategorizedTags(t *testing.T) {
 
 func TestSearchPosts_RejectsTooManyContentTags(t *testing.T) {
 	mock := &mockFetcher{postsResp: []byte(`[]`)}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	_, err := svc.SearchPosts(context.Background(), "1girl blue_hair long_hair", 5)
 	if err == nil || !strings.Contains(err.Error(), "too many content tags") {
@@ -309,7 +408,7 @@ func TestSearchPosts_MetatagCounting(t *testing.T) {
 	mock := &mockFetcher{
 		postsResp: []byte(`[{"id":101,"rating":"e","preview_file_url":""}]`),
 	}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	// rating:/status: are exempt from the limit; the query below is 2 content tags.
 	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair status:any", 5); err != nil {
@@ -331,7 +430,7 @@ func TestSearchPosts_MetatagCounting(t *testing.T) {
 
 func TestSearchPosts_KeepsCallerRating(t *testing.T) {
 	mock := &mockFetcher{postsResp: []byte(`[]`)}
-	svc := NewTagService(mock)
+	svc := NewTagService(mock, nil)
 
 	if _, err := svc.SearchPosts(context.Background(), "cat_ears rating:general", 5); err != nil {
 		t.Fatalf("unexpected error: %v", err)

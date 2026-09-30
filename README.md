@@ -42,6 +42,7 @@ That's it — the client picks up the six tools below on its next session.
 
 - **6 MCP tools**: tag search, exact tag info, related tags, alias resolution, wiki lookup, and post search
 - **Tag lists back from post search**: `search_posts` returns each post's full tag list split by category (copyright/artist/character/general/meta), so mining a few posts reveals which tags naturally go together
+- **Tagger-era tag detection**: `get_tag_info` classifies every name against the pinned WD14 tagger vocabularies (`wd14` field: `live` / `tagger_era` — a tagger-era name Danbooru has since renamed, try `get_tag_alias` / `unknown`), so LoRA card captions stop dead-ending at "tag not found"; `search_tags` adds `wd14_hits` fallback hits when no result carries posts
 - **R-18 by default**: `search_posts` defaults to `rating:explicit`; pass your own `rating:g/s/q/e` metatag to narrow a query
 - **Self-updating**: `danbooru-tag-mcp upgrade` checks GitHub Releases, verifies SHA256 and replaces the binary atomically
 - **Zero-config install**: per-user installer (setup wizard or one-line PowerShell) that registers the install directory into the user PATH automatically
@@ -100,8 +101,8 @@ alternatively use the full exe path.
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| `search_tags` | Search tags by keyword, ordered by post count | `query` (required, e.g. `blue hair`), `limit` (default 10) |
-| `get_tag_info` | Exact info for one tag (aliases, category, counts) | `name` (required, e.g. `blue_hair`) |
+| `search_tags` | Search tags by keyword, ordered by post count; when no result has posts, adds `wd14_hits` (WD14 tagger vocab names containing the query) | `query` (required, e.g. `blue hair`), `limit` (default 10) |
+| `get_tag_info` | Exact info for one tag (category, post count), plus a `wd14` verdict: `live` (current Danbooru), `tagger_era` (WD14 tagger vocab only, likely renamed — see `get_tag_alias`), `unknown` (neither) | `name` (required, e.g. `blue_hair`) |
 | `get_related_tags` | Tags that co-occur with the given tag (meta-category tags like `highres` are filtered out as noise) | `tag` (required), `limit` (default 10) |
 | `get_tag_alias` | Resolve an alias or misspelling to its canonical tag (`null` = input is already canonical) | `name` (required, e.g. `sailor_suit`) |
 | `get_tag_wiki` | Wiki page of a tag: description, multilingual names, and the `[[tag]]` links extracted from the body | `title` or `other_names` (one required), `limit` (default 5) |

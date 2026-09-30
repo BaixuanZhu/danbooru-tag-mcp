@@ -25,7 +25,7 @@ make installer                      # NSIS setup exe -> dist/danbooru-tag-mcp-wi
 make dist-all                       # both release assets (current GOARCH)
 go vet ./...                        # static check
 make test / make test-race          # tests / race detector
-make integration                # online smoke: all 6 tools once against live Danbooru
+make integration                # online smoke: every tool against live Danbooru (+ tagger-era wd14 checks)
 ```
 
 Smoke test (verifies MCP handshake and tool listing):
@@ -45,11 +45,16 @@ layers are decoupled via interfaces for mock-based unit tests:
   cancellation, UA/credential injection, 5MB body cap). New API endpoints must
   go through it; never use `http` directly.
 - **internal/service/**: business logic and JSON parsing; depends on the
-  `TagFetcher` interface (unaware of the concrete client).
+  `TagFetcher` interface (unaware of the concrete client) and on the
+  `vocab.Store` for WD14 classification.
 - **internal/tools/**: mcp-go tool registration and handlers; depends on the
   `TagService` interface. Tool instances (`SearchTagsTool` etc.) are
   package-level exported vars and `register_test.go` statically validates
   their schemas — changing tool definitions requires updating those tests.
+- **internal/vocab/**: WD14 tagger vocabularies as go:embed'd pinned CSV
+  snapshots (see the paragraph on tagger-era detection below); leaf package
+  with no dependencies, nil `*Store` answers miss so callers can run
+  unenriched.
 - **internal/app/**: `Version` (ldflags injected), `Fail`, `UserAgent`, and
   the bootstrap switch (`BootstrapEnabled`).
 - **internal/env/**: user PATH injection (registry `HKCU\Environment` +
@@ -84,6 +89,27 @@ content tags. Category ids are 0=general, 1=artist, 3=copyright, 4=character,
 0-4 continuous scheme). Both behaviors are pinned by unit tests and the
 integration script.
 
+**Tagger-era detection (WD14 layer, test-enforced, do not break)**:
+`internal/vocab` embeds the WD14 tagger vocabularies (`wd-v1-4-moat-tagger-v2`
+and `wd-eva02-large-tagger-v3`, provenance in `internal/vocab/data/README.md`)
+as immutable snapshots — the whole value is historical lookup, so they are
+never refreshed; re-pinning is deliberate and trips
+`TestDefault_PinnedSnapshots`. CSV `category` uses Danbooru numbering plus
+**9 = the tagger's rating buckets** (`general`/`sensitive`/...), which are
+tagger output columns, not Danbooru tags. `get_tag_info` attaches a `wd14`
+verdict computed locally (available even when the API call fails): `live`
+requires a Danbooru row **with posts** — Danbooru returns 0-post placeholder
+rows for renamed-away names (verified live: `barefoot_sandals`,
+`gold_footwear`, even `painted_toenails` all return rows), and those classify
+as `tagger_era` when a vocabulary carries them (`pinned by
+TestInfo_ZeroCountRowIsTaggerEra`) or `unknown` when none does. A name truly
+absent from Danbooru yields a `*service.NotFoundError`, and the tools handler
+rides the `wd14` verdict on that error payload. `search_tags` adds
+`wd14_hits` (vocabulary substring matches, best snapshot count first) when no
+result carries posts (`hasLiveTag`). The wd14 policy translation (probe the
+canonical form via `get_tag_alias`, or describe in prose) stays with the
+consuming agent — the server reports facts only.
+
 ## Key conventions and gotchas
 
 - **stdout carries JSON-RPC only**: in MCP server mode all logs must go to
@@ -106,8 +132,9 @@ integration script.
 - Credentials come from `DANBOORU_LOGIN` / `DANBOORU_API_KEY` env vars; when
   unset the client is anonymous (rate and content limits apply).
 - **CI** (`.github/workflows/ci.yml`): unit tests run on every push/PR; the
-  online smoke (`make integration` / `scripts/integration-test.sh` — all 6
-  tools called once against the live API, anonymous, PATH-isolated via
+  online smoke (`make integration` / `scripts/integration-test.sh` — every
+  tool called against the live API plus a tagger-era name whose `wd14`
+  verdict must ride the response, anonymous, PATH-isolated via
   `DANBOORU_MCP_NO_BOOTSTRAP`) runs only on the weekly schedule or manual
   dispatch, never in the release path. It is the canary for upstream API
   drift (the 2024 related_tag.json revamp broke parsing while unit tests

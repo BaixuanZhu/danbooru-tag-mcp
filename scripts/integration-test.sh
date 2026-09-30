@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Online integration smoke test for danbooru-tag-mcp.
 #
-# Runs the real binary over stdio and calls every MCP tool once against the
-# live Danbooru API (anonymous), asserting response shapes. This is the
-# canary for upstream API drift: when /related_tag.json was revamped in 2024
-# the fixture-based unit tests stayed green — only a live call catches that.
+# Runs the real binary over stdio and calls every MCP tool against the
+# live Danbooru API (anonymous), asserting response shapes — including a
+# tagger-era name whose wd14 verdict must ride the not-found error. This is
+# the canary for upstream API drift: when /related_tag.json was revamped in
+# 2024 the fixture-based unit tests stayed green — only a live call catches
+# that.
 #
 # Isolation: DANBOORU_MCP_NO_BOOTSTRAP=1 is exported unconditionally below,
 # so the test binary never writes the user PATH or registry, even when a
@@ -37,7 +39,7 @@ export DANBOORU_MCP_NO_BOOTSTRAP=1
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 9 throttled calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 11 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -52,6 +54,8 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_tag_wiki","arguments":{"title":"firefly_(honkai:_star_rail)"}}}'
   req '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl","limit":2}}}'
   req '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl blue_hair long_hair"}}}'
+  req '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"gold_footwear"}}}'
+  req '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"gold footwear","limit":5}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -139,6 +143,24 @@ err = payload(9)
 check(err.get('error') == 'post_search_failed'
       and 'too many content tags' in err.get('message', ''),
       'search_posts: over-limit query rejected locally')
+
+# 10. get_tag_info on a tagger-era name: gold_footwear exists only in the
+#     pinned WD14 vocabularies; Danbooru keeps it as a 0-post placeholder
+#     row, which must be classified tagger_era with both snapshot sources.
+info10 = payload(10)
+check(info10.get('name') == 'gold_footwear'
+      and info10.get('post_count') == 0
+      and info10.get('wd14', {}).get('status') == 'tagger_era'
+      and len(info10['wd14'].get('sources', [])) == 2,
+      'get_tag_info: 0-post tagger-era name reports wd14 tagger_era + both sources')
+
+# 11. search_tags fallback: with no live (post-carrying) Danbooru result,
+#     wd14_hits must surface the WD14 snapshot names containing the query.
+search11 = payload(11)
+check(search11.get('wd14_hits')
+      and any(h.get('name') == 'gold_footwear' and len(h.get('sources', [])) == 2
+              for h in search11['wd14_hits']),
+      'search_tags: dead-end query surfaces wd14_hits')
 
 print()
 if failures:

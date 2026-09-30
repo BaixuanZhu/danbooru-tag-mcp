@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	"danbooru-tag-mcp/internal/service"
+
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
@@ -20,6 +22,26 @@ func TestErrResp_Format(t *testing.T) {
 	}
 	if parsed["message"] != "tag 'sample' does not exist" {
 		t.Errorf("expected message field 'tag 'sample' does not exist', got '%s'", parsed["message"])
+	}
+}
+
+func TestHasLiveTag(t *testing.T) {
+	tests := []struct {
+		name string
+		tags []service.Tag
+		live bool
+	}{
+		{"no results", nil, false},
+		{"only zero-count placeholders", []service.Tag{{Name: "gold_footwear", PostCount: 0}}, false},
+		{"one live among placeholders", []service.Tag{{PostCount: 0}, {PostCount: 12}}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasLiveTag(tt.tags); got != tt.live {
+				t.Errorf("hasLiveTag(%v) = %v, want %v", tt.tags, got, tt.live)
+			}
+		})
 	}
 }
 

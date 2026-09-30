@@ -24,6 +24,7 @@ import (
 	"danbooru-tag-mcp/internal/service"
 	"danbooru-tag-mcp/internal/tools"
 	"danbooru-tag-mcp/internal/upgrade"
+	"danbooru-tag-mcp/internal/vocab"
 
 	"github.com/mark3labs/mcp-go/server"
 )
@@ -73,7 +74,7 @@ func main() {
 // injected) so it matches what the version / upgrade subcommands report.
 func serve() {
 	client := api.NewClient()
-	svc := service.NewTagService(client)
+	svc := service.NewTagService(client, vocab.Default())
 
 	s := server.NewMCPServer(
 		"danbooru-tags",

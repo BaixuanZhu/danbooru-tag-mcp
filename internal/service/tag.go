@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"danbooru-tag-mcp/internal/vocab"
 )
 
 type Tag struct {
@@ -72,12 +74,44 @@ type TagFetcher interface {
 	FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error)
 }
 
-type TagService struct {
-	fetcher TagFetcher
+// WD14 status values: how a name stands relative to current Danbooru and
+// the pinned WD14 tagger vocabularies (internal/vocab).
+const (
+	wd14Live      = "live"       // current Danbooru carries the name
+	wd14TaggerEra = "tagger_era" // only the tagger vocabularies carry it (likely renamed on Danbooru)
+	wd14Unknown   = "unknown"    // neither side carries it (treat as a made-up word)
+)
+
+// WD14Status classifies a name against the pinned WD14 tagger vocabularies.
+// It is computed locally, so it is available even when the Danbooru API
+// request itself fails.
+type WD14Status struct {
+	Status  string         `json:"status"`
+	Sources []vocab.Source `json:"sources,omitempty"` // snapshot record per vocabulary, when any carries the name
 }
 
-func NewTagService(fetcher TagFetcher) *TagService {
-	return &TagService{fetcher: fetcher}
+// TagInfo is get_tag_info's payload: the live tag row (embedded, so the
+// found-response shape stays flat) plus the WD14 verdict.
+type TagInfo struct {
+	Tag
+	WD14 WD14Status `json:"wd14"`
+}
+
+// NotFoundError reports that current Danbooru carries no exact match for
+// the name; the WD14 verdict for it is still computable locally.
+type NotFoundError struct {
+	Name string
+}
+
+func (e *NotFoundError) Error() string { return "tag not found: " + e.Name }
+
+type TagService struct {
+	fetcher TagFetcher
+	vocab   *vocab.Store // nil disables WD14 enrichment
+}
+
+func NewTagService(fetcher TagFetcher, vd *vocab.Store) *TagService {
+	return &TagService{fetcher: fetcher, vocab: vd}
 }
 
 func normalizeTag(s string) string {
@@ -98,7 +132,10 @@ func (s *TagService) Search(ctx context.Context, query string, limit int) ([]Tag
 	return tags, nil
 }
 
-func (s *TagService) Info(ctx context.Context, name string) (*Tag, error) {
+// Info resolves a name to its exact tag row plus the WD14 verdict. A
+// *NotFoundError means current Danbooru no longer carries the name — the
+// caller can still classify it locally via WD14Info.
+func (s *TagService) Info(ctx context.Context, name string) (*TagInfo, error) {
 	cleanName := normalizeTag(name)
 	body, err := s.fetcher.FetchTagExact(ctx, cleanName)
 	if err != nil {
@@ -110,9 +147,43 @@ func (s *TagService) Info(ctx context.Context, name string) (*Tag, error) {
 		return nil, fmt.Errorf("failed to parse tag info response: %w", err)
 	}
 	if len(tags) == 0 {
-		return nil, fmt.Errorf("tag not found: %s", cleanName)
+		return nil, &NotFoundError{Name: cleanName}
 	}
-	return &tags[0], nil
+	// A returned row with 0 posts is a placeholder (renamed-away antecedent,
+	// unused tag — verified live: barefoot_sandals, gold_footwear and even
+	// painted_toenails all return rows). It does not make the name live.
+	return &TagInfo{Tag: tags[0], WD14: s.wd14Status(cleanName, tags[0].PostCount > 0)}, nil
+}
+
+// WD14Info classifies a name the caller already found absent from current
+// Danbooru: tagger_era when a pinned tagger vocabulary carries it, unknown
+// otherwise. Local computation, no request.
+func (s *TagService) WD14Info(name string) WD14Status {
+	return s.wd14Status(normalizeTag(name), false)
+}
+
+// TaggerVocabHits returns tagger vocabulary names containing the query
+// substring, best snapshot count first — the search_tags fallback when
+// Danbooru returns nothing. Local computation, no request.
+func (s *TagService) TaggerVocabHits(query string, limit int) []vocab.Hit {
+	return s.vocab.Substring(query, limit)
+}
+
+// wd14Status derives the verdict from a vocab lookup plus whether current
+// Danbooru carries the name: a hit is live when Danbooru does, tagger_era
+// when only the vocabularies do; a miss is live or unknown accordingly.
+func (s *TagService) wd14Status(name string, live bool) WD14Status {
+	hit, ok := s.vocab.Lookup(name)
+	if !ok {
+		if live {
+			return WD14Status{Status: wd14Live}
+		}
+		return WD14Status{Status: wd14Unknown}
+	}
+	if live {
+		return WD14Status{Status: wd14Live, Sources: hit.Sources}
+	}
+	return WD14Status{Status: wd14TaggerEra, Sources: hit.Sources}
 }
 
 // danbooruRelatedTag is the nested tag object inside a related_tags entry.
