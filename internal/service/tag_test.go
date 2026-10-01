@@ -22,6 +22,7 @@ type mockFetcher struct {
 	lastWikiTitle string
 	lastWikiOther string
 	lastPostsArg  string
+	lastPostsLim  int
 }
 
 func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool) ([]byte, error) {
@@ -49,6 +50,7 @@ func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, l
 
 func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
 	m.lastPostsArg = tags
+	m.lastPostsLim = limit
 	return m.postsResp, nil
 }
 

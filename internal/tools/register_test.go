@@ -56,6 +56,7 @@ func TestToolSchemas_HaveRequired(t *testing.T) {
 		{"get_related_tags", GetRelatedTagsTool, "tag"},
 		{"get_tag_alias", GetTagAliasTool, "name"},
 		{"search_posts", SearchPostsTool, "tags"},
+		{"get_tag_profile", GetTagProfileTool, "tag"},
 	}
 
 	for _, tt := range tests {
@@ -84,6 +85,7 @@ func TestToolSchemas_PropertiesExist(t *testing.T) {
 		{"get_related_tags", GetRelatedTagsTool, "limit"},
 		{"get_tag_wiki", GetTagWikiTool, "other_names"},
 		{"search_posts", SearchPostsTool, "limit"},
+		{"get_tag_profile", GetTagProfileTool, "sample"},
 	}
 
 	for _, tt := range tests {

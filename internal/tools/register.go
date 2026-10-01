@@ -23,6 +23,7 @@ type TagService interface {
 	Alias(ctx context.Context, name string) (*service.TagAlias, error)
 	Wiki(ctx context.Context, title, otherNames string, limit int) ([]service.WikiPage, error)
 	SearchPosts(ctx context.Context, tags string, limit int) ([]service.Post, error)
+	Profile(ctx context.Context, tag string, sample int) (*service.TagProfile, error)
 }
 
 // wd14HitsLimit caps the search_tags fallback: enough nearby candidates to
@@ -129,6 +130,17 @@ var (
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("max posts to return (default: 5)"),
+		),
+	)
+
+	GetTagProfileTool = mcp.NewTool("get_tag_profile",
+		mcp.WithDescription("Distribution profile of one tag from a random post sample (default 200): co_tags ordered by in-sample frequency (meta tags and the tag itself excluded), ubiquitous lists corpus-constant tags (freq >= 0.5), top_pairs characteristic combinations ranked by lift (co-occurrence above chance). Shows what a big tag actually renders as"),
+		mcp.WithString("tag",
+			mcp.Required(),
+			mcp.Description("exact tag name, e.g. 'arm_up'"),
+		),
+		mcp.WithNumber("sample",
+			mcp.Description("posts to sample (default: 200, range 20-200)"),
 		),
 	)
 )
@@ -257,5 +269,32 @@ func Register(s *server.MCPServer, svc TagService) {
 			return mcp.NewToolResultText(errResp("post_search_failed", err.Error())), nil
 		}
 		return jsonResult(map[string]any{"posts": posts})
+	})
+
+	// tool 7: get_tag_profile
+	s.AddTool(GetTagProfileTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, _ := req.Params.Arguments.(map[string]any)
+		tag := getStringArg(args, "tag")
+		if tag == "" {
+			return mcp.NewToolResultText(errResp("profile_failed", "tag parameter is required")), nil
+		}
+		sample := getIntArg(args, "sample", 200)
+
+		profile, err := svc.Profile(ctx, tag, sample)
+		if err != nil {
+			var nf *service.NotFoundError
+			if errors.As(err, &nf) {
+				// Same story as get_tag_info: the local WD14 verdict rides
+				// the not-found error so renamed names stay actionable.
+				b, _ := json.Marshal(map[string]any{
+					"error":   "tag_not_found",
+					"message": nf.Error(),
+					"wd14":    svc.WD14Info(tag),
+				})
+				return mcp.NewToolResultText(string(b)), nil
+			}
+			return mcp.NewToolResultText(errResp("profile_failed", err.Error())), nil
+		}
+		return jsonResult(profile)
 	})
 }

@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.BaixuanZhu/danbooru-tag-mcp",
-  "description": "Danbooru tag lookup MCP server for AI image generation: tags, aliases, related tags, wiki, posts",
+  "description": "Danbooru tag lookup MCP server for AI image generation: tags, aliases, related tags, tag profiles, wiki, posts",
   "title": "danbooru-tag-mcp",
   "repository": {
     "url": "https://github.com/BaixuanZhu/danbooru-tag-mcp",

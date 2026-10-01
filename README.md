@@ -36,11 +36,12 @@ Point your MCP client at the command:
 }
 ```
 
-That's it — the client picks up the six tools below on its next session.
+That's it — the client picks up the seven tools below on its next session.
 
 ## Features
 
-- **6 MCP tools**: tag search, exact tag info, related tags, alias resolution, wiki lookup, and post search
+- **7 MCP tools**: tag search, exact tag info, related tags, alias resolution, wiki lookup, post search, and tag distribution profiles
+- **Tag distribution profiles**: `get_tag_profile` samples a random page of a big tag's posts and answers what it actually renders as — co-occurring tags by in-sample frequency (corpus constants like `1girl`/`solo` split into `ubiquitous`), plus characteristic combinations ranked by lift, so a 300k-post tag like `arm_up` can be checked against what you actually wanted before it pollutes a prompt
 - **Tag lists back from post search**: `search_posts` returns each post's full tag list split by category (copyright/artist/character/general/meta), so mining a few posts reveals which tags naturally go together
 - **Tagger-era tag detection**: `get_tag_info` classifies every name against the pinned WD14 tagger vocabularies (`wd14` field: `live` / `tagger_era` — a tagger-era name Danbooru has since renamed, try `get_tag_alias` / `unknown`), so LoRA card captions stop dead-ending at "tag not found"; `search_tags` adds `wd14_hits` fallback hits when no result carries posts
 - **R-18 by default**: `search_posts` defaults to `rating:explicit`; pass your own `rating:g/s/q/e` metatag to narrow a query
@@ -107,6 +108,7 @@ alternatively use the full exe path.
 | `get_tag_alias` | Resolve an alias or misspelling to its canonical tag (`null` = input is already canonical) | `name` (required, e.g. `sailor_suit`) |
 | `get_tag_wiki` | Wiki page of a tag: description, multilingual names, and the `[[tag]]` links extracted from the body | `title` or `other_names` (one required), `limit` (default 5) |
 | `search_posts` | Search posts by a tag combination (defaults to `rating:explicit`; a `rating:` metatag overrides it). Each post carries `tags` split by category: `copyright` / `artist` / `character` / `general` / `meta` | `tags` (required, space-separated), `limit` (default 5) |
+| `get_tag_profile` | Distribution profile of one tag from a random post sample (default 200 posts, whole population — no rating filter): `co_tags` ordered by in-sample frequency, `ubiquitous` corpus constants (`freq >= 0.5`), `top_pairs` characteristic combinations ranked by lift (co-occurrence above chance). Meta tags and the tag itself excluded | `tag` (required, e.g. `arm_up`), `sample` (default 200, range 20-200) |
 
 ## CLI
 

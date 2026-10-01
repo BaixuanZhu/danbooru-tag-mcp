@@ -1,8 +1,8 @@
 # AGENTS.md
 
-Danbooru tag lookup MCP server (Go). With no arguments it serves 6 tools over
+Danbooru tag lookup MCP server (Go). With no arguments it serves 7 tools over
 stdio (`search_tags` / `get_tag_info` / `get_related_tags` / `get_tag_alias` /
-`get_tag_wiki` / `search_posts`) to
+`get_tag_wiki` / `search_posts` / `get_tag_profile`) to
 help local AI image generation pick correct Danbooru tags; it is also a
 self-updatable CLI (`upgrade` / `version` subcommands). User-facing docs live
 in `README.md`; agent-facing conventions live here.
@@ -90,6 +90,28 @@ content tags. Category ids are 0=general, 1=artist, 3=copyright, 4=character,
 5=meta (Danbooru's actual API numbering — verified live, do not "fix" to the
 0-4 continuous scheme). Both behaviors are pinned by unit tests and the
 integration script.
+
+**Tag distribution profile (get_tag_profile, test-enforced, do not break)**:
+answers "what does this big tag actually render as" (arm_up: 309k posts,
+mostly bent-arm poses, drowning arm_above_head's 3.2k) by sampling ONE
+request — `<tag> order:random`, default/limit 200 posts (the anonymous
+per-page cap, verified live) — and aggregating locally in
+`internal/service/profile.go`: singles counted per post (query tag and
+meta-category dropped), split at freq >= 0.5 into `ubiquitous` (corpus
+constants like 1girl/solo — verified live to be the raw top 10 of every big
+tag, not a property of the tag) vs freq-ordered `co_tags`; `top_pairs`
+combinations ranked by **lift** (joint freq over the product of singles
+freqs) because naive pair frequency reproduces the same 1girl+solo baseline
+every time — lift surfaces tag-specific poses (arm_up: holding_weapon+sword,
+lift ~12). Two boundaries pinned by unit tests: the sample query must stay
+`<tag> order:random` with **no rating filter** (`Profile` calls
+`fetcher.FetchPosts` directly, NOT `SearchPosts` — a rating:explicit sample
+would describe arm_up's 5% explicit subpopulation, pinned by
+`TestProfile_UbiquitousSplitAndExclusions`), and the tool is single-tag
+only because `order:` counts toward the 2-tag query limit (verified live:
+`arm_up 1boy order:random` 422s). Renamed/0-post tags return an empty
+profile whose embedded `wd14` verdict tells the story, mirroring
+`get_tag_info`'s NotFound handling.
 
 **Tagger-era detection (WD14 layer, test-enforced, do not break)**:
 `internal/vocab` embeds the WD14 tagger vocabularies (`wd-v1-4-moat-tagger-v2`

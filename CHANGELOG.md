@@ -4,6 +4,23 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [Unreleased]
+
+### Added
+
+- `get_tag_profile` (7th MCP tool): distribution profile of a single tag,
+  answering "what does this big tag actually render as" with data instead of
+  accumulated trial-and-error. Samples one random page of the tag's posts
+  (default 200, `order:random`) and aggregates locally: `co_tags` ordered by
+  in-sample frequency (the query tag and meta-category tags excluded),
+  `ubiquitous` for corpus-constant tags (`freq >= 0.5`, e.g. `1girl`/`solo`
+  — the baseline every big tag shares), and `top_pairs` characteristic
+  combinations ranked by lift (co-occurrence above chance, e.g. arm_up
+  surfaces `holding_weapon + sword`). Single-tag only by design: the sample
+  query `<tag> order:random` already sits at Danbooru's 2-tag limit, and the
+  sample is deliberately not rating-filtered so it describes the whole
+  population.
+
 ## [0.2.2] - 2026-10-01
 
 ### Added

@@ -39,7 +39,7 @@ export DANBOORU_MCP_NO_BOOTSTRAP=1
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 11 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 12 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -56,6 +56,7 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl blue_hair long_hair"}}}'
   req '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"gold_footwear"}}}'
   req '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"gold footwear","limit":5}}}'
+  req '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"arm_up","sample":200}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -98,11 +99,12 @@ def payload(rid):
 info = resp.get(1, {}).get('result', {}).get('serverInfo', {})
 check(info.get('name') == 'danbooru-tags', 'initialize: server reports danbooru-tags')
 
-# 2. all six tools registered
+# 2. all seven tools registered
 names = sorted(t['name'] for t in resp.get(2, {}).get('result', {}).get('tools', []))
 expected = sorted(['search_tags', 'get_tag_info', 'get_related_tags',
-                   'get_tag_alias', 'get_tag_wiki', 'search_posts'])
-check(names == expected, 'tools/list: exactly the six tools')
+                   'get_tag_alias', 'get_tag_wiki', 'search_posts',
+                   'get_tag_profile'])
+check(names == expected, 'tools/list: exactly the seven tools')
 
 # 3. search_tags
 tags = payload(3).get('tags')
@@ -161,6 +163,24 @@ check(search11.get('wd14_hits')
       and any(h.get('name') == 'gold_footwear' and len(h.get('sources', [])) == 2
               for h in search11['wd14_hits']),
       'search_tags: dead-end query surfaces wd14_hits')
+
+# 12. get_tag_profile: live distribution profile of a big tag. The sample
+#     must be a real random draw (no rating filter, self/meta excluded) and
+#     both frequency-ordered singles and lift-ranked pairs must come back.
+prof = payload(12)
+allt = prof.get('co_tags', []) + prof.get('ubiquitous', [])
+check(prof.get('name') == 'arm_up' and prof.get('sample', 0) >= 100
+      and prof.get('wd14', {}).get('status') == 'live',
+      'get_tag_profile: arm_up sampled live')
+check(bool(prof.get('ubiquitous')) and prof['ubiquitous'][0].get('freq', 0) >= 0.5,
+      'get_tag_profile: corpus constants split into ubiquitous')
+check(bool(prof.get('co_tags')) and prof['co_tags'][0].get('freq', 0) >= 0.1
+      and all(e.get('category') != 5 for e in allt)
+      and not any(e.get('tag') == 'arm_up' for e in allt),
+      'get_tag_profile: freq-ordered co_tags, meta and self excluded')
+check(bool(prof.get('top_pairs'))
+      and all(isinstance(p.get('lift'), (int, float)) for p in prof['top_pairs']),
+      'get_tag_profile: lift-ranked combinations present')
 
 print()
 if failures:
