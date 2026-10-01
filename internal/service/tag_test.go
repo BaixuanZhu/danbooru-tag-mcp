@@ -321,7 +321,12 @@ func TestWiki_OtherNamesMode(t *testing.T) {
 	}
 }
 
-func TestSearchPosts_DefaultsToExplicitRating(t *testing.T) {
+func TestSearchPosts_NoRatingInjection(t *testing.T) {
+	// Pinned on purpose: no layer may pick a rating on the caller's behalf.
+	// An injected rating:explicit would bias research queries to a ~5%
+	// subpopulation (arm_up is 95% g/s/q — verified live) and contradict
+	// get_tag_profile's whole-population sample. The query must go out
+	// verbatim; callers opt into a rating with an exempt rating: metatag.
 	mock := &mockFetcher{
 		postsResp: []byte(`[{"id":100,"rating":"e","preview_file_url":"https://danbooru.donmai.us/sample.jpg"}]`),
 	}
@@ -331,10 +336,19 @@ func TestSearchPosts_DefaultsToExplicitRating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if !strings.Contains(mock.lastPostsArg, "rating:explicit") {
-		t.Errorf("expected tags to include rating:explicit, got: %s", mock.lastPostsArg)
+	if mock.lastPostsArg != "cat_ears 1girl" {
+		t.Errorf("query must be sent verbatim with no rating appended, got: %s", mock.lastPostsArg)
 	}
+
+	// A caller-supplied rating metatag is kept as-is (nothing to override).
+	mock.lastPostsArg = ""
+	if _, err := svc.SearchPosts(context.Background(), "cat_ears rating:general", 5); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastPostsArg != "cat_ears rating:general" {
+		t.Errorf("caller rating must be kept verbatim, got: %s", mock.lastPostsArg)
+	}
+
 	if len(posts) != 1 || posts[0].ID != 100 || posts[0].Rating != "e" {
 		t.Errorf("parsed post mismatch: %+v", posts)
 	}
@@ -427,21 +441,5 @@ func TestSearchPosts_MetatagCounting(t *testing.T) {
 	}
 	if mock.lastPostsArg != "" {
 		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
-	}
-}
-
-func TestSearchPosts_KeepsCallerRating(t *testing.T) {
-	mock := &mockFetcher{postsResp: []byte(`[]`)}
-	svc := NewTagService(mock, nil)
-
-	if _, err := svc.SearchPosts(context.Background(), "cat_ears rating:general", 5); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if strings.Contains(mock.lastPostsArg, "rating:explicit") {
-		t.Errorf("caller rating must not be overridden, got: %s", mock.lastPostsArg)
-	}
-	if !strings.Contains(mock.lastPostsArg, "rating:general") {
-		t.Errorf("caller rating must be kept, got: %s", mock.lastPostsArg)
 	}
 }

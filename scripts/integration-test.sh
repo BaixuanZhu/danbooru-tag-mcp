@@ -52,7 +52,7 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_related_tags","arguments":{"tag":"blue_hair","limit":3}}}'
   req '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_tag_alias","arguments":{"name":"sailor_suit"}}}'
   req '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_tag_wiki","arguments":{"title":"firefly_(honkai:_star_rail)"}}}'
-  req '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl","limit":2}}}'
+  req '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl rating:e","limit":2}}}'
   req '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl blue_hair long_hair"}}}'
   req '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"gold_footwear"}}}'
   req '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"gold footwear","limit":5}}}'
@@ -133,12 +133,14 @@ pages = payload(7).get('wiki_pages')
 check(bool(pages) and len(pages[0].get('linked_tags', [])) > 0,
       'get_tag_wiki: linked_tags extracted from body')
 
-# 8. search_posts default rating + per-post categorized tag list
+# 8. search_posts honors the caller's rating metatag + per-post categorized
+#    tag list. (No default rating is injected — that boundary is pinned
+#    deterministically by TestSearchPosts_NoRatingInjection at the mock layer.)
 posts = payload(8).get('posts')
 check(bool(posts) and all(p.get('rating') == 'e' for p in posts)
       and all(isinstance(p.get('tags', {}).get('general'), list)
               and len(p['tags']['general']) > 0 for p in posts),
-      'search_posts: explicit rating + categorized tag list per post')
+      'search_posts: caller rating metatag honored + categorized tag list per post')
 
 # 9. tag-count pre-validation (rejected locally, no network round trip)
 err = payload(9)

@@ -338,17 +338,6 @@ func extractLinkedTags(body string) []string {
 	return tags
 }
 
-// hasRatingMetatag reports whether the caller already pinned a rating filter
-// (e.g. "rating:g") so SearchPosts does not override their choice.
-func hasRatingMetatag(tags string) bool {
-	for _, field := range strings.Fields(tags) {
-		if strings.HasPrefix(field, "rating:") {
-			return true
-		}
-	}
-	return false
-}
-
 // maxContentTags caps content tags per post search: free/anonymous Danbooru
 // accounts allow 2 tags per query (Gold unlocks 6).
 const maxContentTags = 2
@@ -394,19 +383,15 @@ func parsePostTags(p danbooruPost) PostTags {
 	}
 }
 
-// SearchPosts core business rule: default to rating:explicit (R-18 allowed);
-// a rating:<x> metatag supplied by the caller is kept as-is.
+// SearchPosts sends the tags out verbatim: no layer injects a rating
+// filter. The caller pins rating:<x> when they want one (rating: metatags
+// are exempt from the tag-count limit), so an unfiltered query describes
+// the tag's whole population — the same whole-population rule
+// get_tag_profile samples by.
 func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int) ([]Post, error) {
 	query := strings.TrimSpace(tags)
 	if n := countContentTags(query); n > maxContentTags {
 		return nil, fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query", n, maxContentTags)
-	}
-	if !hasRatingMetatag(query) {
-		if query == "" {
-			query = "rating:explicit"
-		} else {
-			query = fmt.Sprintf("%s rating:explicit", query)
-		}
 	}
 
 	body, err := s.fetcher.FetchPosts(ctx, query, limit)

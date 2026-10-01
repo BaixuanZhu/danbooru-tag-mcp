@@ -123,7 +123,7 @@ var (
 	)
 
 	SearchPostsTool = mcp.NewTool("search_posts",
-		mcp.WithDescription("Search posts by tags. Defaults to rating:explicit (R-18); a rating:g/s/q/e metatag in tags overrides it (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries its tag list split by category (copyright/artist/character/general/meta)"),
+		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries its tag list split by category (copyright/artist/character/general/meta)"),
 		mcp.WithString("tags",
 			mcp.Required(),
 			mcp.Description("space-separated tags"),

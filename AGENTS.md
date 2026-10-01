@@ -68,18 +68,23 @@ layers are decoupled via interfaces for mock-based unit tests:
 zero-config client compatibility); `upgrade` / `version` / `help` are CLI
 mode, where writing to stdout is allowed.
 
-**Rating filter boundary (test-enforced, do not break)**: the api layer's
-`FetchPosts` must NOT inject a rating filter (see
-`TestFetchPosts_DoesNotAddRatingFilter`); the service layer's `SearchPosts`
-defaults to `rating:explicit` (R-18 allowed — a deliberate product choice for
-local image generation) and appends it only when the caller's tags contain no
-`rating:` metatag, so callers can override the rating per query. The
-`search_posts` tool description documents the default and the g/s/q/e ladder
-so MCP clients know the rule without extra configuration. `SearchPosts` also
-pre-validates the tag count locally (max 2; content tags and `order:`
-metatags count, `rating:`/`status:`/`id:` style metatags are exempt —
-verified empirically) so over-limit queries fail with a clear error instead
-of a Danbooru 422.
+**Rating filter boundary (test-enforced, do not break)**: **no layer injects
+a rating filter** — neither the api layer's `FetchPosts`
+(`TestFetchPosts_DoesNotAddRatingFilter`) nor the service layer's
+`SearchPosts` (`TestSearchPosts_NoRatingInjection` asserts the query goes
+out verbatim). Rating choice belongs to the caller: a `rating:g/s/q/e`
+metatag narrows a query and is exempt from the tag-count limit, so opting
+in costs nothing toward the 2-tag cap. History: v0.1.0–0.2.x defaulted
+`SearchPosts` to `rating:explicit` as an R-18-allowed product statement;
+dropped in 0.3.0 because a default filter biases research queries toward a
+~5% subpopulation (arm_up is 95% g/s/q — verified live) and contradicted
+`get_tag_profile`'s whole-population sample; "uncensored, unfiltered"
+expresses the product stance without picking a rating for the caller. The
+`search_posts` tool description documents the g/s/q/e ladder so MCP clients
+know the opt-in syntax. `SearchPosts` still pre-validates the tag count
+locally (max 2; content tags and `order:` metatags count, `rating:`/
+`status:`/`id:` style metatags are exempt — verified empirically) so
+over-limit queries fail with a clear error instead of a Danbooru 422.
 
 **Result shaping (inspiration discovery, the product's weak spot turned
 strength)**: `SearchPosts` returns each post's full tag list split by category

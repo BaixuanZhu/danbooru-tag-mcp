@@ -21,6 +21,16 @@ when tagging.
   sample is deliberately not rating-filtered so it describes the whole
   population.
 
+### Changed
+
+- `search_posts` no longer defaults to `rating:explicit`: the query goes out
+  verbatim, so results reflect a tag's whole population (arm_up is ~95%
+  g/s/q — the old default sampled a 5% subpopulation and contradicted
+  `get_tag_profile`). Agents that want R-18 add `rating:e` themselves, and
+  rating metatags are exempt from the 2-tag query limit, so opting in costs
+  nothing. The server stays uncensored — it never hides a rating, it just no
+  longer picks one for you.
+
 ## [0.2.2] - 2026-10-01
 
 ### Added
