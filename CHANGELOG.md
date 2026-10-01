@@ -4,7 +4,7 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-01
 
 ### Added
 
