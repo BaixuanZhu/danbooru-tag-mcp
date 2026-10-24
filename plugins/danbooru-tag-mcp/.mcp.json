@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "danbooru-tags": {
+      "command": "danbooru-tag-mcp",
+      "args": [],
+      "env": {
+        "DANBOORU_MCP_NO_BOOTSTRAP": "1"
+      }
+    }
+  }
+}

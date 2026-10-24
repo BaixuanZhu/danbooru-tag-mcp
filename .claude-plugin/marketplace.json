@@ -1,0 +1,24 @@
+{
+  "name": "danbooru-tag-mcp",
+  "owner": {
+    "name": "BaixuanZhu",
+    "url": "https://github.com/BaixuanZhu"
+  },
+  "description": "Danbooru tag lookup MCP server plugin marketplace.",
+  "plugins": [
+    {
+      "name": "danbooru-tag-mcp",
+      "version": "0.1.0",
+      "source": "./plugins/danbooru-tag-mcp",
+      "description": "Danbooru tag lookup MCP server for AI image generation: tags, aliases, tag profiles, wiki, posts. Requires the danbooru-tag-mcp CLI on PATH.",
+      "category": "utilities",
+      "keywords": [
+        "danbooru",
+        "mcp",
+        "tags",
+        "ai-image-generation",
+        "stable-diffusion"
+      ]
+    }
+  ]
+}

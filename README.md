@@ -80,6 +80,25 @@ Download `danbooru-tag-mcp-windows-<arch>.zip` from the
 extract `danbooru-tag-mcp.exe` anywhere, and run it once — the first run
 silently adds its own directory to the user PATH (idempotent).
 
+### Option 4: ZCode / Claude Code plugin (auto MCP config)
+
+For ZCode and Claude Code users the MCP configuration can come from a plugin
+instead of hand-edited JSON: add this repository as a plugin marketplace and
+install `danbooru-tag-mcp` — the plugin ships the `danbooru-tags` server
+definition, so no client-side config is needed.
+
+- **ZCode**: Plugin Marketplace → Add → `BaixuanZhu/danbooru-tag-mcp` →
+  install the `danbooru-tag-mcp` plugin.
+- **Claude Code**: `/plugin install danbooru-tag-mcp --marketplace BaixuanZhu/danbooru-tag-mcp`
+  (one step, Claude Code 2.1.275+), or add the marketplace first with
+  `claude plugin marketplace add BaixuanZhu/danbooru-tag-mcp` and install
+  from there.
+
+The plugin wires the configuration only — the CLI still has to be on PATH
+(install it first via Option 1-3 above), and `danbooru-tag-mcp upgrade`
+keeps it updated independently of the plugin. See
+[plugins/danbooru-tag-mcp/README.md](plugins/danbooru-tag-mcp/README.md).
+
 ## Configure your MCP client
 
 Point your MCP client (Claude Desktop, ZCode, etc.) at the command:
@@ -96,7 +115,8 @@ Point your MCP client (Claude Desktop, ZCode, etc.) at the command:
 ```
 
 The bare command name works because the install directory is on the user PATH;
-alternatively use the full exe path.
+alternatively use the full exe path. ZCode and Claude Code users can skip the
+manual JSON entirely via [Option 4](#option-4-zcode--claude-code-plugin-auto-mcp-config).
 
 ## Tools
 

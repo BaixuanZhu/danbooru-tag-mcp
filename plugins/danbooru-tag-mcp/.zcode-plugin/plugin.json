@@ -1,0 +1,11 @@
+{
+  "name": "danbooru-tag-mcp",
+  "version": "0.1.0",
+  "description": "Danbooru tag lookup MCP server for AI image generation: tags, aliases, tag profiles, wiki, posts. Requires the danbooru-tag-mcp CLI on PATH.",
+  "author": {
+    "name": "BaixuanZhu",
+    "url": "https://github.com/BaixuanZhu"
+  },
+  "license": "MIT",
+  "mcpServers": "./.mcp.json"
+}

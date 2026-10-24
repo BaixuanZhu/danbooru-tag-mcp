@@ -4,6 +4,21 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [0.4.0] - Unreleased
+
+### Added
+
+- ZCode / Claude Code plugin distribution: this repository is now a plugin
+  marketplace (`.claude-plugin/marketplace.json`, mirrored at the repo root
+  for ZCode), and `plugins/danbooru-tag-mcp/` packages the `danbooru-tags`
+  MCP server definition so installing the plugin configures the client with
+  zero manual JSON. The plugin is configuration-only by design: it launches
+  the bare `danbooru-tag-mcp` command from PATH (the CLI still comes from
+  the installer channels and stays updatable via `upgrade`), sets only
+  `DANBOORU_MCP_NO_BOOTSTRAP=1`, and never declares credential variables —
+  empty `env` placeholders would override inherited user credentials and
+  silently downgrade to anonymous.
+
 ## [0.3.0] - 2026-10-01
 
 ### Added

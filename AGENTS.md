@@ -140,6 +140,25 @@ result carries posts (`hasLiveTag`). The wd14 policy translation (probe the
 canonical form via `get_tag_alias`, or describe in prose) stays with the
 consuming agent — the server reports facts only.
 
+**Plugin distribution (ZCode / Claude Code, configuration-only)**:
+`plugins/danbooru-tag-mcp/` is the plugin source — a pure MCP wiring plugin,
+no skills, no binaries, no download logic. Its `.mcp.json` launches the bare
+command `danbooru-tag-mcp` (PATH resolution) with only
+`DANBOORU_MCP_NO_BOOTSTRAP=1` in `env`, so the exe itself stays owned by the
+installer channels and `upgrade`; the plugin version (in
+`.claude-plugin/plugin.json`, `.zcode-plugin/plugin.json`, and both
+marketplace files) is the packaging version, decoupled from the CLI version —
+bump it only when the plugin files change, and keep the four files in sync
+(two manifests + root `marketplace.json` + `.claude-plugin/marketplace.json`,
+which are identical mirrors; ZCode reads either location, Claude Code reads
+the `.claude-plugin/` one). Never declare `DANBOORU_LOGIN` /
+`DANBOORU_API_KEY` in the plugin's `env` — not even as empty placeholders:
+explicitly declared values override the inherited environment in MCP
+clients, so an empty string silently downgrades authenticated users to
+anonymous (server-side, `client.go` injects credentials only when both are
+non-empty). Credentials flow through user-level environment variables by
+inheritance; this is documented in the plugin README.
+
 ## Key conventions and gotchas
 
 - **stdout carries JSON-RPC only**: in MCP server mode all logs must go to
