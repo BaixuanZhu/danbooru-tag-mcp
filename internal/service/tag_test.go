@@ -13,12 +13,14 @@ import (
 type mockFetcher struct {
 	tagsResp    []byte
 	exactResp   []byte
+	namesResp   []byte
 	relatedResp []byte
 	aliasResp   []byte
 	wikiResp    []byte
 	postsResp   []byte
 
 	lastTagsArg   string
+	lastNamesArg  []string
 	lastWikiTitle string
 	lastWikiOther string
 	lastPostsArg  string
@@ -32,6 +34,11 @@ func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit i
 
 func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) ([]byte, error) {
 	return m.exactResp, nil
+}
+
+func (m *mockFetcher) FetchTagsByNames(ctx context.Context, names []string) ([]byte, error) {
+	m.lastNamesArg = names
+	return m.namesResp, nil
 }
 
 func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) ([]byte, error) {

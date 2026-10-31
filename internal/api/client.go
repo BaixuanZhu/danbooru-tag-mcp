@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -147,6 +148,18 @@ func (c *Client) FetchTagExact(ctx context.Context, name string) ([]byte, error)
 	q := make(url.Values)
 	q.Set("search[name]", name)
 	q.Set("limit", "1")
+	return c.Get(ctx, "/tags.json", q)
+}
+
+// FetchTagsByNames fetches the exact rows for multiple tag names in ONE
+// request: search[name_normalize] accepts a comma-separated list and
+// canonicalizes each entry (case, spacing), so the response carries at most
+// one exact row per requested name. limit is set to the name count because
+// the default page size would silently truncate longer lists.
+func (c *Client) FetchTagsByNames(ctx context.Context, names []string) ([]byte, error) {
+	q := make(url.Values)
+	q.Set("search[name_normalize]", strings.Join(names, ","))
+	q.Set("limit", strconv.Itoa(len(names)))
 	return c.Get(ctx, "/tags.json", q)
 }
 

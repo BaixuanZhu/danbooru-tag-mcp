@@ -53,6 +53,7 @@ func TestToolSchemas_HaveRequired(t *testing.T) {
 	}{
 		{"search_tags", SearchTagsTool, "query"},
 		{"get_tag_info", GetTagInfoTool, "name"},
+		{"get_tags_info", GetTagsInfoTool, "names"},
 		{"get_related_tags", GetRelatedTagsTool, "tag"},
 		{"get_tag_alias", GetTagAliasTool, "name"},
 		{"search_posts", SearchPostsTool, "tags"},
@@ -84,6 +85,7 @@ func TestToolSchemas_PropertiesExist(t *testing.T) {
 		{"search_tags", SearchTagsTool, "limit"},
 		{"get_related_tags", GetRelatedTagsTool, "limit"},
 		{"get_tag_wiki", GetTagWikiTool, "other_names"},
+		{"get_tags_info", GetTagsInfoTool, "names"},
 		{"search_posts", SearchPostsTool, "limit"},
 		{"get_tag_profile", GetTagProfileTool, "sample"},
 	}

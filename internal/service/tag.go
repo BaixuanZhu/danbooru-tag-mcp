@@ -68,6 +68,7 @@ type Post struct {
 type TagFetcher interface {
 	FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool) ([]byte, error)
 	FetchTagExact(ctx context.Context, name string) ([]byte, error)
+	FetchTagsByNames(ctx context.Context, names []string) ([]byte, error)
 	FetchRelated(ctx context.Context, tag string) ([]byte, error)
 	FetchAlias(ctx context.Context, name string) ([]byte, error)
 	FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error)

@@ -30,11 +30,14 @@ all: build
 # ---- Build (dev: bootstrap off, no user PATH pollution) ----
 # -trimpath strips local paths, -ldflags "-s -w" drops debug symbols for size
 # GOOS is pinned to windows (Windows-only project); GOARCH accepts arm64 for cross builds
+# CGO_ENABLED=0 and -buildvcs=false pin the remaining nondeterminism (cgo
+# toolchain paths, .git state) so the same source + toolchain always builds
+# byte-identical exes — the reproducibility contract documented in README.
 .PHONY: build
 build:
 	@echo "[build] $(TARGET) (v$(VERSION), windows/$(GOARCH), dev: no bootstrap)..."
 	@mkdir -p $(DIST)/$(GOARCH)
-	GOOS=windows GOARCH=$(GOARCH) $(GO) build -trimpath -ldflags "$(LDFLAGS_DEV)" -o $(TARGET) .
+	GOOS=windows GOARCH=$(GOARCH) CGO_ENABLED=0 $(GO) build -trimpath -buildvcs=false -ldflags "$(LDFLAGS_DEV)" -o $(TARGET) .
 	@echo "[ok]   $(TARGET)"
 
 # ---- Build (release flavor: bootstrap on, for release packaging and install.ps1) ----
@@ -42,7 +45,7 @@ build:
 build-dist:
 	@echo "[build-dist] $(TARGET) (v$(VERSION), windows/$(GOARCH))..."
 	@mkdir -p $(DIST)/$(GOARCH)
-	GOOS=windows GOARCH=$(GOARCH) $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(TARGET) .
+	GOOS=windows GOARCH=$(GOARCH) CGO_ENABLED=0 $(GO) build -trimpath -buildvcs=false -ldflags "$(LDFLAGS)" -o $(TARGET) .
 	@echo "[ok]   $(TARGET)"
 
 # ---- Build and run (args: make run ARGS="version") ----
@@ -58,11 +61,26 @@ run: build
 # dist/ are listed, so building both arches and re-running this target merges
 # them into one checksum manifest.
 .PHONY: release
-release: build-dist
-	@powershell -NoProfile -Command "Compress-Archive -Path $(DIST)\$(GOARCH)\$(BINARY).exe -DestinationPath $(DIST)\$(BINARY)-windows-$(GOARCH).zip -Force"
+release: build-dist zip
 	@cd $(DIST) && sha256sum $$(ls *.zip) > checksums.txt
 	@echo "[release] $(DIST)/$(BINARY)-windows-$(GOARCH).zip + checksums.txt"
 	@echo "          Upload to the GitHub Release (tag: v$(VERSION)); `upgrade` self-update then works"
+
+# SOURCE_DATE_EPOCH pins zip entry timestamps to the commit time (fixed
+# fallback outside git), so the same commit always zips to the same bytes on
+# any machine — the reproducibility contract documented in README. Export it
+# to override (standard convention of reproducible-builds.org).
+SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct 2>/dev/null || echo 946684800)
+
+# ---- Deterministic zip of the already-built exe (no rebuild) ----
+# Packages the existing dist/<arch>/danbooru-tag-mcp.exe via scripts/zipfile,
+# which pins every entry header field instead of Compress-Archive's
+# local-time timestamps.
+.PHONY: zip
+zip:
+	@echo "[zip] $(DIST)/$(BINARY)-windows-$(GOARCH).zip (epoch $(SOURCE_DATE_EPOCH))..."
+	@$(GO) run ./scripts/zipfile -out $(DIST)/$(BINARY)-windows-$(GOARCH).zip -epoch $(SOURCE_DATE_EPOCH) $(TARGET)
+	@echo "[ok]   $(DIST)/$(BINARY)-windows-$(GOARCH).zip"
 
 # ---- NSIS installer (requires makensis on PATH: scoop install nsis / choco install nsis) ----
 # Output: dist/danbooru-tag-mcp-windows-$(GOARCH)-setup.exe (double-click setup
@@ -71,7 +89,12 @@ release: build-dist
 # native $(GOARCH) exe. The /D flags are not POSIX paths, so MSYS_NO_PATHCONV=1
 # stops Git Bash / MSYS from mangling them.
 .PHONY: installer
-installer: build-dist
+installer: build-dist installer-only
+
+# Package the setup exe from the already-built exe (no rebuild), so CI can
+# build once, then package both artifacts from the same build.
+.PHONY: installer-only
+installer-only:
 	@echo "[installer] building setup exe (v$(VERSION), $(GOARCH))..."
 	@MSYS_NO_PATHCONV=1 makensis /DAPP_VERSION=$(VERSION) /DAPP_ARCH=$(GOARCH) installer/danbooru-tag-mcp.nsi
 	@echo "[ok]   $(DIST)/$(BINARY)-windows-$(GOARCH)-setup.exe"
@@ -128,7 +151,9 @@ help:
 	@echo "  make build-dist               release-flavor build (bootstrap on)"
 	@echo "  make run ARGS=\"version\"        dev build and run (GOARCH=arm64 for ARM64 cross build)"
 	@echo "  make release                  build portable zip + checksums.txt -> $(DIST)/"
+	@echo "  make zip                      deterministic zip of the already-built exe (no rebuild)"
 	@echo "  make installer                build NSIS setup exe -> $(DIST)/$(BINARY)-windows-<arch>-setup.exe"
+	@echo "  make installer-only           package setup exe from the already-built exe (no rebuild)"
 	@echo "  make dist-all                 build both release assets (current GOARCH)"
 	@echo "  make clean                    remove $(DIST)/"
 	@echo "  make tidy                     go mod tidy"

@@ -1,8 +1,8 @@
 # AGENTS.md
 
-Danbooru tag lookup MCP server (Go). With no arguments it serves 7 tools over
-stdio (`search_tags` / `get_tag_info` / `get_related_tags` / `get_tag_alias` /
-`get_tag_wiki` / `search_posts` / `get_tag_profile`) to
+Danbooru tag lookup MCP server (Go). With no arguments it serves 8 tools over
+stdio (`search_tags` / `get_tag_info` / `get_tags_info` / `get_related_tags` /
+`get_tag_alias` / `get_tag_wiki` / `search_posts` / `get_tag_profile`) to
 help local AI image generation pick correct Danbooru tags; it is also a
 self-updatable CLI (`upgrade` / `version` subcommands). User-facing docs live
 in `README.md`; agent-facing conventions live here.
@@ -20,8 +20,10 @@ code page (this bit `make` echoes before). Do not introduce Chinese anywhere.
 make build                          # dev build (ldflags injects Bootstrap=off, no bootstrap) -> dist/<arch>/
 make build-dist                     # release build (bootstrap on)
 make run ARGS="version"             # build and run a subcommand
-make release                        # portable zip + checksums.txt -> dist/ (for GitHub Releases)
-make installer                      # NSIS setup exe -> dist/danbooru-tag-mcp-windows-<arch>-setup.exe
+make release                        # build + deterministic zip + checksums.txt -> dist/
+make zip                            # deterministic zip of the already-built exe (no rebuild)
+make installer                      # build + NSIS setup exe -> dist/danbooru-tag-mcp-windows-<arch>-setup.exe
+make installer-only                 # package setup exe from the already-built exe (no rebuild)
 make dist-all                       # both release assets (current GOARCH)
 go vet ./...                        # static check
 make test / make test-race          # tests / race detector
@@ -140,6 +142,21 @@ result carries posts (`hasLiveTag`). The wd14 policy translation (probe the
 canonical form via `get_tag_alias`, or describe in prose) stays with the
 consuming agent — the server reports facts only.
 
+**Batch tag lookup (get_tags_info, test-enforced, do not break)**: resolves
+up to 20 exact names in **one** Danbooru request — `search[name_normalize]`
+accepts a comma-separated list while `search[name]` does NOT (both verified
+live); the cap (`maxBatchNames`) and the empty-input check fire pre-flight,
+before any fetch (`TestInfos_RejectsBadInputBeforeAnyRequest`). Semantics
+align with `get_tag_info`: 0-post placeholder rows are `found` and classify
+`tagger_era`; names absent from Danbooru go to `missing`, each carrying the
+local `wd14` verdict (the batch counterpart of the NotFoundError rider);
+all-missing is a valid answer, not an error. `Found` rows carry the canonical
+API row name (rows are matched case-insensitively because the API normalizes
+case while `normalizeTag` does not). Deliberately NOT batched:
+related/wiki/profile/posts — those have unbounded payloads; the batch stays
+on fixed-size rows so the response is a few KB max. `Info` keeps using
+`FetchTagExact` (its tests pin that path; do not migrate it).
+
 **Plugin distribution (ZCode / Claude Code, configuration-only)**:
 `plugins/danbooru-tag-mcp/` is the plugin source — a pure MCP wiring plugin,
 no skills, no binaries, no download logic. Its `.mcp.json` launches the bare
@@ -169,11 +186,27 @@ inheritance; this is documented in the plugin README.
   `install.ps1`; keep both in sync): asset naming
   `danbooru-tag-mcp-{GOOS}-{GOARCH}.zip` (contains a single
   `danbooru-tag-mcp.exe`); `checksums.txt` in sha256sum format matched by bare
-  file name (tolerates binary-mode `*` prefix; `make release` generates it);
+  file name (tolerates binary-mode `*` prefix; covers both zips AND both
+  setup exes — the consumers match by bare file name and ignore extra lines);
   Windows cannot overwrite a running exe, so replacement goes through a `.bak`
   rename, with leftovers cleaned by `CleanupStaleBak` on next startup.
   Publishing a release: push a `v0.2.0`-format tag; the workflow builds and
   uploads the assets automatically (no manual upload).
+- **Reproducible builds (release integrity model — no Authenticode)**: the
+  exe and portable zips are byte-reproducible; that is the trust story and
+  must not regress. The contract: exact toolchain pinned via the `toolchain`
+  directive in `go.mod` (CI reads it with `go-version-file`), build flags
+  `CGO_ENABLED=0 -trimpath -buildvcs=false` in both Makefile build targets,
+  and zips written by `scripts/zipfile` with entry timestamps pinned to
+  `SOURCE_DATE_EPOCH` (= commit time; Compress-Archive is banned for release
+  zips — local-time DOS timestamps break determinism). The release workflow
+  builds each arch exe **once**, then packages via `make installer-only` /
+  `make zip` (both no-rebuild; do not reintroduce phony rebuilds before
+  packaging), runs a `verify-repro` job that rebuilds from the tagged source
+  on Linux and compares hashes with the published asset, and attaches free
+  keyless `actions/attest-build-provenance` attestations. Known boundary:
+  the NSIS setup exe is NOT byte-reproducible (makensis embeds build
+  metadata) — covered by checksums + attestation only; documented in README.
 - **Bootstrap guards** (`app.BootstrapEnabled`): skip when any holds —
   `DANBOORU_MCP_NO_BOOTSTRAP` non-empty, build-injected `Bootstrap=off`
   (`make build` dev artifacts), or the exe is under the system Temp dir (`go
@@ -191,9 +224,12 @@ inheritance; this is documented in the plugin README.
   (shell scripts break under Git Bash / CI windows runners when autocrlf
   converts them to CRLF).
 - Release: push a `v*` tag and `.github/workflows/release.yml` runs tests,
-  builds amd64+arm64 NSIS setup exes via `make installer` and portable zips
-  via `make release`, generates `checksums.txt` (zips only), and publishes
-  the GitHub Release (with `install.ps1` as an asset). Release notes come
+  builds each arch exe once, packages amd64+arm64 NSIS setup exes via
+  `make installer-only` and deterministic portable zips via `make zip`,
+  generates `checksums.txt` (zips + setup exes), attaches build-provenance
+  attestations, and publishes the GitHub Release (with `install.ps1` as an
+  asset); the `verify-repro` job then proves the published exe matches a
+  from-source rebuild. Release notes come
   from a `## [x.y.z]` section in `CHANGELOG.md` when present, otherwise
   auto-generated. `make` targets accept `VERSION=` and `GOARCH=` overrides,
   which is how the workflow pins them. Bump the `version` in `server.json`
@@ -225,6 +261,8 @@ inheritance; this is documented in the plugin README.
   explicit params for table-driven tests; registry operations are only tested
   with `DANBOORU_MCP_TEST_REGISTRY=1`. Test naming `TestXxx_Behavior`.
 - Go 1.26, single third-party dependency `github.com/mark3labs/mcp-go`. The
+  exact patch toolchain is pinned in `go.mod` (`toolchain` directive) for
+  reproducible builds — bump it deliberately and together with CI. The
   repo root has a `go.work` (`use .`).
 - Dev environment is Windows + Git Bash (Git Bash path-converts args like
   `/v`, so use `MSYS_NO_PATHCONV=1` when calling `reg` and similar tools).

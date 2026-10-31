@@ -34,9 +34,9 @@ marketplace:
 
 ## What you get
 
-The 7 Danbooru tag lookup tools (`search_tags`, `get_tag_info`,
-`get_related_tags`, `get_tag_alias`, `get_tag_wiki`, `search_posts`,
-`get_tag_profile`) — see the
+The 8 Danbooru tag lookup tools (`search_tags`, `get_tag_info`,
+`get_tags_info`, `get_related_tags`, `get_tag_alias`, `get_tag_wiki`,
+`search_posts`, `get_tag_profile`) — see the
 [tool reference](https://github.com/BaixuanZhu/danbooru-tag-mcp#tools)
 for parameters and output shapes.
 

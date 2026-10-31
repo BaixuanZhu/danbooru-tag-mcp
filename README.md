@@ -36,11 +36,12 @@ Point your MCP client at the command:
 }
 ```
 
-That's it — the client picks up the seven tools below on its next session.
+That's it — the client picks up the eight tools below on its next session.
 
 ## Features
 
-- **7 MCP tools**: tag search, exact tag info, related tags, alias resolution, wiki lookup, post search, and tag distribution profiles
+- **8 MCP tools**: tag search, exact tag info, batch tag lookup, related tags, alias resolution, wiki lookup, post search, and tag distribution profiles
+- **Batch tag lookup**: `get_tags_info` resolves up to 20 exact tag names in a single request — one tool call instead of 20, with found/missing split and a `wd14` verdict on every name
 - **Tag distribution profiles**: `get_tag_profile` samples a random page of a big tag's posts and answers what it actually renders as — co-occurring tags by in-sample frequency (corpus constants like `1girl`/`solo` split into `ubiquitous`), plus characteristic combinations ranked by lift, so a 300k-post tag like `arm_up` can be checked against what you actually wanted before it pollutes a prompt
 - **Tag lists back from post search**: `search_posts` returns each post's full tag list split by category (copyright/artist/character/general/meta), so mining a few posts reveals which tags naturally go together
 - **Tagger-era tag detection**: `get_tag_info` classifies every name against the pinned WD14 tagger vocabularies (`wd14` field: `live` / `tagger_era` — a tagger-era name Danbooru has since renamed, try `get_tag_alias` / `unknown`), so LoRA card captions stop dead-ending at "tag not found"; `search_tags` adds `wd14_hits` fallback hits when no result carries posts
@@ -124,6 +125,7 @@ manual JSON entirely via [Option 4](#option-4-zcode--claude-code-plugin-auto-mcp
 |------|-------------|------------|
 | `search_tags` | Search tags by keyword, ordered by post count; when no result has posts, adds `wd14_hits` (WD14 tagger vocab names containing the query) | `query` (required, e.g. `blue hair`), `limit` (default 10) |
 | `get_tag_info` | Exact info for one tag (category, post count), plus a `wd14` verdict: `live` (current Danbooru), `tagger_era` (WD14 tagger vocab only, likely renamed — see `get_tag_alias`), `unknown` (neither) | `name` (required, e.g. `blue_hair`) |
+| `get_tags_info` | Batch version of `get_tag_info`: up to 20 exact names in one request; returns `found` (each with the same fields as `get_tag_info`) and `missing` (names absent from Danbooru, each still carrying its `wd14` verdict) | `names` (required, e.g. `["blue_hair","1girl"]`, max 20) |
 | `get_related_tags` | Tags that co-occur with the given tag (meta-category tags like `highres` are filtered out as noise) | `tag` (required), `limit` (default 10) |
 | `get_tag_alias` | Resolve an alias or misspelling to its canonical tag (`null` = input is already canonical) | `name` (required, e.g. `sailor_suit`) |
 | `get_tag_wiki` | Wiki page of a tag: description, multilingual names, and the `[[tag]]` links extracted from the body | `title` or `other_names` (one required), `limit` (default 5) |
@@ -166,3 +168,38 @@ make installer   # NSIS setup exe (requires makensis: scoop install nsis)
 Releases are automated: pushing a `v*` tag makes GitHub Actions run the test
 suite and publish the setup exes, portable zips, and `checksums.txt` for both
 architectures.
+
+## Reproducible builds & verifying downloads
+
+Release binaries are **not** Authenticode-signed; integrity rests on
+reproducible builds plus SHA-256, all free and verifiable by anyone:
+
+- The exe and portable zips are **byte-reproducible**: the exact Go toolchain
+  is pinned in `go.mod`, builds use `CGO_ENABLED=0 -trimpath -buildvcs=false`,
+  and zips are written by `scripts/zipfile` with entry timestamps pinned to
+  the commit time (`SOURCE_DATE_EPOCH`). Same source + toolchain ⇒ identical
+  bytes on any machine, any timezone.
+- Every release job runs a **verify-repro** check: it rebuilds the exe from
+  the tagged source on a Linux runner and compares it byte-for-byte against
+  the published Windows-built asset — a green check on the release proves
+  the artifacts were built from the tag without tampering.
+- All artifacts carry **SHA-256 checksums** (`checksums.txt`) and free
+  keyless **build-provenance attestations** signed by the GitHub workflow.
+
+Verify a download:
+
+```bash
+sha256sum -c --ignore-missing checksums.txt   # integrity vs the manifest
+gh attestation verify --repo BaixuanZhu/danbooru-tag-mcp danbooru-tag-mcp.exe   # provenance
+```
+
+Reproduce the portable exe yourself and compare:
+
+```bash
+git checkout v0.4.0
+make build-dist VERSION=0.4.0 GOARCH=amd64
+sha256sum dist/amd64/danbooru-tag-mcp.exe     # must equal the hash inside the published zip
+```
+
+The NSIS setup exe is the one non-reproducible artifact (makensis embeds
+build metadata); it is still covered by `checksums.txt` and the attestations.

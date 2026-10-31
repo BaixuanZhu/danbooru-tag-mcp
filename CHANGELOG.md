@@ -8,6 +8,27 @@ when tagging.
 
 ### Added
 
+- `get_tags_info` (8th MCP tool): batch exact lookup for up to 20 tag names
+  in a single Danbooru request (`search[name_normalize]` accepts a
+  comma-separated list — verified live), replacing N× `get_tag_info` calls
+  when vetting a candidate prompt list. Returns `found` rows (same fields as
+  `get_tag_info`, including the `wd14` verdict; 0-post placeholder rows
+  count as found and classify `tagger_era`) plus `missing` names, each still
+  carrying its local `wd14` verdict so tagger-era names stay actionable.
+  One request regardless of batch size, so the client's 1.5s rate-limit gap
+  is paid once; response is fixed-size rows only.
+- Reproducible release builds + SHA-256 standardization (no Authenticode):
+  the exe and portable zips are byte-reproducible — exact toolchain pinned
+  in `go.mod`, `CGO_ENABLED=0 -buildvcs=false` builds, and a deterministic
+  zip helper (`scripts/zipfile`) pinning entry timestamps to the commit time
+  (`SOURCE_DATE_EPOCH`). `checksums.txt` now covers the NSIS setup exes too
+  (both consumers match by bare file name and ignore extra lines), every
+  artifact gets a free keyless GitHub build-provenance attestation, and a
+  new `verify-repro` release job rebuilds the exe from the tagged source on
+  Linux and compares it byte-for-byte against the published asset — proof
+  the release was built from the tag untampered. The setup exe remains
+  non-reproducible (makensis embeds build metadata) and is covered by
+  checksums + attestation.
 - ZCode / Claude Code plugin distribution: this repository is now a plugin
   marketplace (`.claude-plugin/marketplace.json`, mirrored at the repo root
   for ZCode), and `plugins/danbooru-tag-mcp/` packages the `danbooru-tags`

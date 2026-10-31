@@ -39,7 +39,7 @@ export DANBOORU_MCP_NO_BOOTSTRAP=1
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 12 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 13 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -57,6 +57,7 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"gold_footwear"}}}'
   req '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"gold footwear","limit":5}}}'
   req '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"arm_up","sample":200}}}'
+  req '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"get_tags_info","arguments":{"names":["blue_hair","gold_footwear","not_a_real_tag_xyz"]}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -99,12 +100,12 @@ def payload(rid):
 info = resp.get(1, {}).get('result', {}).get('serverInfo', {})
 check(info.get('name') == 'danbooru-tags', 'initialize: server reports danbooru-tags')
 
-# 2. all seven tools registered
+# 2. all eight tools registered
 names = sorted(t['name'] for t in resp.get(2, {}).get('result', {}).get('tools', []))
-expected = sorted(['search_tags', 'get_tag_info', 'get_related_tags',
-                   'get_tag_alias', 'get_tag_wiki', 'search_posts',
-                   'get_tag_profile'])
-check(names == expected, 'tools/list: exactly the seven tools')
+expected = sorted(['search_tags', 'get_tag_info', 'get_tags_info',
+                   'get_related_tags', 'get_tag_alias', 'get_tag_wiki',
+                   'search_posts', 'get_tag_profile'])
+check(names == expected, 'tools/list: exactly the eight tools')
 
 # 3. search_tags
 tags = payload(3).get('tags')
@@ -183,6 +184,23 @@ check(bool(prof.get('co_tags')) and prof['co_tags'][0].get('freq', 0) >= 0.1
 check(bool(prof.get('top_pairs'))
       and all(isinstance(p.get('lift'), (int, float)) for p in prof['top_pairs']),
       'get_tag_profile: lift-ranked combinations present')
+
+# 13. get_tags_info: batch exact lookup in one request — live name, 0-post
+#     tagger-era placeholder row, and a genuinely missing name, all in one
+#     response (search[name_normalize] comma list, verified live).
+batch = payload(13)
+found13 = {t.get('name'): t for t in batch.get('found', [])}
+missing13 = {m.get('name'): m for m in batch.get('missing', [])}
+check(found13.get('blue_hair', {}).get('post_count', 0) > 0
+      and found13['blue_hair'].get('wd14', {}).get('status') == 'live',
+      'get_tags_info: live name found with wd14 live')
+check(found13.get('gold_footwear', {}).get('post_count') == 0
+      and found13['gold_footwear'].get('wd14', {}).get('status') == 'tagger_era'
+      and len(found13['gold_footwear'].get('wd14', {}).get('sources', [])) == 2,
+      'get_tags_info: 0-post placeholder found, classified tagger_era + both sources')
+check('not_a_real_tag_xyz' in missing13
+      and missing13['not_a_real_tag_xyz'].get('wd14', {}).get('status') == 'unknown',
+      'get_tags_info: absent name listed under missing with wd14 unknown')
 
 print()
 if failures:

@@ -17,6 +17,7 @@ import (
 type TagService interface {
 	Search(ctx context.Context, query string, limit int) ([]service.Tag, error)
 	Info(ctx context.Context, name string) (*service.TagInfo, error)
+	Infos(ctx context.Context, names []string) (*service.TagsInfo, error)
 	WD14Info(name string) service.WD14Status
 	TaggerVocabHits(query string, limit int) []vocab.Hit
 	Related(ctx context.Context, tag string, limit int) ([]service.RelatedTag, error)
@@ -67,6 +68,26 @@ func getIntArg(args map[string]any, key string, defaultVal int) int {
 		}
 	}
 	return defaultVal
+}
+
+// getStringSliceArg extracts a string-array argument. MCP clients deliver
+// JSON arrays as []any; non-string entries are skipped.
+func getStringSliceArg(args map[string]any, key string) []string {
+	val, ok := args[key]
+	if !ok {
+		return nil
+	}
+	arr, ok := val.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // Exported tool instances so register_test.go can statically validate their schemas
@@ -141,6 +162,16 @@ var (
 		),
 		mcp.WithNumber("sample",
 			mcp.Description("posts to sample (default: 200, range 20-200)"),
+		),
+	)
+
+	GetTagsInfoTool = mcp.NewTool("get_tags_info",
+		mcp.WithDescription("Batch exact info for up to 20 Danbooru tag names in one request (cheaper than repeated get_tag_info calls). Returns found tags (name, category, post_count, wd14 verdict: live/tagger_era/unknown) and missing names with their wd14 verdict"),
+		mcp.WithArray("names",
+			mcp.Required(),
+			mcp.MaxItems(20),
+			mcp.Items(map[string]any{"type": "string"}),
+			mcp.Description("exact tag names, e.g. ['blue_hair','1girl']"),
 		),
 	)
 )
@@ -271,30 +302,45 @@ func Register(s *server.MCPServer, svc TagService) {
 		return jsonResult(map[string]any{"posts": posts})
 	})
 
-	// tool 7: get_tag_profile
-	s.AddTool(GetTagProfileTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args, _ := req.Params.Arguments.(map[string]any)
-		tag := getStringArg(args, "tag")
-		if tag == "" {
-			return mcp.NewToolResultText(errResp("profile_failed", "tag parameter is required")), nil
-		}
-		sample := getIntArg(args, "sample", 200)
-
-		profile, err := svc.Profile(ctx, tag, sample)
-		if err != nil {
-			var nf *service.NotFoundError
-			if errors.As(err, &nf) {
-				// Same story as get_tag_info: the local WD14 verdict rides
-				// the not-found error so renamed names stay actionable.
-				b, _ := json.Marshal(map[string]any{
-					"error":   "tag_not_found",
-					"message": nf.Error(),
-					"wd14":    svc.WD14Info(tag),
-				})
-				return mcp.NewToolResultText(string(b)), nil
+		// tool 7: get_tag_profile
+		s.AddTool(GetTagProfileTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			args, _ := req.Params.Arguments.(map[string]any)
+			tag := getStringArg(args, "tag")
+			if tag == "" {
+				return mcp.NewToolResultText(errResp("profile_failed", "tag parameter is required")), nil
 			}
-			return mcp.NewToolResultText(errResp("profile_failed", err.Error())), nil
+			sample := getIntArg(args, "sample", 200)
+
+			profile, err := svc.Profile(ctx, tag, sample)
+			if err != nil {
+				var nf *service.NotFoundError
+				if errors.As(err, &nf) {
+					// Same story as get_tag_info: the local WD14 verdict rides
+					// the not-found error so renamed names stay actionable.
+					b, _ := json.Marshal(map[string]any{
+						"error":   "tag_not_found",
+						"message": nf.Error(),
+						"wd14":    svc.WD14Info(tag),
+					})
+					return mcp.NewToolResultText(string(b)), nil
+				}
+				return mcp.NewToolResultText(errResp("profile_failed", err.Error())), nil
+			}
+			return jsonResult(profile)
+		})
+
+	// tool 8: get_tags_info
+	s.AddTool(GetTagsInfoTool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args, _ := req.Params.Arguments.(map[string]any)
+		names := getStringSliceArg(args, "names")
+		if len(names) == 0 {
+			return mcp.NewToolResultText(errResp("tags_info_failed", "names parameter is required (array of tag names)")), nil
 		}
-		return jsonResult(profile)
+
+		info, err := svc.Infos(ctx, names)
+		if err != nil {
+			return mcp.NewToolResultText(errResp("tags_info_failed", err.Error())), nil
+		}
+		return jsonResult(info)
 	})
 }

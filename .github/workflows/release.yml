@@ -6,6 +6,14 @@
 #   danbooru-tag-mcp-windows-<arch>.zip         portable zip (fetched by `upgrade` self-update)
 #   checksums.txt                               sha256sum manifest shared by upgrade and install.ps1
 #   install.ps1                                 one-line PowerShell installer (stable URL on main)
+#
+# Release integrity = reproducible builds + SHA-256 (no Authenticode):
+# the exe and zips are byte-reproducible (pinned toolchain via go.mod,
+# CGO_ENABLED=0, -buildvcs=false, deterministic zipfile helper), keyless
+# GitHub attestations prove which workflow built each asset, and the
+# verify-repro job rebuilds the exe on Linux and compares it against the
+# published Windows-built asset. The NSIS setup exe is NOT byte-reproducible
+# (makensis embeds build metadata) — it is covered by checksums + attestation.
 
 name: release
 
@@ -16,6 +24,8 @@ on:
 
 permissions:
   contents: write  # softprops/action-gh-release needs this to create the release and upload assets
+  id-token: write  # actions/attest-build-provenance needs this for keyless signing
+  attestations: write
 
 jobs:
   build-and-release:
@@ -27,7 +37,10 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
-          go-version: '1.26'
+          # go.mod pins the exact toolchain (reproducible builds); CI and
+          # local rebuilds must compile with the same gc patch release.
+          go-version-file: go.mod
+          cache: true
 
       - name: go test (pre-release unit test gate)
         # Red tests fail the job and block the release. Publishing is an
@@ -42,9 +55,9 @@ jobs:
         run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build danbooru-tag-mcp.exe (amd64 + arm64)
-        # Both arches built sequentially into dist/amd64/ and dist/arm64/.
-        # build-dist is the release flavor (startup bootstrap on); make build
-        # is the dev flavor with bootstrap off.
+        # Both arches built sequentially into dist/amd64/ and dist/arm64/,
+        # exactly once: the installer-only/zip targets below package this
+        # same build, so every artifact embeds the identical exe.
         run: |
           make build-dist VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
           make build-dist VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
@@ -69,28 +82,48 @@ jobs:
         shell: pwsh
         run: makensis /VERSION
 
-      - name: Build installer (amd64 + arm64)
-        # Each invocation rebuilds its arch's exe (build-dist dependency) and
-        # packs it into dist/danbooru-tag-mcp-windows-<arch>-setup.exe
+      - name: Package installer (amd64 + arm64)
+        # installer-only packs the already-built exe (no rebuild) into
+        # dist/danbooru-tag-mcp-windows-<arch>-setup.exe
         run: |
-          make installer VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
-          make installer VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
+          make installer-only VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
+          make installer-only VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
 
-      - name: Build portable zip (amd64 + arm64)
-        # windows-latest ships with zip support, so make release works directly
+      - name: Package portable zip (amd64 + arm64)
+        # zip is deterministic (scripts/zipfile pins entry metadata to the
+        # commit timestamp), so re-running it yields byte-identical archives.
         run: |
-          make release VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
-          make release VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
+          make zip VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=amd64
+          make zip VERSION=${{ steps.ver.outputs.VERSION }} GOARCH=arm64
 
       - name: Generate checksum
         # GNU coreutils sha256sum format checksums.txt, shared by `upgrade`
-        # self-update and install.ps1 for download integrity verification
+        # self-update and install.ps1 for download integrity verification.
+        # Both consumers match lines by bare file name and ignore the rest,
+        # so the setup exes can ride along in the same manifest.
         shell: bash
         run: |
           cd dist
-          sha256sum danbooru-tag-mcp-windows-amd64.zip danbooru-tag-mcp-windows-arm64.zip > checksums.txt
+          sha256sum \
+            danbooru-tag-mcp-windows-amd64.zip \
+            danbooru-tag-mcp-windows-arm64.zip \
+            danbooru-tag-mcp-windows-amd64-setup.exe \
+            danbooru-tag-mcp-windows-arm64-setup.exe > checksums.txt
           echo "--- checksums.txt ---"
           cat checksums.txt
+
+      - name: Attest build provenance
+        # Free keyless sigstore attestations signed via the workflow's OIDC
+        # identity: proof of which commit/workflow produced each asset.
+        # Verify locally with:
+        #   gh attestation verify --repo BaixuanZhu/danbooru-tag-mcp <file>
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            dist/danbooru-tag-mcp-windows-amd64-setup.exe
+            dist/danbooru-tag-mcp-windows-arm64-setup.exe
+            dist/danbooru-tag-mcp-windows-amd64.zip
+            dist/danbooru-tag-mcp-windows-arm64.zip
 
       - name: Extract release notes from CHANGELOG.md
         # Pulls the section matching the current tag from CHANGELOG.md as the
@@ -136,3 +169,53 @@ jobs:
             dist/danbooru-tag-mcp-windows-arm64.zip
             dist/checksums.txt
             install.ps1
+
+  verify-repro:
+    # Reproducibility proof: rebuild the portable exe from the tagged source
+    # on Linux (cross-compile, same pinned toolchain) and compare byte-for-
+    # byte with the published Windows-built asset. Equal hashes prove the
+    # release exe is exactly what the tagged source builds into — no
+    # tampering after the build and no build-machine-specific bytes.
+    name: Verify reproducible build
+    runs-on: ubuntu-latest
+    needs: build-and-release
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Rebuild from the tagged source (cross-compile)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          make build-dist VERSION="$VERSION" GOARCH=amd64
+          make build-dist VERSION="$VERSION" GOARCH=arm64
+
+      - name: Download published zips and compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p published
+          gh release download "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'danbooru-tag-mcp-windows-*.zip' --dir published
+          status=0
+          {
+            echo "## Reproducibility check (Linux rebuild vs published asset)"
+            echo ""
+            echo "| arch | local rebuild | published | verdict |"
+            echo "|---|---|---|---|"
+            for arch in amd64 arm64; do
+              unzip -o -q "published/danbooru-tag-mcp-windows-${arch}.zip" -d "published/${arch}"
+              local_hash=$(sha256sum "dist/${arch}/danbooru-tag-mcp.exe" | cut -d' ' -f1)
+              pub_hash=$(sha256sum "published/${arch}/danbooru-tag-mcp.exe" | cut -d' ' -f1)
+              if [ "$local_hash" = "$pub_hash" ]; then verdict=match; else verdict=MISMATCH; status=1; fi
+              echo "| ${arch} | \`${local_hash}\` | \`${pub_hash}\` | ${verdict} |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $status

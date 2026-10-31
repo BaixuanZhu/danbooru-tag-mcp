@@ -153,6 +153,29 @@ func TestFetchTagExact_ReturnsSingle(t *testing.T) {
 	}
 }
 
+func TestFetchTagsByNames_BuildsQuery(t *testing.T) {
+	var gotNames, gotLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotNames = r.URL.Query().Get("search[name_normalize]")
+		gotLimit = r.URL.Query().Get("limit")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(srv.URL)
+	_, err := cli.FetchTagsByNames(context.Background(), []string{"blue_hair", "1girl", "solo"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// One request for the whole batch: comma-joined name_normalize plus a
+	// limit matching the name count, so the default page size cannot
+	// truncate the response.
+	if gotNames != "blue_hair,1girl,solo" || gotLimit != "3" {
+		t.Errorf("unexpected query params: name_normalize=%s, limit=%s", gotNames, gotLimit)
+	}
+}
+
 func TestFetchAlias_BuildsCorrectURL(t *testing.T) {
 	var gotName, gotStatus, gotLimit string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
