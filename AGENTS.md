@@ -199,7 +199,11 @@ inheritance; this is documented in the plugin README.
   `CGO_ENABLED=0 -trimpath -buildvcs=false` in both Makefile build targets,
   and zips written by `scripts/zipfile` with entry timestamps pinned to
   `SOURCE_DATE_EPOCH` (= commit time; Compress-Archive is banned for release
-  zips — local-time DOS timestamps break determinism). The release workflow
+  zips — local-time DOS timestamps break determinism). Gotcha: the zip
+  recipe strips GOOS/GOARCH (`env -u`) around `go run` because command-line
+  make variables are exported to recipes — `make zip GOARCH=arm64` would
+  otherwise cross-compile the packager itself and fail on the runner (this
+  broke the first v0.4.0 release run). The release workflow
   builds each arch exe **once**, then packages via `make installer-only` /
   `make zip` (both no-rebuild; do not reintroduce phony rebuilds before
   packaging), runs a `verify-repro` job that rebuilds from the tagged source

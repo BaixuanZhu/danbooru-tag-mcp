@@ -75,11 +75,14 @@ SOURCE_DATE_EPOCH ?= $(shell git log -1 --pretty=%ct 2>/dev/null || echo 9466848
 # ---- Deterministic zip of the already-built exe (no rebuild) ----
 # Packages the existing dist/<arch>/danbooru-tag-mcp.exe via scripts/zipfile,
 # which pins every entry header field instead of Compress-Archive's
-# local-time timestamps.
+# local-time timestamps. The packager itself must run on the HOST arch:
+# command-line make variables (GOARCH=arm64) are exported to recipes, which
+# would cross-compile `go run` too and break on the runner (env -u strips
+# them so go falls back to host defaults).
 .PHONY: zip
 zip:
 	@echo "[zip] $(DIST)/$(BINARY)-windows-$(GOARCH).zip (epoch $(SOURCE_DATE_EPOCH))..."
-	@$(GO) run ./scripts/zipfile -out $(DIST)/$(BINARY)-windows-$(GOARCH).zip -epoch $(SOURCE_DATE_EPOCH) $(TARGET)
+	@env -u GOOS -u GOARCH $(GO) run ./scripts/zipfile -out $(DIST)/$(BINARY)-windows-$(GOARCH).zip -epoch $(SOURCE_DATE_EPOCH) $(TARGET)
 	@echo "[ok]   $(DIST)/$(BINARY)-windows-$(GOARCH).zip"
 
 # ---- NSIS installer (requires makensis on PATH: scoop install nsis / choco install nsis) ----
