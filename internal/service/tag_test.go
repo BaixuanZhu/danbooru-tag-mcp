@@ -19,16 +19,18 @@ type mockFetcher struct {
 	wikiResp    []byte
 	postsResp   []byte
 
-	lastTagsArg   string
-	lastNamesArg  []string
-	lastWikiTitle string
-	lastWikiOther string
-	lastPostsArg  string
-	lastPostsLim  int
+	lastTagsArg      string
+	lastTagsCategory int
+	lastNamesArg     []string
+	lastWikiTitle    string
+	lastWikiOther    string
+	lastPostsArg     string
+	lastPostsLim     int
 }
 
-func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool) ([]byte, error) {
+func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error) {
 	m.lastTagsArg = namePattern
+	m.lastTagsCategory = category
 	return m.tagsResp, nil
 }
 
@@ -67,7 +69,7 @@ func TestSearch_ParsesTags(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	tags, err := svc.Search(context.Background(), "blue hair", 10)
+	tags, err := svc.Search(context.Background(), "blue hair", 10, -1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -76,6 +78,43 @@ func TestSearch_ParsesTags(t *testing.T) {
 	}
 	if len(tags) != 1 || tags[0].Name != "blue_hair" || tags[0].PostCount != 500 {
 		t.Errorf("parsed tag mismatch: %+v", tags)
+	}
+}
+
+func TestSearch_ForwardsCategory(t *testing.T) {
+	// The API only accepts numeric ids (verified live: "character" returns
+	// empty while 4 works), so the service must forward the id verbatim.
+	mock := &mockFetcher{tagsResp: []byte(`[]`)}
+	svc := NewTagService(mock, nil)
+
+	if _, err := svc.Search(context.Background(), "firefly", 10, 4); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastTagsCategory != 4 {
+		t.Errorf("expected category 4 forwarded, got %d", mock.lastTagsCategory)
+	}
+	if _, err := svc.Search(context.Background(), "firefly", 10, -1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.lastTagsCategory != -1 {
+		t.Errorf("expected category -1 (no filter) forwarded, got %d", mock.lastTagsCategory)
+	}
+}
+
+func TestCategoryID(t *testing.T) {
+	for name, want := range map[string]int{
+		"general": 0, "artist": 1, "copyright": 3, "character": 4, "meta": 5,
+		"Character": 4, " CHARACTER ": 4,
+	} {
+		got, ok := CategoryID(name)
+		if !ok || got != want {
+			t.Errorf("CategoryID(%q): expected %d, got %d,%v", name, want, got, ok)
+		}
+	}
+	for _, bad := range []string{"", "style", "circle", "0", "4"} {
+		if _, ok := CategoryID(bad); ok {
+			t.Errorf("CategoryID(%q) must not resolve", bad)
+		}
 	}
 }
 
@@ -287,7 +326,7 @@ func TestWiki_ExtractsLinkedTags(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	pages, err := svc.Wiki(context.Background(), "firefly_(honkai:_star_rail)", "", 5)
+	pages, err := svc.Wiki(context.Background(), "firefly_(honkai:_star_rail)", "", 5, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -320,11 +359,121 @@ func TestWiki_OtherNamesMode(t *testing.T) {
 	mock := &mockFetcher{wikiResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
 
-	if _, err := svc.Wiki(context.Background(), "", "流萤", 5); err != nil {
+	if _, err := svc.Wiki(context.Background(), "", "流萤", 5, false); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if mock.lastWikiTitle != "" || mock.lastWikiOther != "流萤" {
 		t.Errorf("other-names mode must pass the alias only, got title=%q other=%q", mock.lastWikiTitle, mock.lastWikiOther)
+	}
+}
+
+func TestInfo_RenamedTo(t *testing.T) {
+	// Verified live: renamed-away names keep a 0-post placeholder row, and
+	// every sampled active alias antecedent has one. The alias consequent is
+	// the actionable answer, so it rides the row as renamed_to.
+	mock := &mockFetcher{
+		exactResp: []byte(`[{"id":26260,"name":"sailor_suit","category":0,"post_count":0}]`),
+		aliasResp: []byte(`[{"antecedent_name":"sailor_suit","consequent_name":"sailor","status":"active"}]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	info, err := svc.Info(context.Background(), "sailor_suit")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.RenamedTo != "sailor" {
+		t.Errorf("expected renamed_to sailor, got %q", info.RenamedTo)
+	}
+	raw, _ := json.Marshal(info)
+	if !strings.Contains(string(raw), `"renamed_to":"sailor"`) {
+		t.Errorf("expected renamed_to in payload, got: %s", raw)
+	}
+}
+
+func TestInfo_LiveRowSkipsAliasRequest(t *testing.T) {
+	// The alias lookup runs only on the 0-post dead end: a live row must not
+	// pay the extra request.
+	mock := &mockFetcher{
+		exactResp: []byte(armUpExactRow),
+		aliasResp: []byte(`[{"antecedent_name":"arm_up","consequent_name":"x","status":"active"}]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	info, err := svc.Info(context.Background(), "arm_up")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.RenamedTo != "" {
+		t.Errorf("live row must not carry renamed_to, got %q", info.RenamedTo)
+	}
+}
+
+func TestInfo_AliasLookupFailureIsNonFatal(t *testing.T) {
+	// The alias fetch is an enhancement: a parse failure (here: empty body)
+	// must still return the found row, just without renamed_to.
+	mock := &mockFetcher{
+		exactResp: []byte(`[{"id":26260,"name":"sailor_suit","category":0,"post_count":0}]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	info, err := svc.Info(context.Background(), "sailor_suit")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if info.Name != "sailor_suit" || info.RenamedTo != "" {
+		t.Errorf("expected the row without renamed_to, got: %+v", info)
+	}
+}
+
+func TestSearchPosts_Fields(t *testing.T) {
+	// score/fav_count/large_file_url are present on all sampled posts
+	// (verified live); the projection must copy them through.
+	mock := &mockFetcher{
+		postsResp: []byte(`[{
+			"id": 900,
+			"rating": "g",
+			"score": 42,
+			"fav_count": 7,
+			"preview_file_url": "https://cdn.donmai.us/preview/x.jpg",
+			"large_file_url": "https://cdn.donmai.us/large/x.jpg"
+		}]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	posts, err := svc.SearchPosts(context.Background(), "touhou", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	p := posts[0]
+	if p.Score != 42 || p.FavCount != 7 {
+		t.Errorf("score/fav_count not copied: %+v", p)
+	}
+	if p.LargeFileURL != "https://cdn.donmai.us/large/x.jpg" {
+		t.Errorf("large_file_url not copied: %q", p.LargeFileURL)
+	}
+	raw, _ := json.Marshal(posts)
+	for _, want := range []string{`"score":42`, `"fav_count":7`, `"large_file_url":"https://cdn.donmai.us/large/x.jpg"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("expected %s in payload, got: %s", want, raw)
+		}
+	}
+}
+
+func TestSearchPosts_RejectsLimitOverMax(t *testing.T) {
+	// 20 posts bound the payload at ~20 KB (a post carries ~44 tags on
+	// average, verified live); limit 21 must fail before any request.
+	mock := &mockFetcher{postsResp: []byte(`[]`)}
+	svc := NewTagService(mock, nil)
+
+	_, err := svc.SearchPosts(context.Background(), "1girl", maxPostLimit+1)
+	if err == nil || !strings.Contains(err.Error(), "too many posts requested") {
+		t.Fatalf("expected limit rejection, got: %v", err)
+	}
+	if mock.lastPostsArg != "" {
+		t.Errorf("no request should be sent on limit rejection, got: %s", mock.lastPostsArg)
+	}
+	if _, err := svc.SearchPosts(context.Background(), "1girl", maxPostLimit); err != nil {
+		t.Errorf("limit %d must stay allowed, got: %v", maxPostLimit, err)
 	}
 }
 

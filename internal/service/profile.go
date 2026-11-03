@@ -33,6 +33,27 @@ const (
 	profileMaxPairs     = 10
 )
 
+// The opt-in sample orderings and rating filter (validated pre-flight).
+var (
+	profileOrders  = map[string]bool{"random": true, "score": true, "favcount": true}
+	profileRatings = map[string]bool{"g": true, "s": true, "q": true, "e": true}
+)
+
+// ProfileOptions carries the optional caller choices for one profile. With
+// selects pair mode; Order/Rating reshape the sample query.
+type ProfileOptions struct {
+	With   string // optional second exact tag; non-empty selects pair mode
+	Rating string // optional g|s|q|e filter (metatag, exempt from the tag cap)
+	Order  string // random|score|favcount; empty means random (single mode)
+}
+
+// ProfileWith is the pair-mode descriptor in the response: the second tag and
+// its whole-population post count.
+type ProfileWith struct {
+	Tag       string `json:"tag"`
+	PostCount int    `json:"post_count"`
+}
+
 // ProfileTag is one co-occurring tag with the share of sampled posts that
 // carry it.
 type ProfileTag struct {
@@ -53,34 +74,61 @@ type ProfilePair struct {
 }
 
 // TagProfile is get_tag_profile's payload: what a tag's posts actually look
-// like, estimated from one random page. The tag row and wd14 verdict are
+// like, estimated from one sampled page. The tag row and wd14 verdict are
 // embedded (flat), so profiling a renamed-away name returns the same story
 // get_tag_info tells.
 type TagProfile struct {
 	TagInfo
-	Sample     int           `json:"sample"`     // distinct posts actually sampled
-	Ubiquitous []ProfileTag  `json:"ubiquitous"` // corpus constants (freq >= 0.5), freq-ordered
-	CoTags     []ProfileTag  `json:"co_tags"`    // the tag's variable content, freq-ordered
-	TopPairs   []ProfilePair `json:"top_pairs"`  // combinations ranked by lift
+	With       *ProfileWith       `json:"with,omitempty"`   // pair-mode second tag descriptor
+	Order      string             `json:"order"`            // random|score|favcount|recent
+	Rating     string             `json:"rating,omitempty"` // applied rating filter, if any
+	Sample     int                `json:"sample"`           // distinct posts actually sampled
+	Ratings    map[string]float64 `json:"ratings"`          // share of the sample per rating
+	Ubiquitous []ProfileTag       `json:"ubiquitous"`       // corpus constants (freq >= 0.5), freq-ordered
+	CoTags     []ProfileTag       `json:"co_tags"`          // the tag's variable content, freq-ordered
+	TopPairs   []ProfilePair      `json:"top_pairs"`        // combinations ranked by lift
 }
 
 // Profile answers "what does this big tag actually render as": it resolves
 // the tag row (Info semantics, so the wd14 verdict rides along), samples one
-// random page of the tag's posts, and aggregates co-occurring tags by
-// in-sample frequency.
+// page of the tag's posts, and aggregates co-occurring tags by in-sample
+// frequency.
 //
-// The input must be a single exact tag name: the sample query is
-// "<tag> order:random" and order: counts toward Danbooru's 2-tag query
-// limit (verified live: "arm_up 1boy order:random" 422s), so a second tag
-// would fail upstream. sample is clamped to [20, 200] and defaults to 200.
+// Single-tag mode samples "<tag> order:<order>" (default random; score and
+// favcount answer "what do its top posts look like" and are biased toward
+// outlier content). Pair mode (opts.With) drops order: entirely — two content
+// tags plus order: exceeds Danbooru's 2-tag query limit (verified live: 422)
+// — and samples the most recent joint posts instead. opts.Rating composes
+// with either mode (rating: is exempt from the tag cap).
 //
-// The sample is deliberately NOT rating-filtered (unlike SearchPosts): a
-// profile describes the tag's whole population — arm_up is 95% g/s/q, and
-// an explicit-only sample would describe a 5% subpopulation.
-func (s *TagService) Profile(ctx context.Context, tag string, sample int) (*TagProfile, error) {
+// The default sample is deliberately NOT rating-filtered (unlike
+// SearchPosts): a profile describes the tag's whole population — arm_up is
+// 95% g/s/q, and an explicit-only sample would describe a 5% subpopulation.
+// sample is clamped to [20, 200] and defaults to 200.
+func (s *TagService) Profile(ctx context.Context, tag string, sample int, opts ProfileOptions) (*TagProfile, error) {
 	raw := strings.TrimSpace(tag)
 	if raw == "" || strings.ContainsAny(raw, " :") {
 		return nil, fmt.Errorf("profile takes a single exact tag name (e.g. 'arm_up'); metatags and multi-tag queries are not supported")
+	}
+	rating := strings.ToLower(strings.TrimSpace(opts.Rating))
+	if rating != "" && !profileRatings[rating] {
+		return nil, fmt.Errorf("invalid rating %q: use g, s, q or e", opts.Rating)
+	}
+	order := strings.ToLower(strings.TrimSpace(opts.Order))
+	if order != "" && !profileOrders[order] {
+		return nil, fmt.Errorf("invalid order %q: use random, score or favcount", opts.Order)
+	}
+	with := strings.TrimSpace(opts.With)
+	if with != "" {
+		if strings.ContainsAny(with, " :") {
+			return nil, fmt.Errorf("with takes a single exact tag name (e.g. 'holding_weapon'); metatags and multi-tag queries are not supported")
+		}
+		if strings.EqualFold(with, raw) {
+			return nil, fmt.Errorf("with must be a different tag than tag")
+		}
+		if order != "" {
+			return nil, fmt.Errorf("order is not allowed with with: order: plus two content tags exceeds Danbooru's 2-tag query limit, so pair samples are the most recent joint posts")
+		}
 	}
 	switch {
 	case sample <= 0:
@@ -91,23 +139,97 @@ func (s *TagService) Profile(ctx context.Context, tag string, sample int) (*TagP
 		sample = profileSampleMax
 	}
 
-	info, err := s.Info(ctx, raw)
-	if err != nil {
-		return nil, err // *NotFoundError propagates; the handler rides the wd14 verdict
-	}
 	profile := &TagProfile{
-		TagInfo:    *info,
+		Rating:     rating,
+		Ratings:    map[string]float64{},
 		Ubiquitous: []ProfileTag{},
 		CoTags:     []ProfileTag{},
 		TopPairs:   []ProfilePair{},
 	}
+
+	if with == "" {
+		return s.profileSingle(ctx, raw, sample, order, rating, profile)
+	}
+	return s.profilePair(ctx, raw, with, sample, rating, profile)
+}
+
+// profileSingle runs the default mode: resolve the row, then sample one
+// ordered page of the tag's posts.
+func (s *TagService) profileSingle(ctx context.Context, tag string, sample int, order, rating string, profile *TagProfile) (*TagProfile, error) {
+	info, err := s.Info(ctx, tag)
+	if err != nil {
+		return nil, err // *NotFoundError propagates; the handler rides the wd14 verdict
+	}
+	profile.TagInfo = *info
+	if order == "" {
+		order = "random"
+	}
+	profile.Order = order
 	if info.PostCount == 0 {
 		// Placeholder row (renamed-away antecedent, unused tag): nothing to
-		// sample; the embedded wd14 verdict tells the story.
+		// sample; the embedded wd14 verdict and renamed_to tell the story.
 		return profile, nil
 	}
 
-	body, err := s.fetcher.FetchPosts(ctx, raw+" order:random", sample)
+	query := info.Name + " order:" + order
+	if rating != "" {
+		query += " rating:" + rating
+	}
+	posts, err := s.fetchProfilePosts(ctx, query, sample)
+	if err != nil {
+		return nil, err
+	}
+	aggregateProfile(profile, posts, map[string]bool{strings.ToLower(info.Name): true})
+	return profile, nil
+}
+
+// profilePair runs pair mode: resolve both rows in one batch request, then
+// sample the most recent joint posts (no order: — two content tags plus
+// order: exceeds Danbooru's 2-tag query limit).
+func (s *TagService) profilePair(ctx context.Context, tag, with string, sample int, rating string, profile *TagProfile) (*TagProfile, error) {
+	batch, err := s.Infos(ctx, []string{tag, with})
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]*TagInfo, len(batch.Found))
+	for i := range batch.Found {
+		byName[strings.ToLower(batch.Found[i].Name)] = &batch.Found[i]
+	}
+	tagRow, withRow := byName[strings.ToLower(tag)], byName[strings.ToLower(with)]
+	if tagRow == nil {
+		return nil, &NotFoundError{Name: tag} // the handler's wd14 rider uses the actually missing name
+	}
+	if withRow == nil {
+		return nil, &NotFoundError{Name: with}
+	}
+
+	profile.TagInfo = *tagRow
+	s.resolveRenamedTo(ctx, &profile.TagInfo) // same dead-end enhancement Info applies
+	profile.With = &ProfileWith{Tag: withRow.Name, PostCount: withRow.PostCount}
+	profile.Order = "recent"
+	if tagRow.PostCount == 0 || withRow.PostCount == 0 {
+		// Placeholder row(s): no joint posts exist; the embedded rows tell why.
+		return profile, nil
+	}
+
+	query := tagRow.Name + " " + withRow.Name
+	if rating != "" {
+		query += " rating:" + rating
+	}
+	posts, err := s.fetchProfilePosts(ctx, query, sample)
+	if err != nil {
+		return nil, err
+	}
+	aggregateProfile(profile, posts, map[string]bool{
+		strings.ToLower(tagRow.Name):  true,
+		strings.ToLower(withRow.Name): true,
+	})
+	return profile, nil
+}
+
+// fetchProfilePosts fetches and parses one page of posts for the sample.
+func (s *TagService) fetchProfilePosts(ctx context.Context, query string, limit int) ([]danbooruPost, error) {
+	body, err := s.fetcher.FetchPosts(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -115,8 +237,7 @@ func (s *TagService) Profile(ctx context.Context, tag string, sample int) (*TagP
 	if err := json.Unmarshal(body, &posts); err != nil {
 		return nil, fmt.Errorf("failed to parse posts: %w", err)
 	}
-	aggregateProfile(profile, posts)
-	return profile, nil
+	return posts, nil
 }
 
 // coTagCount is the running tally for one co-occurring tag.
@@ -147,8 +268,8 @@ type taggedName struct {
 }
 
 // contentTags lists a post's non-meta tags with their categories, minus the
-// profiled tag itself.
-func contentTags(post danbooruPost, self string) []taggedName {
+// excluded names (the profiled tag itself, plus the paired tag in pair mode).
+func contentTags(post danbooruPost, exclude map[string]bool) []taggedName {
 	t := parsePostTags(post)
 	groups := []struct {
 		names    []string
@@ -159,7 +280,7 @@ func contentTags(post danbooruPost, self string) []taggedName {
 	var out []taggedName
 	for _, g := range groups {
 		for _, name := range g.names {
-			if name != self {
+			if !exclude[name] {
 				out = append(out, taggedName{name: name, category: g.category})
 			}
 		}
@@ -168,10 +289,12 @@ func contentTags(post danbooruPost, self string) []taggedName {
 }
 
 // aggregateProfile folds the sampled posts into the profile in place:
-// singles are split into ubiquitous constants vs freq-ordered co_tags, and
-// combinations are ranked by lift. order:random pages are independent
-// draws, so posts are deduplicated by id before counting.
-func aggregateProfile(p *TagProfile, posts []danbooruPost) {
+// singles are split into ubiquitous constants vs freq-ordered co_tags,
+// combinations are ranked by lift, and the rating mix is counted.
+// order:random pages are independent draws, so posts are deduplicated by id
+// before counting. exclude carries the query tags (lowercase), which never
+// appear in the ranked sections.
+func aggregateProfile(p *TagProfile, posts []danbooruPost, exclude map[string]bool) {
 	seen := make(map[int]bool, len(posts))
 	distinct := make([]danbooruPost, 0, len(posts))
 	for _, post := range posts {
@@ -186,11 +309,18 @@ func aggregateProfile(p *TagProfile, posts []danbooruPost) {
 		return
 	}
 	p.Sample = n
-	self := p.Name
+
+	ratingCounts := make(map[string]int, 4)
+	for _, post := range distinct {
+		ratingCounts[post.Rating]++
+	}
+	for r, c := range ratingCounts {
+		p.Ratings[r] = roundFreq(c, n)
+	}
 
 	counts := make(map[string]coTagCount)
 	for _, post := range distinct {
-		for _, tn := range contentTags(post, self) {
+		for _, tn := range contentTags(post, exclude) {
 			c := counts[tn.name]
 			c.count++
 			c.category = tn.category
@@ -235,7 +365,7 @@ func aggregateProfile(p *TagProfile, posts []danbooruPost) {
 	pairCounts := make(map[string]pairRow)
 	for _, post := range distinct {
 		var present []string
-		for _, tn := range contentTags(post, self) {
+		for _, tn := range contentTags(post, exclude) {
 			if core[tn.name] {
 				present = append(present, tn.name)
 			}

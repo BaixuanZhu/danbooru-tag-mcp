@@ -4,6 +4,47 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [0.5.0] - Unreleased
+
+### Breaking
+
+- `get_tag_wiki` no longer returns the raw DText `body`. It is replaced by
+  deterministic structured fields: `summary` (first intro paragraph, links
+  flattened), `intro_tags` (definition/appearance link targets, noise like
+  `tag_group:`/`help:`/`list of` filtered), `rules` (disambiguation/usage
+  sentences containing a link and a directive keyword, capped),
+  `see_also` (links under a See also heading) and `example_posts`
+  (`!post #id` ids; `!asset` ignored). `title`, `other_names` and
+  `linked_tags` keep their shapes. The new opt-in `include_description`
+  argument adds `description` — the full intro prose as plain text with links
+  flattened and paragraph breaks preserved — so character appearance
+  descriptions (hair/eyes/outfit relationships) survive without the raw
+  body. There is no raw-body fallback by design.
+
+### Added
+
+- `get_tag_profile` pair mode (`with`): profiles the 200 most recent joint
+  posts of a tag pair (`<tag> <with>`, no `order:` — two content tags plus
+  order: exceeds the anonymous 2-tag limit, verified live 422), reports
+  `order: "recent"` plus a `with: {tag, post_count}` descriptor, and
+  excludes both query tags from every ranked section.
+- `get_tag_profile` sample controls: `order` (`random` default / `score` /
+  `favcount`, top-post biased and documented as such) and `rating`
+  (`g|s|q|e`, an exempt metatag that composes with single and pair modes);
+  every profile now also reports the sample's `ratings` mix (fraction per
+  rating over the deduplicated sample).
+- `search_posts`: each post now carries `score`, `fav_count` and
+  `large_file_url` (inspectable size) alongside the preview URL; `limit` is
+  capped at 20 (rejected locally above that — a post averages ~44 tags, so
+  the payload stays bounded).
+- `search_tags` `category` filter (`general|artist|copyright|character|meta`),
+  mapped to the numeric ids the API actually accepts (names return empty —
+  verified live).
+- `get_tag_info` `renamed_to`: on 0-post placeholder rows (renamed-away
+  names), one extra alias request resolves the canonical tag
+  (`sailor_suit` -> `renamed_to: "sailor"`); live rows pay no extra request
+  and alias failures are non-fatal.
+
 ## [0.4.0] - 2026-10-31
 
 ### Added

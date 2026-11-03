@@ -132,11 +132,16 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) ([]byt
 	}
 }
 
-func (c *Client) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool) ([]byte, error) {
+// FetchTags searches tags by name pattern. category is a Danbooru category
+// id; the API rejects names, so -1 (no filter) is the only way to omit it.
+func (c *Client) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error) {
 	q := make(url.Values)
 	q.Set("search[name_matches]", fmt.Sprintf("*%s*", namePattern))
 	if orderByCount {
 		q.Set("search[order]", "count")
+	}
+	if category >= 0 {
+		q.Set("search[category]", strconv.Itoa(category))
 	}
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))

@@ -113,8 +113,38 @@ func TestGet_ResponseSizeLimit(t *testing.T) {
 }
 
 func TestFetchTags_BuildsCorrectURL(t *testing.T) {
-	var gotMatches, gotOrder, gotLimit string
+	var gotMatches, gotOrder, gotLimit, gotCategory string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMatches = r.URL.Query().Get("search[name_matches]")
+		gotOrder = r.URL.Query().Get("search[order]")
+		gotLimit = r.URL.Query().Get("limit")
+		gotCategory = r.URL.Query().Get("search[category]")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(srv.URL)
+	if _, err := cli.FetchTags(context.Background(), "blue_hair", 10, true, -1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotMatches != "*blue_hair*" || gotOrder != "count" || gotLimit != "10" {
+		t.Errorf("unexpected query params: matches=%s, order=%s, limit=%s", gotMatches, gotOrder, gotLimit)
+	}
+	// -1 means no filter: search[category] must stay absent (a literal -1
+	// would be rejected by the API).
+	if gotCategory != "" {
+		t.Errorf("category -1 must omit search[category], got %q", gotCategory)
+	}
+}
+
+func TestFetchTags_CategoryFilter(t *testing.T) {
+	// The API only accepts numeric ids (verified live: "character" returns
+	// empty while 4 works), so the client forwards the id verbatim and only
+	// when set.
+	var gotCategory, gotMatches, gotOrder, gotLimit string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotCategory = r.URL.Query().Get("search[category]")
 		gotMatches = r.URL.Query().Get("search[name_matches]")
 		gotOrder = r.URL.Query().Get("search[order]")
 		gotLimit = r.URL.Query().Get("limit")
@@ -124,12 +154,14 @@ func TestFetchTags_BuildsCorrectURL(t *testing.T) {
 	defer srv.Close()
 
 	cli := newTestClient(srv.URL)
-	_, err := cli.FetchTags(context.Background(), "blue_hair", 10, true)
-	if err != nil {
+	if _, err := cli.FetchTags(context.Background(), "firefly", 10, true, 4); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if gotMatches != "*blue_hair*" || gotOrder != "count" || gotLimit != "10" {
-		t.Errorf("unexpected query params: matches=%s, order=%s, limit=%s", gotMatches, gotOrder, gotLimit)
+	if gotCategory != "4" {
+		t.Errorf("expected search[category]=4, got %q", gotCategory)
+	}
+	if gotMatches != "*firefly*" || gotOrder != "count" || gotLimit != "10" {
+		t.Errorf("category must not disturb the other params: matches=%s order=%s limit=%s", gotMatches, gotOrder, gotLimit)
 	}
 }
 

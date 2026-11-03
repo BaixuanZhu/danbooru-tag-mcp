@@ -16,12 +16,12 @@
 # Usage:
 #   bash scripts/integration-test.sh [exe]
 #   Default exe: dist/amd64/danbooru-tag-mcp.exe (build it first: make build).
-#   stdin hold-open time is tunable via DANBOORU_MCP_IT_SLEEP (default 45s).
+#   stdin hold-open time is tunable via DANBOORU_MCP_IT_SLEEP (default 60s).
 
 set -euo pipefail
 
 EXE="${1:-dist/amd64/danbooru-tag-mcp.exe}"
-SLEEP="${DANBOORU_MCP_IT_SLEEP:-45}"
+SLEEP="${DANBOORU_MCP_IT_SLEEP:-60}"
 
 if [ ! -f "$EXE" ]; then
   echo "[integration] exe not found: $EXE (build it first: make build)" >&2
@@ -39,7 +39,7 @@ export DANBOORU_MCP_NO_BOOTSTRAP=1
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 13 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 18 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -51,13 +51,18 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"blue_hair"}}}'
   req '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"get_related_tags","arguments":{"tag":"blue_hair","limit":3}}}'
   req '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"get_tag_alias","arguments":{"name":"sailor_suit"}}}'
-  req '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_tag_wiki","arguments":{"title":"firefly_(honkai:_star_rail)"}}}'
+  req '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"get_tag_wiki","arguments":{"title":"firefly_(honkai:_star_rail)","include_description":true}}}'
   req '{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl rating:e","limit":2}}}'
   req '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl blue_hair long_hair"}}}'
   req '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"gold_footwear"}}}'
   req '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"gold footwear","limit":5}}}'
   req '{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"arm_up","sample":200}}}'
   req '{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"get_tags_info","arguments":{"names":["blue_hair","gold_footwear","not_a_real_tag_xyz"]}}}'
+  req '{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"arm_up","with":"holding_weapon","sample":50}}}'
+  req '{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"arm_up","rating":"g","sample":20}}}'
+  req '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"firefly","category":"character","limit":5}}}'
+  req '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"sailor_suit"}}}'
+  req '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl","limit":21}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -129,10 +134,26 @@ alias = payload(6).get('alias')
 check(bool(alias) and alias.get('consequent') == 'sailor',
       'get_tag_alias: sailor_suit resolves to sailor')
 
-# 7. get_tag_wiki
-pages = payload(7).get('wiki_pages')
-check(bool(pages) and len(pages[0].get('linked_tags', [])) > 0,
-      'get_tag_wiki: linked_tags extracted from body')
+# 7. get_tag_wiki: structured fields replace the raw body. The firefly page
+#    must distill into summary/intro_tags/rules/see_also/example_posts, keep
+#    linked_tags, expose the appearance prose only via include_description,
+#    and never carry a body key.
+page7 = payload(7).get('wiki_pages')[0]
+check(bool(page7.get('summary')) and 'Honkai: Star Rail' in page7['summary'],
+      'get_tag_wiki: summary distilled from the intro')
+check(len(page7.get('intro_tags', [])) >= 20
+      and 'grey hair' in page7['intro_tags'],
+      'get_tag_wiki: intro_tags carry the appearance tag targets')
+check('body' not in page7, 'get_tag_wiki: raw body absent')
+check(bool(page7.get('description'))
+      and 'grey hair' in page7['description']
+      and '[[[' not in page7['description'],
+      'get_tag_wiki: include_description returns the flattened intro prose')
+check(len(page7.get('example_posts', [])) > 0
+      and all(isinstance(i, int) for i in page7['example_posts']),
+      'get_tag_wiki: example post ids extracted')
+check(len(page7.get('linked_tags', [])) > 0,
+      'get_tag_wiki: linked_tags union still present')
 
 # 8. search_posts honors the caller's rating metatag + per-post categorized
 #    tag list. (No default rating is injected — that boundary is pinned
@@ -201,6 +222,49 @@ check(found13.get('gold_footwear', {}).get('post_count') == 0
 check('not_a_real_tag_xyz' in missing13
       and missing13['not_a_real_tag_xyz'].get('wd14', {}).get('status') == 'unknown',
       'get_tags_info: absent name listed under missing with wd14 unknown')
+
+# 14. get_tag_profile pair mode: exactly "<tag> <with>" (no order:, which
+#     would 422 against the anonymous 2-tag cap), the 50 most recent joint
+#     posts, both query tags excluded from every ranked section.
+prof14 = payload(14)
+ranked14 = (prof14.get('ubiquitous', []) + prof14.get('co_tags', [])
+            + prof14.get('top_pairs', []))
+ranked_names14 = [e.get('tag', e.get('pair', '')) for e in ranked14]
+check(prof14.get('order') == 'recent'
+      and prof14.get('with', {}).get('tag') == 'holding_weapon'
+      and prof14.get('with', {}).get('post_count', 0) > 0,
+      'get_tag_profile: pair mode reports order=recent + with descriptor')
+check(prof14.get('sample', 0) >= 10
+      and not any('arm_up' in n or 'holding_weapon' in n for n in ranked_names14),
+      'get_tag_profile: pair mode excludes both query tags from rankings')
+check(bool(prof14.get('ratings')),
+      'get_tag_profile: pair mode reports the ratings mix')
+
+# 15. get_tag_profile rating filter: the exempt rating: metatag narrows the
+#     sample without counting against the tag cap.
+prof15 = payload(15)
+check(prof15.get('rating') == 'g' and prof15.get('ratings') == {'g': 1.0}
+      and prof15.get('sample', 0) >= 10,
+      'get_tag_profile: rating:g sample is all-g')
+
+# 16. search_tags category filter: the API wants numeric ids; the server maps
+#     the name so every row comes back a character (4).
+tags16 = payload(16).get('tags')
+check(bool(tags16) and all(t.get('category') == 4 for t in tags16),
+      'search_tags: category=character returns only category-4 rows')
+
+# 17. get_tag_info renamed_to: sailor_suit keeps a 0-post placeholder row and
+#     an active alias; the consequent rides the row.
+info17 = payload(17)
+check(info17.get('name') == 'sailor_suit' and info17.get('post_count') == 0
+      and info17.get('renamed_to') == 'sailor',
+      'get_tag_info: 0-post renamed name carries renamed_to')
+
+# 18. search_posts limit cap: rejected locally before any request.
+err18 = payload(18)
+check(err18.get('error') == 'post_search_failed'
+      and 'too many posts requested' in err18.get('message', ''),
+      'search_posts: limit over 20 rejected locally')
 
 print()
 if failures:

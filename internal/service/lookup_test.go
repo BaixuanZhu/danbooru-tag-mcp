@@ -41,9 +41,9 @@ func TestInfos_Behavior(t *testing.T) {
 			wantMissing: []string{"fake_one", "fake_two"},
 		},
 		{
-			name: "names are normalized and deduped before the single request",
-			in:   []string{"blue hair", " blue_hair ", "solo"},
-			resp: `[{"id":1,"name":"blue_hair","category":0,"post_count":1}]`,
+			name:        "names are normalized and deduped before the single request",
+			in:          []string{"blue hair", " blue_hair ", "solo"},
+			resp:        `[{"id":1,"name":"blue_hair","category":0,"post_count":1}]`,
 			wantFound:   []string{"blue_hair"},
 			wantMissing: []string{"solo"},
 			wantFetch:   []string{"blue_hair", "solo"},

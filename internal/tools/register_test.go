@@ -83,15 +83,20 @@ func TestToolSchemas_PropertiesExist(t *testing.T) {
 		property string
 	}{
 		{"search_tags", SearchTagsTool, "limit"},
+		{"search_tags", SearchTagsTool, "category"},
 		{"get_related_tags", GetRelatedTagsTool, "limit"},
 		{"get_tag_wiki", GetTagWikiTool, "other_names"},
+		{"get_tag_wiki", GetTagWikiTool, "include_description"},
 		{"get_tags_info", GetTagsInfoTool, "names"},
 		{"search_posts", SearchPostsTool, "limit"},
 		{"get_tag_profile", GetTagProfileTool, "sample"},
+		{"get_tag_profile", GetTagProfileTool, "with"},
+		{"get_tag_profile", GetTagProfileTool, "rating"},
+		{"get_tag_profile", GetTagProfileTool, "order"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.name+"/"+tt.property, func(t *testing.T) {
 			if _, exists := tt.tool.InputSchema.Properties[tt.property]; !exists {
 				t.Errorf("tool %s missing expected property %s", tt.name, tt.property)
 			}

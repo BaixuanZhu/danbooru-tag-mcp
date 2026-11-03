@@ -90,35 +90,65 @@ over-limit queries fail with a clear error instead of a Danbooru 422.
 
 **Result shaping (inspiration discovery, the product's weak spot turned
 strength)**: `SearchPosts` returns each post's full tag list split by category
-(`PostTags`, parsed from the API's `tag_string_*` fields — no extra request);
-`Related` drops both the query tag itself and meta-category (5) entries,
-because meta tags like `highres` co-occur with everything and drown out
-content tags. Category ids are 0=general, 1=artist, 3=copyright, 4=character,
-5=meta (Danbooru's actual API numbering — verified live, do not "fix" to the
-0-4 continuous scheme). Both behaviors are pinned by unit tests and the
-integration script.
+(`PostTags`, parsed from the API's `tag_string_*` fields — no extra request)
+plus `score`/`fav_count`/`large_file_url`, and caps `limit` at 20
+pre-flight (a post averages ~44 tags — verified live — so 20 bounds the
+payload at ~20 KB); `Related` drops both the query tag itself and
+meta-category (5) entries, because meta tags like `highres` co-occur with
+everything and drown out content tags. Category ids are 0=general, 1=artist,
+3=copyright, 4=character, 5=meta (Danbooru's actual API numbering — verified
+live, do not "fix" to the 0-4 continuous scheme). `Search` takes a numeric
+category id (-1 = no filter); the API rejects category names (verified live)
+so the tools layer maps via `service.CategoryID` before any request. These
+behaviors are pinned by unit tests and the integration script.
+
+**Wiki structured extraction (get_tag_wiki, test-enforced, do not break)**:
+the raw DText `body` is REMOVED from the response (breaking change, user
+decision) and replaced by deterministic fields extracted in
+`internal/service/tag.go` (`extractWikiPage`): split on `h1.`–`h6.` headings
+(intro = before the first heading, bodies carry \r\n so line endings are
+normalized first); `summary` = first intro paragraph with `[[target|display]]`
+links flattened to display text; `intro_tags` = intro link targets minus
+noise (`tag_group:`, `help:`, `list of`); `rules` = sentences carrying a link
+AND a directive keyword ("instead", "not to be confused", "should", "use",
+...), capped 6/500 chars — a keyword heuristic, not a parser, so do not
+promise complete rule coverage; `see_also` = links under a See also heading;
+`example_posts` = unique `!post #id` ids (`!asset` ignored). The opt-in
+`include_description` adds `description` (full intro prose, links flattened,
+paragraph breaks preserved) so character appearance relationships survive —
+it is filtered intro text, NOT the raw body. `linked_tags` keeps its old raw
+union shape. Tests pin real live bodies (`arm_up`, `sailor`, `1girl`,
+`firefly_(honkai:_star_rail)`, `highres` fixtures in `wiki_test.go`); update
+fixtures deliberately if the upstream pages change.
 
 **Tag distribution profile (get_tag_profile, test-enforced, do not break)**:
 answers "what does this big tag actually render as" (arm_up: 309k posts,
 mostly bent-arm poses, drowning arm_above_head's 3.2k) by sampling ONE
-request — `<tag> order:random`, default/limit 200 posts (the anonymous
-per-page cap, verified live) — and aggregating locally in
-`internal/service/profile.go`: singles counted per post (query tag and
-meta-category dropped), split at freq >= 0.5 into `ubiquitous` (corpus
-constants like 1girl/solo — verified live to be the raw top 10 of every big
-tag, not a property of the tag) vs freq-ordered `co_tags`; `top_pairs`
-combinations ranked by **lift** (joint freq over the product of singles
-freqs) because naive pair frequency reproduces the same 1girl+solo baseline
-every time — lift surfaces tag-specific poses (arm_up: holding_weapon+sword,
-lift ~12). Two boundaries pinned by unit tests: the sample query must stay
-`<tag> order:random` with **no rating filter** (`Profile` calls
-`fetcher.FetchPosts` directly, NOT `SearchPosts` — a rating:explicit sample
-would describe arm_up's 5% explicit subpopulation, pinned by
-`TestProfile_UbiquitousSplitAndExclusions`), and the tool is single-tag
-only because `order:` counts toward the 2-tag query limit (verified live:
-`arm_up 1boy order:random` 422s). Renamed/0-post tags return an empty
-profile whose embedded `wd14` verdict tells the story, mirroring
-`get_tag_info`'s NotFound handling.
+request and aggregating locally in `internal/service/profile.go`: singles
+counted per post (query tags and meta-category dropped), split at
+freq >= 0.5 into `ubiquitous` (corpus constants like 1girl/solo — verified
+live to be the raw top 10 of every big tag, not a property of the tag) vs
+freq-ordered `co_tags`; `top_pairs` combinations ranked by **lift** (joint
+freq over the product of singles freqs) because naive pair frequency
+reproduces the same 1girl+solo baseline every time — lift surfaces
+tag-specific poses (arm_up: holding_weapon+sword, lift ~12). The response
+echoes `order`/`rating` and carries a `ratings` mix (fractions over the
+deduped sample). Boundaries pinned by unit tests: the DEFAULT single-tag
+sample query must stay `<tag> order:random` with **no rating filter**
+(`Profile` calls `fetcher.FetchPosts` directly, NOT `SearchPosts` — a
+rating:explicit sample would describe arm_up's 5% explicit subpopulation,
+pinned by `TestProfile_UbiquitousSplitAndExclusions`; `order: score` /
+`favcount` and `rating: g/s/q/e` are caller opt-ins, documented as
+top-post-biased/filtered views); `order:` counts toward the 2-tag query
+limit (verified live: `arm_up 1boy order:random` 422s), so pair mode
+(`with`) DROPS order: entirely and samples `<tag> <with>` — the 200 most
+recent joint posts, `order: "recent"`, both query tags excluded from every
+ranked section — and rejects a caller-supplied `order`. `rating:` composes
+with both modes (exempt from the tag cap). Renamed/0-post tags return an
+empty profile whose embedded `wd14` verdict (and `renamed_to`, resolved on
+the primary row only) tells the story, mirroring `get_tag_info`'s NotFound
+handling; a missing pair tag returns `*NotFoundError{Name: <missing name>}`
+so the handler's wd14 rider (which uses `nf.Name`) covers the right name.
 
 **Tagger-era detection (WD14 layer, test-enforced, do not break)**:
 `internal/vocab` embeds the WD14 tagger vocabularies (`wd-v1-4-moat-tagger-v2`
@@ -136,7 +166,12 @@ rows for renamed-away names (verified live: `barefoot_sandals`,
 as `tagger_era` when a vocabulary carries them (`pinned by
 TestInfo_ZeroCountRowIsTaggerEra`) or `unknown` when none does. A name truly
 absent from Danbooru yields a `*service.NotFoundError`, and the tools handler
-rides the `wd14` verdict on that error payload. `search_tags` adds
+rides the `wd14` verdict on that error payload. On 0-post rows `Info` also
+resolves `renamed_to` via one extra alias request (`resolveRenamedTo`, live
+rows skip it; alias errors are non-fatal) — every sampled active alias
+antecedent keeps a 0-post row (verified live). `Infos` (batch) does NOT
+resolve aliases: `search[antecedent_name]` comma lists return empty (verified
+live), so `renamed_to` is single-tag only. `search_tags` adds
 `wd14_hits` (vocabulary substring matches, best snapshot count first) when no
 result carries posts (`hasLiveTag`). The wd14 policy translation (probe the
 canonical form via `get_tag_alias`, or describe in prose) stays with the
@@ -270,3 +305,24 @@ inheritance; this is documented in the plugin README.
   repo root has a `go.work` (`use .`).
 - Dev environment is Windows + Git Bash (Git Bash path-converts args like
   `/v`, so use `MSYS_NO_PATHCONV=1` when calling `reg` and similar tools).
+<!-- TRELLIS:START -->
+# Trellis Instructions
+
+These instructions are for AI assistants working in this project.
+
+This project is managed by Trellis. The working knowledge you need lives under `.trellis/`:
+
+- `.trellis/workflow.md` — development phases, when to create tasks, skill routing
+- `.trellis/spec/` — package- and layer-scoped coding guidelines (read before writing code in a given layer)
+- `.trellis/workspace/` — per-developer journals and session traces
+- `.trellis/tasks/` — active and archived tasks (PRDs, research, jsonl context)
+
+If a Trellis command is available on your platform (e.g. `/trellis:finish-work`, `/trellis:continue`), prefer it over manual steps. Not every platform exposes every command.
+
+If you're using Codex or another agent-capable tool, additional project-scoped helpers may live in:
+- `.agents/skills/` — reusable Trellis skills
+- `.codex/agents/` — optional custom subagents
+
+Managed by Trellis. Edits outside this block are preserved; edits inside may be overwritten by a future `trellis update`.
+
+<!-- TRELLIS:END -->
