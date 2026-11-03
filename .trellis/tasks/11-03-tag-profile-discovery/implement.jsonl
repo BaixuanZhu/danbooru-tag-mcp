@@ -1,0 +1,4 @@
+{"file": "AGENTS.md", "reason": "Project conventions, layer rules, tool-description and rating-boundary constraints"}
+{"file": ".trellis/tasks/11-03-tag-profile-discovery/prd.md", "reason": "Requirements, scope, and acceptance criteria"}
+{"file": ".trellis/tasks/11-03-tag-profile-discovery/design.md", "reason": "Exact service/tool contracts and response shapes"}
+{"file": ".trellis/tasks/11-03-tag-profile-discovery/research/api-probes.md", "reason": "Live API evidence behind every design decision"}
