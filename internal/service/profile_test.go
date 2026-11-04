@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"danbooru-tag-mcp/internal/vocab"
 )
@@ -503,5 +504,30 @@ func TestProfile_ZeroPostPrimaryResolvesAlias(t *testing.T) {
 	}
 	if p.With == nil || p.With.Tag != "sailor" || p.With.PostCount != 5000 {
 		t.Errorf("unexpected with descriptor: %+v", p.With)
+	}
+}
+
+func TestProfile_NeverCarriesCacheMarks(t *testing.T) {
+	// Even when the tag-row fetch stale-served, the profile response must
+	// carry no cache markers: posts are never cached and profiles pin no
+	// cache fields (posts/profile excluded from the stale-marking contract).
+	mock := &mockFetcher{
+		exactResp: []byte(armUpExactRow),
+		postsResp: []byte(`[]`),
+		stale:     true,
+		staleAt:   time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC),
+	}
+	svc := NewTagService(mock, nil)
+
+	p, err := svc.Profile(context.Background(), "arm_up", 20, ProfileOptions{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	raw, err := json.Marshal(p)
+	if err != nil {
+		t.Fatalf("marshal profile: %v", err)
+	}
+	if strings.Contains(string(raw), `"stale":`) || strings.Contains(string(raw), `"cached_at":`) {
+		t.Errorf("profile must never carry cache markers, got: %s", raw)
 	}
 }

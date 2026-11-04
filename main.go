@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"danbooru-tag-mcp/internal/api"
 	"danbooru-tag-mcp/internal/app"
@@ -73,7 +74,7 @@ func main() {
 // serve starts the MCP stdio server. The version reuses app.Version (ldflags
 // injected) so it matches what the version / upgrade subcommands report.
 func serve() {
-	client := api.NewClient()
+	client := api.NewClient(clientOptions()...)
 	svc := service.NewTagService(client, vocab.Default())
 
 	s := server.NewMCPServer(
@@ -87,6 +88,22 @@ func serve() {
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("[FATAL] mcp server terminated: %v", err)
 	}
+}
+
+// clientOptions builds the api client options for server mode: the response
+// cache under %LOCALAPPDATA%\danbooru-tag-mcp\cache, skipped entirely (no
+// cache) when DANBOORU_MCP_NO_CACHE is non-empty or LOCALAPPDATA is unset.
+// WithCache itself degrades to cache-less with a stderr warning when the
+// location cannot be opened, so no extra error handling is needed here.
+func clientOptions() []api.Option {
+	if os.Getenv("DANBOORU_MCP_NO_CACHE") != "" {
+		return nil
+	}
+	base := os.Getenv("LOCALAPPDATA")
+	if base == "" {
+		return nil
+	}
+	return []api.Option{api.WithCache(filepath.Join(base, "danbooru-tag-mcp", "cache"))}
 }
 
 // usage prints CLI help (only on the explicit help subcommand; never pollutes
@@ -119,6 +136,9 @@ Install:
 
 Environment variables:
   DANBOORU_LOGIN / DANBOORU_API_KEY   Danbooru API credentials (optional; anonymous access without them)
+  DANBOORU_REQ_GAP_MS                 Min spacing between requests in ms (0 = no gap; invalid keeps
+                                      the default: 1500 anonymous / 500 with credentials)
   DANBOORU_MCP_NO_BOOTSTRAP           Skip PATH registration at startup when non-empty
+  DANBOORU_MCP_NO_CACHE               Disable the response cache when non-empty
 `)
 }

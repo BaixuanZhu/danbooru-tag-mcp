@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"danbooru-tag-mcp/internal/cache"
 	"danbooru-tag-mcp/internal/vocab"
 )
 
@@ -19,6 +22,14 @@ type mockFetcher struct {
 	wikiResp    []byte
 	postsResp   []byte
 
+	// stale makes every fetch report a stale-marked result (CachedAt
+	// = staleAt), pinning how provenance flows into response marks.
+	stale   bool
+	staleAt time.Time
+
+	aliasCalls int   // number of FetchAlias invocations
+	aliasErr   error // returned by FetchAlias instead of a body
+
 	lastTagsArg      string
 	lastTagsCategory int
 	lastNamesArg     []string
@@ -28,39 +39,48 @@ type mockFetcher struct {
 	lastPostsLim     int
 }
 
-func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error) {
+// result wraps a canned body with the mock's provenance settings.
+func (m *mockFetcher) result(body []byte) cache.Result {
+	return cache.Result{Body: body, Stale: m.stale, CachedAt: m.staleAt}
+}
+
+func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) (cache.Result, error) {
 	m.lastTagsArg = namePattern
 	m.lastTagsCategory = category
-	return m.tagsResp, nil
+	return m.result(m.tagsResp), nil
 }
 
-func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) ([]byte, error) {
-	return m.exactResp, nil
+func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) (cache.Result, error) {
+	return m.result(m.exactResp), nil
 }
 
-func (m *mockFetcher) FetchTagsByNames(ctx context.Context, names []string) ([]byte, error) {
+func (m *mockFetcher) FetchTagsByNames(ctx context.Context, names []string) (cache.Result, error) {
 	m.lastNamesArg = names
-	return m.namesResp, nil
+	return m.result(m.namesResp), nil
 }
 
-func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
-	return m.relatedResp, nil
+func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) (cache.Result, error) {
+	return m.result(m.relatedResp), nil
 }
 
-func (m *mockFetcher) FetchAlias(ctx context.Context, name string) ([]byte, error) {
-	return m.aliasResp, nil
+func (m *mockFetcher) FetchAlias(ctx context.Context, name string) (cache.Result, error) {
+	m.aliasCalls++
+	if m.aliasErr != nil {
+		return cache.Result{}, m.aliasErr
+	}
+	return m.result(m.aliasResp), nil
 }
 
-func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error) {
+func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, limit int) (cache.Result, error) {
 	m.lastWikiTitle = title
 	m.lastWikiOther = otherNames
-	return m.wikiResp, nil
+	return m.result(m.wikiResp), nil
 }
 
-func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
+func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) (cache.Result, error) {
 	m.lastPostsArg = tags
 	m.lastPostsLim = limit
-	return m.postsResp, nil
+	return m.result(m.postsResp), nil
 }
 
 func TestSearch_ParsesTags(t *testing.T) {
@@ -69,15 +89,15 @@ func TestSearch_ParsesTags(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	tags, err := svc.Search(context.Background(), "blue hair", 10, -1)
+	res, err := svc.Search(context.Background(), "blue hair", 10, -1, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if mock.lastTagsArg != "blue_hair" {
 		t.Errorf("expected normalized query 'blue_hair', got '%s'", mock.lastTagsArg)
 	}
-	if len(tags) != 1 || tags[0].Name != "blue_hair" || tags[0].PostCount != 500 {
-		t.Errorf("parsed tag mismatch: %+v", tags)
+	if len(res.Tags) != 1 || res.Tags[0].Name != "blue_hair" || res.Tags[0].PostCount != 500 {
+		t.Errorf("parsed tag mismatch: %+v", res.Tags)
 	}
 }
 
@@ -87,13 +107,13 @@ func TestSearch_ForwardsCategory(t *testing.T) {
 	mock := &mockFetcher{tagsResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
 
-	if _, err := svc.Search(context.Background(), "firefly", 10, 4); err != nil {
+	if _, err := svc.Search(context.Background(), "firefly", 10, 4, 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if mock.lastTagsCategory != 4 {
 		t.Errorf("expected category 4 forwarded, got %d", mock.lastTagsCategory)
 	}
-	if _, err := svc.Search(context.Background(), "firefly", 10, -1); err != nil {
+	if _, err := svc.Search(context.Background(), "firefly", 10, -1, 0); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if mock.lastTagsCategory != -1 {
@@ -242,21 +262,21 @@ func TestRelated_ParsesCurrentApiFormat(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	rel, err := svc.Related(context.Background(), "blue_hair", 10)
+	res, err := svc.Related(context.Background(), "blue_hair", 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// The query tag itself (similarity 1.0) and meta-category entries
 	// (highres, category 5) must both be dropped; the limit is spent on
 	// content tags only.
-	if len(rel) != 1 {
-		t.Fatalf("expected 1 related tag (self + meta dropped), got %d", len(rel))
+	if len(res.Related) != 1 {
+		t.Fatalf("expected 1 related tag (self + meta dropped), got %d", len(res.Related))
 	}
-	if rel[0].Tag != "aqua_hair" || rel[0].Category != 0 || rel[0].PostCount != 179981 {
-		t.Errorf("unexpected tag fields: %+v", rel[0])
+	if res.Related[0].Tag != "aqua_hair" || res.Related[0].Category != 0 || res.Related[0].PostCount != 179981 {
+		t.Errorf("unexpected tag fields: %+v", res.Related[0])
 	}
-	if rel[0].Similarity != 0.45 || rel[0].Frequency != 0.11 {
-		t.Errorf("unexpected similarity metrics: %+v", rel[0])
+	if res.Related[0].Similarity != 0.45 || res.Related[0].Frequency != 0.11 {
+		t.Errorf("unexpected similarity metrics: %+v", res.Related[0])
 	}
 }
 
@@ -274,15 +294,15 @@ func TestRelated_TruncatesToLimit(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	rel, err := svc.Related(context.Background(), "solo", 2)
+	res, err := svc.Related(context.Background(), "solo", 2)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(rel) != 2 {
-		t.Fatalf("expected 2 tags truncated by limit, got %d", len(rel))
+	if len(res.Related) != 2 {
+		t.Fatalf("expected 2 tags truncated by limit, got %d", len(res.Related))
 	}
-	if rel[0].Tag != "1girl" || rel[1].Tag != "looking_at_viewer" {
-		t.Errorf("unexpected content: %+v", rel)
+	if res.Related[0].Tag != "1girl" || res.Related[1].Tag != "looking_at_viewer" {
+		t.Errorf("unexpected content: %+v", res.Related)
 	}
 }
 
@@ -292,12 +312,12 @@ func TestAlias_ParsesMapping(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	alias, err := svc.Alias(context.Background(), "sailor suit")
+	res, err := svc.Alias(context.Background(), "sailor suit")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if alias == nil || alias.Antecedent != "sailor_suit" || alias.Consequent != "sailor" {
-		t.Fatalf("unexpected alias: %+v", alias)
+	if res.Alias == nil || res.Alias.Antecedent != "sailor_suit" || res.Alias.Consequent != "sailor" {
+		t.Fatalf("unexpected alias: %+v", res.Alias)
 	}
 }
 
@@ -305,12 +325,12 @@ func TestAlias_NoActiveAliasReturnsNull(t *testing.T) {
 	mock := &mockFetcher{aliasResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
 
-	alias, err := svc.Alias(context.Background(), "blue_hair")
+	res, err := svc.Alias(context.Background(), "blue_hair")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if alias != nil {
-		t.Fatalf("expected nil alias for canonical input, got: %+v", alias)
+	if res.Alias != nil {
+		t.Fatalf("expected null alias for canonical input, got: %+v", res.Alias)
 	}
 }
 
@@ -326,14 +346,14 @@ func TestWiki_ExtractsLinkedTags(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	pages, err := svc.Wiki(context.Background(), "firefly_(honkai:_star_rail)", "", 5, false)
+	res, err := svc.Wiki(context.Background(), "firefly_(honkai:_star_rail)", "", 5, false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(pages) != 1 {
-		t.Fatalf("expected 1 page, got %d", len(pages))
+	if len(res.Pages) != 1 {
+		t.Fatalf("expected 1 page, got %d", len(res.Pages))
 	}
-	p := pages[0]
+	p := res.Pages[0]
 	if p.Title != "firefly_(honkai:_star_rail)" {
 		t.Errorf("unexpected title: %s", p.Title)
 	}
@@ -440,7 +460,7 @@ func TestSearchPosts_Fields(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "touhou", 1)
+	posts, err := svc.SearchPosts(context.Background(), "touhou", 1, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -465,14 +485,14 @@ func TestSearchPosts_RejectsLimitOverMax(t *testing.T) {
 	mock := &mockFetcher{postsResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
 
-	_, err := svc.SearchPosts(context.Background(), "1girl", maxPostLimit+1)
+	_, err := svc.SearchPosts(context.Background(), "1girl", maxPostLimit+1, "")
 	if err == nil || !strings.Contains(err.Error(), "too many posts requested") {
 		t.Fatalf("expected limit rejection, got: %v", err)
 	}
 	if mock.lastPostsArg != "" {
 		t.Errorf("no request should be sent on limit rejection, got: %s", mock.lastPostsArg)
 	}
-	if _, err := svc.SearchPosts(context.Background(), "1girl", maxPostLimit); err != nil {
+	if _, err := svc.SearchPosts(context.Background(), "1girl", maxPostLimit, ""); err != nil {
 		t.Errorf("limit %d must stay allowed, got: %v", maxPostLimit, err)
 	}
 }
@@ -488,7 +508,7 @@ func TestSearchPosts_NoRatingInjection(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "cat_ears 1girl", 5)
+	posts, err := svc.SearchPosts(context.Background(), "cat_ears 1girl", 5, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -498,7 +518,7 @@ func TestSearchPosts_NoRatingInjection(t *testing.T) {
 
 	// A caller-supplied rating metatag is kept as-is (nothing to override).
 	mock.lastPostsArg = ""
-	if _, err := svc.SearchPosts(context.Background(), "cat_ears rating:general", 5); err != nil {
+	if _, err := svc.SearchPosts(context.Background(), "cat_ears rating:general", 5, ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if mock.lastPostsArg != "cat_ears rating:general" {
@@ -535,14 +555,14 @@ func TestSearchPosts_ParsesCategorizedTags(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "touhou", 1)
+	posts, err := svc.SearchPosts(context.Background(), "touhou", 1, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(posts) != 1 {
 		t.Fatalf("expected 1 post, got %d", len(posts))
 	}
-	tags := posts[0].Tags
+	tags := *posts[0].Tags
 	if len(tags.Copyright) != 1 || tags.Copyright[0] != "touhou" {
 		t.Errorf("unexpected copyright tags: %+v", tags.Copyright)
 	}
@@ -567,7 +587,7 @@ func TestSearchPosts_RejectsTooManyContentTags(t *testing.T) {
 	mock := &mockFetcher{postsResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
 
-	_, err := svc.SearchPosts(context.Background(), "1girl blue_hair long_hair", 5)
+	_, err := svc.SearchPosts(context.Background(), "1girl blue_hair long_hair", 5, "")
 	if err == nil || !strings.Contains(err.Error(), "too many content tags") {
 		t.Fatalf("expected too-many-tags error, got: %v", err)
 	}
@@ -583,7 +603,7 @@ func TestSearchPosts_MetatagCounting(t *testing.T) {
 	svc := NewTagService(mock, nil)
 
 	// rating:/status: are exempt from the limit; the query below is 2 content tags.
-	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair status:any", 5); err != nil {
+	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair status:any", 5, ""); err != nil {
 		t.Fatalf("unexpected error for exempt metatag: %v", err)
 	}
 	if !strings.Contains(mock.lastPostsArg, "status:any") {
@@ -592,8 +612,215 @@ func TestSearchPosts_MetatagCounting(t *testing.T) {
 
 	// order: counts toward the limit; 2 content tags + order: must be rejected locally.
 	mock.lastPostsArg = ""
-	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair order:count", 5); err == nil {
+	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair order:count", 5, ""); err == nil {
 		t.Fatalf("expected too-many-tags error for order: metatag, got nil")
+	}
+	if mock.lastPostsArg != "" {
+		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
+	}
+}
+
+// --- Step R1 visible half: stale marks on cacheable responses ---
+
+func TestCacheableResponses_StaleMarksMarshaled(t *testing.T) {
+	// One canned body per path, live rows so no alias fetch intervenes.
+	bodies := func(m *mockFetcher) {
+		m.tagsResp = []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":1200000}]`)
+		m.exactResp = []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":1200000}]`)
+		m.namesResp = []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":1200000}]`)
+		m.relatedResp = []byte(`{"query":"blue_hair","related_tags":[]}`)
+		m.aliasResp = []byte(`[{"antecedent_name":"sailor_suit","consequent_name":"sailor","status":"active"}]`)
+		m.wikiResp = []byte(`[{"title":"arm_up","body":"Body.","other_names":[],"is_deleted":false}]`)
+	}
+	cases := []struct {
+		name string
+		call func(svc *TagService) (any, error)
+	}{
+		{"search_tags", func(svc *TagService) (any, error) { return svc.Search(context.Background(), "blue hair", 10, -1, 0) }},
+		{"get_tag_info", func(svc *TagService) (any, error) { return svc.Info(context.Background(), "blue_hair") }},
+		{"get_tags_info", func(svc *TagService) (any, error) { return svc.Infos(context.Background(), []string{"blue_hair"}) }},
+		{"get_related_tags", func(svc *TagService) (any, error) { return svc.Related(context.Background(), "blue_hair", 10) }},
+		{"get_tag_alias", func(svc *TagService) (any, error) { return svc.Alias(context.Background(), "sailor_suit") }},
+		{"get_tag_wiki", func(svc *TagService) (any, error) { return svc.Wiki(context.Background(), "arm_up", "", 5, false) }},
+	}
+	at := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Fresh network/cache path: both markers absent (the transparent
+			// fresh-hit contract).
+			freshMock := &mockFetcher{}
+			bodies(freshMock)
+			got, err := tc.call(NewTagService(freshMock, nil))
+			if err != nil {
+				t.Fatalf("fresh path: %v", err)
+			}
+			raw, _ := json.Marshal(got)
+			if strings.Contains(string(raw), `"stale":`) || strings.Contains(string(raw), `"cached_at":`) {
+				t.Errorf("fresh response must omit both markers, got: %s", raw)
+			}
+
+			// Stale fallback: both markers present with the entry's storage
+			// time in RFC3339.
+			staleMock := &mockFetcher{stale: true, staleAt: at}
+			bodies(staleMock)
+			got, err = tc.call(NewTagService(staleMock, nil))
+			if err != nil {
+				t.Fatalf("stale path: %v", err)
+			}
+			raw, _ = json.Marshal(got)
+			for _, want := range []string{`"stale":true`, `"cached_at":"2026-11-01T12:00:00Z"`} {
+				if !strings.Contains(string(raw), want) {
+					t.Errorf("stale response must carry %s, got: %s", want, raw)
+				}
+			}
+		})
+	}
+}
+
+// --- Step R4a: min_posts ---
+
+func TestSearch_MinPostsFilters(t *testing.T) {
+	mock := &mockFetcher{tagsResp: []byte(`[
+		{"id":1,"name":"big","category":0,"post_count":500},
+		{"id":2,"name":"small","category":0,"post_count":10},
+		{"id":3,"name":"dead","category":0,"post_count":0}
+	]`)}
+	svc := NewTagService(mock, nil)
+
+	// Default 0 must keep every row (the pre-filter behavior).
+	res, err := svc.Search(context.Background(), "tag", 10, -1, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Tags) != 3 {
+		t.Errorf("min_posts 0 must keep all rows, got %d", len(res.Tags))
+	}
+
+	// Threshold filtering: fewer rows than the limit is valid.
+	res, err = svc.Search(context.Background(), "tag", 10, -1, 50)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Tags) != 1 || res.Tags[0].Name != "big" {
+		t.Errorf("min_posts 50 must keep only big, got: %+v", res.Tags)
+	}
+
+	// min_posts 1 also drops 0-post placeholder rows.
+	res, err = svc.Search(context.Background(), "tag", 10, -1, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(res.Tags) != 2 {
+		t.Errorf("min_posts 1 must drop the 0-post placeholder, got: %+v", res.Tags)
+	}
+}
+
+// --- Step R4c: search_posts tags modes ---
+
+func TestSearchPosts_TagsModeDefaultFullIsByteIdentical(t *testing.T) {
+	// Both the default (empty) and explicit full must marshal the exact
+	// historical shape: the tag block present with every category list.
+	mock := &mockFetcher{postsResp: []byte(`[{
+		"id": 900, "rating": "e", "score": 42, "fav_count": 7,
+		"preview_file_url": "https://cdn.donmai.us/preview/x.jpg",
+		"large_file_url": "https://cdn.danbooru.us/large/x.jpg",
+		"tag_string_copyright": "touhou",
+		"tag_string_artist": "kantoku",
+		"tag_string_character": "hakurei_reimu",
+		"tag_string_general": "1girl solo",
+		"tag_string_meta": "highres"
+	}]`)}
+	svc := NewTagService(mock, nil)
+
+	want := `[{"id":900,"rating":"e","score":42,"fav_count":7,"tags":{"copyright":["touhou"],"artist":["kantoku"],"character":["hakurei_reimu"],"general":["1girl","solo"],"meta":["highres"]},"preview_file_url":"https://cdn.donmai.us/preview/x.jpg","large_file_url":"https://cdn.danbooru.us/large/x.jpg"}]`
+	for _, mode := range []string{"", "full"} {
+		posts, err := svc.SearchPosts(context.Background(), "touhou", 1, mode)
+		if err != nil {
+			t.Fatalf("mode %q: %v", mode, err)
+		}
+		raw, err := json.Marshal(posts)
+		if err != nil {
+			t.Fatalf("mode %q: marshal: %v", mode, err)
+		}
+		if string(raw) != want {
+			t.Errorf("mode %q: expected the historical full shape, got: %s", mode, raw)
+		}
+	}
+}
+
+func TestSearchPosts_TagsModeNoneOmitsTagLists(t *testing.T) {
+	mock := &mockFetcher{postsResp: []byte(`[{
+		"id": 900, "rating": "e", "score": 42, "fav_count": 7,
+		"preview_file_url": "https://cdn.donmai.us/preview/x.jpg",
+		"large_file_url": "https://cdn.donmai.us/large/x.jpg",
+		"tag_string_general": "1girl solo"
+	}]`)}
+	svc := NewTagService(mock, nil)
+
+	posts, err := svc.SearchPosts(context.Background(), "touhou", 1, "none")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(posts) != 1 {
+		t.Fatalf("expected 1 post, got %d", len(posts))
+	}
+	if posts[0].Tags != nil {
+		t.Errorf("none mode must drop the tag lists, got: %+v", posts[0].Tags)
+	}
+	// Identity, rating, popularity counters and URLs must survive.
+	raw, _ := json.Marshal(posts)
+	for _, want := range []string{`"id":900`, `"rating":"e"`, `"score":42`, `"fav_count":7`, `"large_file_url"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("none mode must keep %s, got: %s", want, raw)
+		}
+	}
+	if strings.Contains(string(raw), `"tags"`) {
+		t.Errorf("none mode must omit the tags key entirely, got: %s", raw)
+	}
+}
+
+func TestSearchPosts_TagsModeDiffSubtractsQueryContentTags(t *testing.T) {
+	mock := &mockFetcher{postsResp: []byte(`[{
+		"id": 900, "rating": "g",
+		"tag_string_copyright": "touhou project",
+		"tag_string_character": "hakurei_reimu",
+		"tag_string_general": "arm_up 1girl solo",
+		"tag_string_meta": "highres"
+	}]`)}
+	svc := NewTagService(mock, nil)
+
+	// The query mixes case and a metatag: only arm_up is subtracted,
+	// rating:g never names a literal tag so it cannot be.
+	posts, err := svc.SearchPosts(context.Background(), "Arm_Up rating:g", 1, "diff")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(posts) != 1 || posts[0].Tags == nil {
+		t.Fatalf("diff mode must keep the tag block, got: %+v", posts)
+	}
+	tags := *posts[0].Tags
+	if fmt.Sprint(tags.General) != fmt.Sprint([]string{"1girl", "solo"}) {
+		t.Errorf("general must be [1girl solo], got: %v", tags.General)
+	}
+	if fmt.Sprint(tags.Copyright) != fmt.Sprint([]string{"touhou", "project"}) {
+		t.Errorf("copyright must be untouched, got: %v", tags.Copyright)
+	}
+	if fmt.Sprint(tags.Character) != fmt.Sprint([]string{"hakurei_reimu"}) {
+		t.Errorf("character must be untouched, got: %v", tags.Character)
+	}
+	if fmt.Sprint(tags.Meta) != fmt.Sprint([]string{"highres"}) {
+		t.Errorf("meta must be untouched, got: %v", tags.Meta)
+	}
+}
+
+func TestSearchPosts_TagsModeInvalid(t *testing.T) {
+	mock := &mockFetcher{postsResp: []byte(`[]`)}
+	svc := NewTagService(mock, nil)
+
+	_, err := svc.SearchPosts(context.Background(), "1girl", 5, "bogus")
+	if err == nil || !strings.Contains(err.Error(), "invalid tags mode") {
+		t.Fatalf("expected mode rejection, got: %v", err)
 	}
 	if mock.lastPostsArg != "" {
 		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)

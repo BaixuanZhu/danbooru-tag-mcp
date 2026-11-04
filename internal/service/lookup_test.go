@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -169,5 +170,73 @@ func TestInfos_RejectsBadInputBeforeAnyRequest(t *testing.T) {
 				t.Errorf("validation failure must not trigger a request, got: %v", mock.lastNamesArg)
 			}
 		})
+	}
+}
+
+// --- Step R3: batch renamed_to ---
+
+func TestInfos_ZeroPostRowsResolveRenamedTo(t *testing.T) {
+	// The batch applies the same dead-end enhancement as Info: 0-post
+	// placeholder rows resolve renamed_to via one alias request each, and
+	// live rows stay at zero extra requests.
+	mock := &mockFetcher{
+		namesResp: []byte(`[
+			{"id":1,"name":"blue_hair","category":0,"post_count":1200000},
+			{"id":2,"name":"gold_footwear","category":0,"post_count":0}
+		]`),
+		aliasResp: []byte(`[{"antecedent_name":"gold_footwear","consequent_name":"footwear","status":"active"}]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	got, err := svc.Infos(context.Background(), []string{"blue_hair", "gold_footwear"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got.Found) != 2 {
+		t.Fatalf("expected 2 found rows, got: %+v", got.Found)
+	}
+	if got.Found[0].RenamedTo != "" {
+		t.Errorf("live row must not carry renamed_to, got %q", got.Found[0].RenamedTo)
+	}
+	if got.Found[1].RenamedTo != "footwear" {
+		t.Errorf("0-post row must carry renamed_to footwear, got %q", got.Found[1].RenamedTo)
+	}
+	if mock.aliasCalls != 1 {
+		t.Errorf("only the 0-post row may trigger an alias request, got %d calls", mock.aliasCalls)
+	}
+}
+
+func TestInfos_LiveOnlyBatchIssuesNoAliasRequests(t *testing.T) {
+	mock := &mockFetcher{
+		namesResp: []byte(`[
+			{"id":1,"name":"blue_hair","category":0,"post_count":1200000},
+			{"id":2,"name":"solo","category":0,"post_count":900000}
+		]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	if _, err := svc.Infos(context.Background(), []string{"blue_hair", "solo"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mock.aliasCalls != 0 {
+		t.Errorf("live rows must skip the alias lookup, got %d calls", mock.aliasCalls)
+	}
+}
+
+func TestInfos_AliasFailureIsNonFatal(t *testing.T) {
+	// The alias fetch is an enhancement: its failure must still return the
+	// found row, just without renamed_to.
+	mock := &mockFetcher{
+		namesResp: []byte(`[{"id":2,"name":"gold_footwear","category":0,"post_count":0}]`),
+		aliasErr:  errors.New("danbooru 503 (Downbooru)"),
+	}
+	svc := NewTagService(mock, nil)
+
+	got, err := svc.Infos(context.Background(), []string{"gold_footwear"})
+	if err != nil {
+		t.Fatalf("alias failure must be non-fatal, got: %v", err)
+	}
+	if len(got.Found) != 1 || got.Found[0].Name != "gold_footwear" || got.Found[0].RenamedTo != "" {
+		t.Errorf("expected the row without renamed_to, got: %+v", got.Found)
 	}
 }

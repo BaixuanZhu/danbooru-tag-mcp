@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 
+	"danbooru-tag-mcp/internal/cache"
 	"danbooru-tag-mcp/internal/service"
 	"danbooru-tag-mcp/internal/vocab"
 
@@ -16,15 +17,15 @@ import (
 )
 
 type TagService interface {
-	Search(ctx context.Context, query string, limit, category int) ([]service.Tag, error)
+	Search(ctx context.Context, query string, limit, category, minPosts int) (*service.SearchResult, error)
 	Info(ctx context.Context, name string) (*service.TagInfo, error)
 	Infos(ctx context.Context, names []string) (*service.TagsInfo, error)
 	WD14Info(name string) service.WD14Status
 	TaggerVocabHits(query string, limit int) []vocab.Hit
-	Related(ctx context.Context, tag string, limit int) ([]service.RelatedTag, error)
-	Alias(ctx context.Context, name string) (*service.TagAlias, error)
-	Wiki(ctx context.Context, title, otherNames string, limit int, includeDescription bool) ([]service.WikiPage, error)
-	SearchPosts(ctx context.Context, tags string, limit int) ([]service.Post, error)
+	Related(ctx context.Context, tag string, limit int) (*service.RelatedResult, error)
+	Alias(ctx context.Context, name string) (*service.AliasResult, error)
+	Wiki(ctx context.Context, title, otherNames string, limit int, includeDescription bool) (*service.WikiResult, error)
+	SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) ([]service.Post, error)
 	Profile(ctx context.Context, tag string, sample int, opts service.ProfileOptions) (*service.TagProfile, error)
 }
 
@@ -82,6 +83,16 @@ func getBoolArg(args map[string]any, key string) bool {
 	return false
 }
 
+// withRefresh wraps ctx with the cache refresh request when the call opted
+// in: the api layer then bypasses the fresh-hit shortcut and re-fetches
+// live. Absent/false returns ctx unchanged (default cache-on behavior).
+func withRefresh(ctx context.Context, args map[string]any) context.Context {
+	if getBoolArg(args, "refresh") {
+		return cache.WithRefresh(ctx)
+	}
+	return ctx
+}
+
 // getStringSliceArg extracts a string-array argument. MCP clients deliver
 // JSON arrays as []any; non-string entries are skipped.
 func getStringSliceArg(args map[string]any, key string) []string {
@@ -105,7 +116,7 @@ func getStringSliceArg(args map[string]any, key string) []string {
 // Exported tool instances so register_test.go can statically validate their schemas
 var (
 	SearchTagsTool = mcp.NewTool("search_tags",
-		mcp.WithDescription("Search Danbooru tags by keyword, ordered by post count. When no result has posts, adds wd14_hits (WD14 tagger vocab names containing the query). category filters by general|artist|copyright|character|meta"),
+		mcp.WithDescription("Search Danbooru tags by keyword, ordered by post count. When no result has posts, adds wd14_hits (WD14 tagger vocab names containing the query). category filters by general|artist|copyright|character|meta. min_posts filters out tags below the threshold (may return fewer than limit). Serves expired cached data marked stale+cached_at when Danbooru is unreachable; refresh:true re-fetches live and updates the cache"),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("keyword, e.g. 'blue hair'"),
@@ -116,18 +127,27 @@ var (
 		mcp.WithString("category",
 			mcp.Description("filter by category: general|artist|copyright|character|meta"),
 		),
+		mcp.WithNumber("min_posts",
+			mcp.Description("drop tags with fewer posts (default: 0 keeps all)"),
+		),
+		mcp.WithBoolean("refresh",
+			mcp.Description("bypass the cache and re-fetch live"),
+		),
 	)
 
 	GetTagInfoTool = mcp.NewTool("get_tag_info",
-		mcp.WithDescription("Get exact info for a Danbooru tag. wd14 field: live (current Danbooru), tagger_era (WD14 tagger vocab only, likely renamed), unknown (neither). Adds renamed_to when a 0-post name has an active alias"),
+		mcp.WithDescription("Get exact info for a Danbooru tag. wd14 field: live (current Danbooru), tagger_era (WD14 tagger vocab only, likely renamed), unknown (neither). Adds renamed_to when a 0-post name has an active alias. Serves expired cached data marked stale+cached_at when Danbooru is unreachable; refresh:true re-fetches live and updates the cache"),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("exact tag name, e.g. 'blue_hair'"),
 		),
+		mcp.WithBoolean("refresh",
+			mcp.Description("bypass the cache and re-fetch live"),
+		),
 	)
 
 	GetRelatedTagsTool = mcp.NewTool("get_related_tags",
-		mcp.WithDescription("Get co-occurring tags for a given tag (meta-category tags excluded)"),
+		mcp.WithDescription("Get co-occurring tags for a given tag (meta-category tags excluded). Serves expired cached data marked stale+cached_at when Danbooru is unreachable; refresh:true re-fetches live and updates the cache"),
 		mcp.WithString("tag",
 			mcp.Required(),
 			mcp.Description("tag to find co-occurring tags for"),
@@ -135,18 +155,24 @@ var (
 		mcp.WithNumber("limit",
 			mcp.Description("max related tags to return (default: 10)"),
 		),
+		mcp.WithBoolean("refresh",
+			mcp.Description("bypass the cache and re-fetch live"),
+		),
 	)
 
 	GetTagAliasTool = mcp.NewTool("get_tag_alias",
-		mcp.WithDescription("Resolve a tag alias or misspelling to its canonical Danbooru tag; null means the input is already canonical"),
+		mcp.WithDescription("Resolve a tag alias or misspelling to its canonical Danbooru tag; null means the input is already canonical. Serves expired cached data marked stale+cached_at when Danbooru is unreachable; refresh:true re-fetches live and updates the cache"),
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("alias or candidate tag, e.g. 'sailor_suit'"),
 		),
+		mcp.WithBoolean("refresh",
+			mcp.Description("bypass the cache and re-fetch live"),
+		),
 	)
 
 	GetTagWikiTool = mcp.NewTool("get_tag_wiki",
-		mcp.WithDescription("Get a tag's wiki page as structured fields: summary, intro_tags, rules, see_also, example_posts, linked_tags, other_names. include_description also returns the intro prose. Pass title (exact canonical tag) or other_names (multilingual alias substring)"),
+		mcp.WithDescription("Get a tag's wiki page as structured fields: summary, intro_tags, rules, see_also, example_posts, linked_tags, other_names. include_description also returns the intro prose. Pass title (exact canonical tag) or other_names (multilingual alias substring). Serves expired cached data marked stale+cached_at when Danbooru is unreachable; refresh:true re-fetches live and updates the cache"),
 		mcp.WithString("title",
 			mcp.Description("exact wiki title, i.e. the canonical tag, e.g. 'firefly_(honkai:_star_rail)'"),
 		),
@@ -159,16 +185,23 @@ var (
 		mcp.WithBoolean("include_description",
 			mcp.Description("also return the intro prose as plain text (character appearance descriptions)"),
 		),
+		mcp.WithBoolean("refresh",
+			mcp.Description("bypass the cache and re-fetch live"),
+		),
 	)
 
 	SearchPostsTool = mcp.NewTool("search_posts",
-		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta)"),
+		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta). tags_mode=none drops tag lists; diff keeps only tags not already in the query"),
 		mcp.WithString("tags",
 			mcp.Required(),
 			mcp.Description("space-separated tags"),
 		),
 		mcp.WithNumber("limit",
 			mcp.Description("max posts to return (default: 5, max: 20)"),
+		),
+		mcp.WithString("tags_mode",
+			mcp.Enum("full", "none", "diff"),
+			mcp.Description("tag-list mode: full (default), none (drop tag lists), diff (drop tags already in the query)"),
 		),
 	)
 
@@ -193,12 +226,15 @@ var (
 	)
 
 	GetTagsInfoTool = mcp.NewTool("get_tags_info",
-		mcp.WithDescription("Batch exact info for up to 20 Danbooru tag names in one request (cheaper than repeated get_tag_info calls). Returns found tags (name, category, post_count, wd14 verdict: live/tagger_era/unknown) and missing names with their wd14 verdict"),
+		mcp.WithDescription("Batch exact info for up to 20 Danbooru tag names in one request (cheaper than repeated get_tag_info calls). 0-post rows also resolve renamed_to (one extra request each). Returns found tags (name, category, post_count, wd14 verdict: live/tagger_era/unknown) and missing names with their wd14 verdict. Serves expired cached data marked stale+cached_at when Danbooru is unreachable; refresh:true re-fetches live and updates the cache"),
 		mcp.WithArray("names",
 			mcp.Required(),
 			mcp.MaxItems(20),
 			mcp.Items(map[string]any{"type": "string"}),
 			mcp.Description("exact tag names, e.g. ['blue_hair','1girl']"),
+		),
+		mcp.WithBoolean("refresh",
+			mcp.Description("bypass the cache and re-fetch live"),
 		),
 	)
 )
@@ -232,19 +268,19 @@ func Register(s *server.MCPServer, svc TagService) {
 			}
 			category = id
 		}
+		ctx = withRefresh(ctx, args)
 
-		tags, err := svc.Search(ctx, query, limit, category)
+		res, err := svc.Search(ctx, query, limit, category, getIntArg(args, "min_posts", 0))
 		if err != nil {
 			return mcp.NewToolResultText(errResp("search_failed", err.Error())), nil
 		}
-		payload := map[string]any{"tags": tags}
-		if !hasLiveTag(tags) {
+		if !hasLiveTag(res.Tags) {
 			// Dead end made actionable: nearby WD14 tagger-vocab names.
 			if hits := svc.TaggerVocabHits(query, wd14HitsLimit); len(hits) > 0 {
-				payload["wd14_hits"] = hits
+				res.WD14Hits = hits
 			}
 		}
-		return jsonResult(payload)
+		return jsonResult(res)
 	})
 
 	// tool 2: get_tag_info
@@ -254,6 +290,7 @@ func Register(s *server.MCPServer, svc TagService) {
 		if name == "" {
 			return mcp.NewToolResultText(errResp("tag_not_found", "name parameter is required")), nil
 		}
+		ctx = withRefresh(ctx, args)
 
 		info, err := svc.Info(ctx, name)
 		if err != nil {
@@ -281,12 +318,13 @@ func Register(s *server.MCPServer, svc TagService) {
 			return mcp.NewToolResultText(errResp("related_failed", "tag parameter is required")), nil
 		}
 		limit := getIntArg(args, "limit", 10)
+		ctx = withRefresh(ctx, args)
 
-		related, err := svc.Related(ctx, tag, limit)
+		res, err := svc.Related(ctx, tag, limit)
 		if err != nil {
 			return mcp.NewToolResultText(errResp("related_failed", err.Error())), nil
 		}
-		return jsonResult(map[string]any{"related": related})
+		return jsonResult(res)
 	})
 
 	// tool 4: get_tag_alias
@@ -296,12 +334,13 @@ func Register(s *server.MCPServer, svc TagService) {
 		if name == "" {
 			return mcp.NewToolResultText(errResp("alias_failed", "name parameter is required")), nil
 		}
+		ctx = withRefresh(ctx, args)
 
-		alias, err := svc.Alias(ctx, name)
+		res, err := svc.Alias(ctx, name)
 		if err != nil {
 			return mcp.NewToolResultText(errResp("alias_failed", err.Error())), nil
 		}
-		return jsonResult(map[string]any{"alias": alias})
+		return jsonResult(res)
 	})
 
 	// tool 5: get_tag_wiki
@@ -313,12 +352,13 @@ func Register(s *server.MCPServer, svc TagService) {
 			return mcp.NewToolResultText(errResp("wiki_failed", "title or other_names parameter is required")), nil
 		}
 		limit := getIntArg(args, "limit", 5)
+		ctx = withRefresh(ctx, args)
 
-		pages, err := svc.Wiki(ctx, title, otherNames, limit, getBoolArg(args, "include_description"))
+		res, err := svc.Wiki(ctx, title, otherNames, limit, getBoolArg(args, "include_description"))
 		if err != nil {
 			return mcp.NewToolResultText(errResp("wiki_failed", err.Error())), nil
 		}
-		return jsonResult(map[string]any{"wiki_pages": pages})
+		return jsonResult(res)
 	})
 
 	// tool 6: search_posts
@@ -330,7 +370,7 @@ func Register(s *server.MCPServer, svc TagService) {
 		}
 		limit := getIntArg(args, "limit", 5)
 
-		posts, err := svc.SearchPosts(ctx, tags, limit)
+		posts, err := svc.SearchPosts(ctx, tags, limit, getStringArg(args, "tags_mode"))
 		if err != nil {
 			return mcp.NewToolResultText(errResp("post_search_failed", err.Error())), nil
 		}
@@ -378,6 +418,7 @@ func Register(s *server.MCPServer, svc TagService) {
 		if len(names) == 0 {
 			return mcp.NewToolResultText(errResp("tags_info_failed", "names parameter is required (array of tag names)")), nil
 		}
+		ctx = withRefresh(ctx, args)
 
 		info, err := svc.Infos(ctx, names)
 		if err != nil {

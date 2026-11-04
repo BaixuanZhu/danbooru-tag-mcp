@@ -84,11 +84,19 @@ func TestToolSchemas_PropertiesExist(t *testing.T) {
 	}{
 		{"search_tags", SearchTagsTool, "limit"},
 		{"search_tags", SearchTagsTool, "category"},
+		{"search_tags", SearchTagsTool, "min_posts"},
+		{"search_tags", SearchTagsTool, "refresh"},
+		{"get_tag_info", GetTagInfoTool, "refresh"},
+		{"get_tags_info", GetTagsInfoTool, "names"},
+		{"get_tags_info", GetTagsInfoTool, "refresh"},
 		{"get_related_tags", GetRelatedTagsTool, "limit"},
+		{"get_related_tags", GetRelatedTagsTool, "refresh"},
+		{"get_tag_alias", GetTagAliasTool, "refresh"},
 		{"get_tag_wiki", GetTagWikiTool, "other_names"},
 		{"get_tag_wiki", GetTagWikiTool, "include_description"},
-		{"get_tags_info", GetTagsInfoTool, "names"},
+		{"get_tag_wiki", GetTagWikiTool, "refresh"},
 		{"search_posts", SearchPostsTool, "limit"},
+		{"search_posts", SearchPostsTool, "tags_mode"},
 		{"get_tag_profile", GetTagProfileTool, "sample"},
 		{"get_tag_profile", GetTagProfileTool, "with"},
 		{"get_tag_profile", GetTagProfileTool, "rating"},
@@ -101,5 +109,49 @@ func TestToolSchemas_PropertiesExist(t *testing.T) {
 				t.Errorf("tool %s missing expected property %s", tt.name, tt.property)
 			}
 		})
+	}
+}
+
+func TestToolSchemas_NoRefreshOnUncachedTools(t *testing.T) {
+	// Posts and profile responses are never cached, so the refresh bypass
+	// (and the stale markers it pairs with) have nothing to act on there.
+	for _, tt := range []struct {
+		name string
+		tool mcp.Tool
+	}{
+		{"search_posts", SearchPostsTool},
+		{"get_tag_profile", GetTagProfileTool},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, exists := tt.tool.InputSchema.Properties["refresh"]; exists {
+				t.Errorf("tool %s must not expose a refresh param", tt.name)
+			}
+		})
+	}
+}
+
+func TestSearchPostsTool_TagsModeEnum(t *testing.T) {
+	// The enum is the contract: only full/none/diff are valid modes, and
+	// there is no default so the absent param means full server-side.
+	prop, exists := SearchPostsTool.InputSchema.Properties["tags_mode"]
+	if !exists {
+		t.Fatal("search_posts missing tags_mode property")
+	}
+	schema, ok := prop.(map[string]any)
+	if !ok {
+		t.Fatalf("tags_mode property is not an object, got: %#v", prop)
+	}
+	enum, ok := schema["enum"].([]string)
+	if !ok {
+		t.Fatalf("tags_mode enum missing or wrong type, got: %#v", schema["enum"])
+	}
+	want := []string{"full", "none", "diff"}
+	if len(enum) != len(want) {
+		t.Fatalf("tags_mode enum = %v, want %v", enum, want)
+	}
+	for i, v := range want {
+		if enum[i] != v {
+			t.Errorf("tags_mode enum[%d] = %q, want %q", i, enum[i], v)
+		}
 	}
 }

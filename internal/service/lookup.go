@@ -26,14 +26,17 @@ type MissingTag struct {
 type TagsInfo struct {
 	Found   []TagInfo    `json:"found"`
 	Missing []MissingTag `json:"missing,omitempty"`
+	CacheMarks
 }
 
 // Infos resolves up to maxBatchNames exact tag names in ONE Danbooru request
 // (search[name_normalize] takes a comma-separated list — verified live,
 // search[name] does not). Names are normalized and deduped; 0-post rows
-// count as found (placeholder semantics shared with Info); everything else
-// lands in Missing with its local WD14 verdict. An all-missing input is a
-// valid answer, not an error.
+// count as found (placeholder semantics shared with Info) and resolve
+// renamed_to via one extra alias request each (resolveRenamedTo: live rows
+// skip it, alias failures are non-fatal); everything else lands in Missing
+// with its local WD14 verdict. An all-missing input is a valid answer, not
+// an error.
 func (s *TagService) Infos(ctx context.Context, names []string) (*TagsInfo, error) {
 	clean := make([]string, 0, len(names))
 	seen := make(map[string]bool, len(names))
@@ -52,12 +55,12 @@ func (s *TagService) Infos(ctx context.Context, names []string) (*TagsInfo, erro
 		return nil, fmt.Errorf("too many names: %d (max %d); split the call into batches", len(clean), maxBatchNames)
 	}
 
-	body, err := s.fetcher.FetchTagsByNames(ctx, clean)
+	res, err := s.fetcher.FetchTagsByNames(ctx, clean)
 	if err != nil {
 		return nil, err
 	}
 	var rows []Tag
-	if err := json.Unmarshal(body, &rows); err != nil {
+	if err := json.Unmarshal(res.Body, &rows); err != nil {
 		return nil, fmt.Errorf("failed to parse tags info response: %w", err)
 	}
 
@@ -68,7 +71,7 @@ func (s *TagService) Infos(ctx context.Context, names []string) (*TagsInfo, erro
 		byName[strings.ToLower(r.Name)] = r
 	}
 
-	result := &TagsInfo{Found: make([]TagInfo, 0, len(clean))}
+	result := &TagsInfo{Found: make([]TagInfo, 0, len(clean)), CacheMarks: marksFrom(res)}
 	for _, name := range clean {
 		row, ok := byName[strings.ToLower(name)]
 		if !ok {
@@ -76,6 +79,11 @@ func (s *TagService) Infos(ctx context.Context, names []string) (*TagsInfo, erro
 			continue
 		}
 		result.Found = append(result.Found, TagInfo{Tag: row, WD14: s.wd14Status(name, row.PostCount > 0)})
+	}
+	// Dead-end enhancement shared with Info: renamed-away antecedents keep a
+	// 0-post row, and their alias consequent is the actionable answer.
+	for i := range result.Found {
+		s.resolveRenamedTo(ctx, &result.Found[i])
 	}
 	return result, nil
 }

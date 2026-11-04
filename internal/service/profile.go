@@ -161,6 +161,7 @@ func (s *TagService) profileSingle(ctx context.Context, tag string, sample int, 
 		return nil, err // *NotFoundError propagates; the handler rides the wd14 verdict
 	}
 	profile.TagInfo = *info
+	profile.TagInfo.CacheMarks = CacheMarks{} // profiles never carry cache markers
 	if order == "" {
 		order = "random"
 	}
@@ -203,8 +204,10 @@ func (s *TagService) profilePair(ctx context.Context, tag, with string, sample i
 		return nil, &NotFoundError{Name: with}
 	}
 
+	// Infos already resolved renamed_to on the 0-post rows (the same
+	// dead-end enhancement Info applies), so the row embeds as-is.
 	profile.TagInfo = *tagRow
-	s.resolveRenamedTo(ctx, &profile.TagInfo) // same dead-end enhancement Info applies
+	profile.TagInfo.CacheMarks = CacheMarks{} // profiles never carry cache markers
 	profile.With = &ProfileWith{Tag: withRow.Name, PostCount: withRow.PostCount}
 	profile.Order = "recent"
 	if tagRow.PostCount == 0 || withRow.PostCount == 0 {
@@ -229,12 +232,12 @@ func (s *TagService) profilePair(ctx context.Context, tag, with string, sample i
 
 // fetchProfilePosts fetches and parses one page of posts for the sample.
 func (s *TagService) fetchProfilePosts(ctx context.Context, query string, limit int) ([]danbooruPost, error) {
-	body, err := s.fetcher.FetchPosts(ctx, query, limit)
+	res, err := s.fetcher.FetchPosts(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
 	var posts []danbooruPost
-	if err := json.Unmarshal(body, &posts); err != nil {
+	if err := json.Unmarshal(res.Body, &posts); err != nil {
 		return nil, fmt.Errorf("failed to parse posts: %w", err)
 	}
 	return posts, nil

@@ -9,7 +9,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
+	"danbooru-tag-mcp/internal/cache"
 	"danbooru-tag-mcp/internal/vocab"
 )
 
@@ -65,27 +67,51 @@ type PostTags struct {
 
 // Post is a trimmed search result entry: identity, rating, popularity
 // counters, the full tag list by category, and image URLs (preview plus the
-// large version, which is big enough to actually inspect).
+// large version, which is big enough to actually inspect). Tags is nil
+// (omitted from JSON) in the none tags mode; every other mode carries it.
 type Post struct {
-	ID           int      `json:"id"`
-	Rating       string   `json:"rating"`
-	Score        int      `json:"score"`
-	FavCount     int      `json:"fav_count"`
-	Tags         PostTags `json:"tags"`
-	PreviewURL   string   `json:"preview_file_url"`
-	LargeFileURL string   `json:"large_file_url"` // empty when no large version exists
+	ID           int       `json:"id"`
+	Rating       string    `json:"rating"`
+	Score        int       `json:"score"`
+	FavCount     int       `json:"fav_count"`
+	Tags         *PostTags `json:"tags,omitempty"`
+	PreviewURL   string    `json:"preview_file_url"`
+	LargeFileURL string    `json:"large_file_url"` // empty when no large version exists
 }
 
-// TagFetcher decouples the service from the concrete api.Client for mock-based unit tests
+// TagFetcher decouples the service from the concrete api.Client for
+// mock-based unit tests. Fetch methods return cache.Result so response
+// provenance (stale fallback) can flow to the caller alongside the raw
+// Danbooru JSON body.
 type TagFetcher interface {
 	// category is a Danbooru category id filter; -1 means no filter.
-	FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error)
-	FetchTagExact(ctx context.Context, name string) ([]byte, error)
-	FetchTagsByNames(ctx context.Context, names []string) ([]byte, error)
-	FetchRelated(ctx context.Context, tag string) ([]byte, error)
-	FetchAlias(ctx context.Context, name string) ([]byte, error)
-	FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error)
-	FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error)
+	FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) (cache.Result, error)
+	FetchTagExact(ctx context.Context, name string) (cache.Result, error)
+	FetchTagsByNames(ctx context.Context, names []string) (cache.Result, error)
+	FetchRelated(ctx context.Context, tag string) (cache.Result, error)
+	FetchAlias(ctx context.Context, name string) (cache.Result, error)
+	FetchWiki(ctx context.Context, title, otherNames string, limit int) (cache.Result, error)
+	FetchPosts(ctx context.Context, tags string, limit int) (cache.Result, error)
+}
+
+// CacheMarks carries expired-cache provenance on a cacheable response. Both
+// fields stay zero — and out of the JSON — on every network path and every
+// fresh cache hit; they are set only when the owning fetch fell back to an
+// expired cache entry after retries were exhausted. CachedAt is that
+// entry's storage time (RFC3339). Posts and profile responses never carry
+// marks: posts are never cached, and profiles pin no cache fields.
+type CacheMarks struct {
+	Stale    bool   `json:"stale,omitempty"`
+	CachedAt string `json:"cached_at,omitempty"`
+}
+
+// marksFrom converts a fetch result's provenance into response marks:
+// empty unless the fetch served a stale entry.
+func marksFrom(res cache.Result) CacheMarks {
+	if !res.Stale {
+		return CacheMarks{}
+	}
+	return CacheMarks{Stale: true, CachedAt: res.CachedAt.Format(time.RFC3339)}
 }
 
 // WD14 status values: how a name stands relative to current Danbooru and
@@ -106,11 +132,42 @@ type WD14Status struct {
 
 // TagInfo is get_tag_info's payload: the live tag row (embedded, so the
 // found-response shape stays flat) plus the WD14 verdict, and RenamedTo on
-// 0-post placeholder rows that an active alias points elsewhere.
+// 0-post placeholder rows that an active alias points elsewhere. When
+// embedded in a TagProfile the cache marks are cleared: profiles carry no
+// cache fields by contract.
 type TagInfo struct {
 	Tag
 	WD14      WD14Status `json:"wd14"`
 	RenamedTo string     `json:"renamed_to,omitempty"`
+	CacheMarks
+}
+
+// SearchResult is search_tags' payload: the matched tag rows plus the
+// optional WD14 tagger-vocabulary fallback hits (filled by the tools layer
+// when no row carries posts).
+type SearchResult struct {
+	Tags     []Tag       `json:"tags"`
+	WD14Hits []vocab.Hit `json:"wd14_hits,omitempty"`
+	CacheMarks
+}
+
+// RelatedResult is get_related_tags' payload: the co-occurring tags.
+type RelatedResult struct {
+	Related []RelatedTag `json:"related"`
+	CacheMarks
+}
+
+// AliasResult is get_tag_alias' payload: Alias is null when the input is
+// already canonical.
+type AliasResult struct {
+	Alias *TagAlias `json:"alias"`
+	CacheMarks
+}
+
+// WikiResult is get_tag_wiki' payload: the distilled wiki pages.
+type WikiResult struct {
+	Pages []WikiPage `json:"wiki_pages"`
+	CacheMarks
 }
 
 // NotFoundError reports that current Danbooru carries no exact match for
@@ -155,18 +212,30 @@ func CategoryID(name string) (int, bool) {
 
 // Search finds tags by keyword, ordered by post count. category is a Danbooru
 // category id filter (-1 = no filter); the tools layer maps names to ids.
-func (s *TagService) Search(ctx context.Context, query string, limit, category int) ([]Tag, error) {
+// minPosts drops rows below the threshold after the fetch (0 keeps every
+// row, the pre-filter behavior), so the result may be shorter than limit —
+// including empty, which the caller treats as a dead-end search.
+func (s *TagService) Search(ctx context.Context, query string, limit, category, minPosts int) (*SearchResult, error) {
 	cleanQuery := normalizeTag(query)
-	body, err := s.fetcher.FetchTags(ctx, cleanQuery, limit, true, category)
+	res, err := s.fetcher.FetchTags(ctx, cleanQuery, limit, true, category)
 	if err != nil {
 		return nil, err
 	}
 
 	var tags []Tag
-	if err := json.Unmarshal(body, &tags); err != nil {
+	if err := json.Unmarshal(res.Body, &tags); err != nil {
 		return nil, fmt.Errorf("failed to parse tags response: %w", err)
 	}
-	return tags, nil
+	if minPosts > 0 {
+		kept := tags[:0]
+		for _, t := range tags {
+			if t.PostCount >= minPosts {
+				kept = append(kept, t)
+			}
+		}
+		tags = kept
+	}
+	return &SearchResult{Tags: tags, CacheMarks: marksFrom(res)}, nil
 }
 
 // Info resolves a name to its exact tag row plus the WD14 verdict. A
@@ -174,13 +243,13 @@ func (s *TagService) Search(ctx context.Context, query string, limit, category i
 // caller can still classify it locally via WD14Info.
 func (s *TagService) Info(ctx context.Context, name string) (*TagInfo, error) {
 	cleanName := normalizeTag(name)
-	body, err := s.fetcher.FetchTagExact(ctx, cleanName)
+	res, err := s.fetcher.FetchTagExact(ctx, cleanName)
 	if err != nil {
 		return nil, err
 	}
 
 	var tags []Tag
-	if err := json.Unmarshal(body, &tags); err != nil {
+	if err := json.Unmarshal(res.Body, &tags); err != nil {
 		return nil, fmt.Errorf("failed to parse tag info response: %w", err)
 	}
 	if len(tags) == 0 {
@@ -189,7 +258,7 @@ func (s *TagService) Info(ctx context.Context, name string) (*TagInfo, error) {
 	// A returned row with 0 posts is a placeholder (renamed-away antecedent,
 	// unused tag — verified live: barefoot_sandals, gold_footwear and even
 	// painted_toenails all return rows). It does not make the name live.
-	info := &TagInfo{Tag: tags[0], WD14: s.wd14Status(cleanName, tags[0].PostCount > 0)}
+	info := &TagInfo{Tag: tags[0], WD14: s.wd14Status(cleanName, tags[0].PostCount > 0), CacheMarks: marksFrom(res)}
 	s.resolveRenamedTo(ctx, info)
 	return info, nil
 }
@@ -203,8 +272,8 @@ func (s *TagService) resolveRenamedTo(ctx context.Context, info *TagInfo) {
 	if info.PostCount != 0 {
 		return
 	}
-	if alias, err := s.Alias(ctx, info.Name); err == nil && alias != nil {
-		info.RenamedTo = alias.Consequent
+	if res, err := s.Alias(ctx, info.Name); err == nil && res.Alias != nil {
+		info.RenamedTo = res.Alias.Consequent
 	}
 }
 
@@ -265,15 +334,15 @@ type danbooruRelatedResponse struct {
 // commentary, ...) as returned by tags.json / related_tag.json.
 const danbooruCategoryMeta = 5
 
-func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]RelatedTag, error) {
+func (s *TagService) Related(ctx context.Context, tag string, limit int) (*RelatedResult, error) {
 	cleanTag := normalizeTag(tag)
-	body, err := s.fetcher.FetchRelated(ctx, cleanTag)
+	res, err := s.fetcher.FetchRelated(ctx, cleanTag)
 	if err != nil {
 		return nil, err
 	}
 
 	var resp danbooruRelatedResponse
-	if err := json.Unmarshal(body, &resp); err != nil {
+	if err := json.Unmarshal(res.Body, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse related tags: %w", err)
 	}
 
@@ -301,27 +370,28 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) ([]Rela
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
-	return results, nil
+	return &RelatedResult{Related: results, CacheMarks: marksFrom(res)}, nil
 }
 
 // Alias resolves a user-typed alias to its canonical Danbooru tag via
-// /tag_aliases.json. Returns nil when no active alias exists, meaning the
-// input is likely already canonical.
-func (s *TagService) Alias(ctx context.Context, name string) (*TagAlias, error) {
+// /tag_aliases.json. The result's Alias field is nil when no active alias
+// exists, meaning the input is likely already canonical (null in JSON).
+func (s *TagService) Alias(ctx context.Context, name string) (*AliasResult, error) {
 	cleanName := normalizeTag(name)
-	body, err := s.fetcher.FetchAlias(ctx, cleanName)
+	res, err := s.fetcher.FetchAlias(ctx, cleanName)
 	if err != nil {
 		return nil, err
 	}
 
 	var aliases []danbooruAliasResponse
-	if err := json.Unmarshal(body, &aliases); err != nil {
+	if err := json.Unmarshal(res.Body, &aliases); err != nil {
 		return nil, fmt.Errorf("failed to parse tag alias response: %w", err)
 	}
-	if len(aliases) == 0 {
-		return nil, nil
+	result := &AliasResult{CacheMarks: marksFrom(res)}
+	if len(aliases) > 0 {
+		result.Alias = &TagAlias{Antecedent: aliases[0].AntecedentName, Consequent: aliases[0].ConsequentName}
 	}
-	return &TagAlias{Antecedent: aliases[0].AntecedentName, Consequent: aliases[0].ConsequentName}, nil
+	return result, nil
 }
 
 type danbooruAliasResponse struct {
@@ -342,20 +412,20 @@ type danbooruWikiResponse struct {
 // structured WikiPage fields. includeDescription additionally returns the
 // intro prose as plain text (character appearance descriptions); the raw
 // body is never returned.
-func (s *TagService) Wiki(ctx context.Context, title, otherNames string, limit int, includeDescription bool) ([]WikiPage, error) {
+func (s *TagService) Wiki(ctx context.Context, title, otherNames string, limit int, includeDescription bool) (*WikiResult, error) {
 	cleanTitle := normalizeTag(title)
 	cleanOther := ""
 	if cleanTitle == "" {
 		cleanOther = strings.TrimSpace(otherNames)
 	}
 
-	body, err := s.fetcher.FetchWiki(ctx, cleanTitle, cleanOther, limit)
+	res, err := s.fetcher.FetchWiki(ctx, cleanTitle, cleanOther, limit)
 	if err != nil {
 		return nil, err
 	}
 
 	var pages []danbooruWikiResponse
-	if err := json.Unmarshal(body, &pages); err != nil {
+	if err := json.Unmarshal(res.Body, &pages); err != nil {
 		return nil, fmt.Errorf("failed to parse wiki response: %w", err)
 	}
 
@@ -367,7 +437,7 @@ func (s *TagService) Wiki(ctx context.Context, title, otherNames string, limit i
 		}
 		results = append(results, extractWikiPage(p.Title, p.Body, other, includeDescription))
 	}
-	return results, nil
+	return &WikiResult{Pages: results, CacheMarks: marksFrom(res)}, nil
 }
 
 // Wiki extraction caps: bounded output even for the longest bodies
@@ -680,6 +750,13 @@ const maxContentTags = 2
 // average (verified live), so 20 posts bound the payload at roughly 20 KB.
 const maxPostLimit = 20
 
+// isMetatagToken reports whether one space-separated query field is a
+// metatag (contains ':': rating:g, order:random, status:deleted, ...)
+// rather than a literal tag name.
+func isMetatagToken(field string) bool {
+	return strings.Contains(field, ":")
+}
+
 // countContentTags counts fields that count toward Danbooru's per-account
 // tag limit: content tags (no ':') plus order: metatags. Other metatags
 // (rating:, status:, id:, ...) are exempt — verified empirically against
@@ -688,7 +765,7 @@ const maxPostLimit = 20
 func countContentTags(tags string) int {
 	count := 0
 	for _, field := range strings.Fields(tags) {
-		if !strings.Contains(field, ":") || strings.HasPrefix(field, "order:") {
+		if !isMetatagToken(field) || strings.HasPrefix(field, "order:") {
 			count++
 		}
 	}
@@ -724,12 +801,64 @@ func parsePostTags(p danbooruPost) PostTags {
 	}
 }
 
+// minus returns the category lists with the excluded (lowercase) names
+// removed from every category; used by diff mode to drop the query's own
+// tags from each post.
+func (t PostTags) minus(exclude map[string]bool) PostTags {
+	if len(exclude) == 0 {
+		return t
+	}
+	filter := func(names []string) []string {
+		kept := names[:0]
+		for _, n := range names {
+			if !exclude[strings.ToLower(n)] {
+				kept = append(kept, n)
+			}
+		}
+		return kept
+	}
+	t.Copyright = filter(t.Copyright)
+	t.Artist = filter(t.Artist)
+	t.Character = filter(t.Character)
+	t.General = filter(t.General)
+	t.Meta = filter(t.Meta)
+	return t
+}
+
+// Tags-list modes for SearchPosts (validated pre-flight, empty = full).
+const (
+	tagsModeFull = "full" // every per-post category list, the historical shape
+	tagsModeNone = "none" // omit the per-post tag lists entirely
+	tagsModeDiff = "diff" // category lists minus the query's own content tags
+)
+
+// tagsModes is the valid-mode set for SearchPosts.
+var tagsModes = map[string]bool{tagsModeFull: true, tagsModeNone: true, tagsModeDiff: true}
+
+// queryContentTags returns the lowercase content-tag names of a posts query:
+// space-split tokens that are not metatags (any ':' token — rating:g,
+// order:random, status:deleted — never names a literal tag, so diff mode
+// excludes them from subtraction). This is the same metatag predicate
+// countContentTags applies, minus its order: special case: order: counts
+// toward the 2-tag cap but is not a subtractable name.
+func queryContentTags(query string) map[string]bool {
+	out := make(map[string]bool)
+	for _, tok := range strings.Fields(query) {
+		if !isMetatagToken(tok) {
+			out[strings.ToLower(tok)] = true
+		}
+	}
+	return out
+}
+
 // SearchPosts sends the tags out verbatim: no layer injects a rating
 // filter. The caller pins rating:<x> when they want one (rating: metatags
 // are exempt from the tag-count limit), so an unfiltered query describes
 // the tag's whole population — the same whole-population rule
-// get_tag_profile samples by.
-func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int) ([]Post, error) {
+// get_tag_profile samples by. tagsMode reshapes only the response: full
+// (default, the historical shape) keeps every per-post category list, none
+// omits the tag lists, diff keeps only tags not already in the query.
+func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) ([]Post, error) {
 	query := strings.TrimSpace(tags)
 	if n := countContentTags(query); n > maxContentTags {
 		return nil, fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query", n, maxContentTags)
@@ -737,27 +866,45 @@ func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int) ([
 	if limit > maxPostLimit {
 		return nil, fmt.Errorf("too many posts requested: %d (max %d); a post carries its full tag list, so keep pages small", limit, maxPostLimit)
 	}
+	mode := strings.ToLower(strings.TrimSpace(tagsMode))
+	if mode == "" {
+		mode = tagsModeFull
+	}
+	if !tagsModes[mode] {
+		return nil, fmt.Errorf("invalid tags mode %q: use full, none or diff", tagsMode)
+	}
 
-	body, err := s.fetcher.FetchPosts(ctx, query, limit)
+	res, err := s.fetcher.FetchPosts(ctx, query, limit)
 	if err != nil {
 		return nil, err
 	}
 
 	var rawPosts []danbooruPost
-	if err := json.Unmarshal(body, &rawPosts); err != nil {
+	if err := json.Unmarshal(res.Body, &rawPosts); err != nil {
 		return nil, fmt.Errorf("failed to parse posts: %w", err)
+	}
+	var exclude map[string]bool
+	if mode == tagsModeDiff {
+		exclude = queryContentTags(query)
 	}
 	posts := make([]Post, 0, len(rawPosts))
 	for _, p := range rawPosts {
-		posts = append(posts, Post{
+		post := Post{
 			ID:           p.ID,
 			Rating:       p.Rating,
 			Score:        p.Score,
 			FavCount:     p.FavCount,
-			Tags:         parsePostTags(p),
 			PreviewURL:   p.PreviewFileURL,
 			LargeFileURL: p.LargeFileURL,
-		})
+		}
+		if mode != tagsModeNone {
+			pt := parsePostTags(p)
+			if mode == tagsModeDiff {
+				pt = pt.minus(exclude)
+			}
+			post.Tags = &pt
+		}
+		posts = append(posts, post)
 	}
 	return posts, nil
 }

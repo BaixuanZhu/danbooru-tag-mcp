@@ -130,14 +130,14 @@ func fetchWikiPage(t *testing.T, title, body string, includeDescription bool) Wi
 	t.Helper()
 	mock := &mockFetcher{wikiResp: wikiRespBody(t, title, body)}
 	svc := NewTagService(mock, nil)
-	pages, err := svc.Wiki(context.Background(), title, "", 5, includeDescription)
+	res, err := svc.Wiki(context.Background(), title, "", 5, includeDescription)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(pages) != 1 {
-		t.Fatalf("expected 1 page, got %d", len(pages))
+	if len(res.Pages) != 1 {
+		t.Fatalf("expected 1 page, got %d", len(res.Pages))
 	}
-	return pages[0]
+	return res.Pages[0]
 }
 
 func TestWiki_StructuredFields(t *testing.T) {
