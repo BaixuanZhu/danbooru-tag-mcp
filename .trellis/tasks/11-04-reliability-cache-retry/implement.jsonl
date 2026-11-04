@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "Pre-development checklist and backend layer entry point"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "R2 rewrites the api-layer error construction (HTML collapse, truncation, retry classification)"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "Step 2 adds a new leaf package internal/cache; placement must follow project structure rules"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "TagFetcher signature change (Step 4) spans api/service/tools; stale markers flow across all three"}
+{"file": ".trellis/tasks/11-04-reliability-cache-retry/research/live-probes.md", "reason": "Outage evidence (1864B Downbooru page), deferred comma-list probes, curl -g gotcha for live verification"}
