@@ -43,9 +43,18 @@ routing only) -> `internal/tools` -> `internal/service` -> `internal/api`;
 layers are decoupled via interfaces for mock-based unit tests:
 
 - **internal/api/**: Danbooru REST HTTP client. `Client.Get` is the **single
-  choke point** for all outbound requests (1.5s rate limit + mutex, context
-  cancellation, UA/credential injection, 5MB body cap). New API endpoints must
-  go through it; never use `http` directly.
+  choke point** for all outbound requests (rate-limit gap + mutex, context
+  cancellation, UA/credential injection, 5MB body cap, bounded retry, error
+  shrink, and the response-cache read/write/stale-fallback policy — see the
+  reliability boundary below). New API endpoints must go through it; never
+  use `http` directly.
+- **internal/cache/**: persistent response cache, a stdlib-only leaf package
+  (same discipline as internal/vocab). `Store` keeps one JSON entry per key
+  under `<dir>/v1/<sha256>.json` (atomic temp+rename writes; oldest-by-mtime
+  eviction under a dual cap: 2000 entries AND 64MB total payload);
+  `Result` carries the body plus stale provenance; `WithRefresh` /
+  `RefreshRequested` thread the per-call cache-bypass flag through ctx.
+  Knows nothing about HTTP, Danbooru, or TTLs — the api layer owns those.
 - **internal/service/**: business logic and JSON parsing; depends on the
   `TagFetcher` interface (unaware of the concrete client) and on the
   `vocab.Store` for WD14 classification.
@@ -70,6 +79,38 @@ layers are decoupled via interfaces for mock-based unit tests:
 zero-config client compatibility); `upgrade` / `version` / `help` are CLI
 mode, where writing to stdout is allowed.
 
+**Response cache + retry + error shrink (reliability boundary, test-enforced,
+do not break)**: `Client.Get` caches the four stable endpoints with per-path
+TTLs (`/related_tag.json` 30d, `/wiki_pages.json` + `/tag_aliases.json` 7d,
+`/tags.json` 24h); the cache key is `path + "?" + params.Encode()` computed
+BEFORE credential injection, so credentials never reach disk and
+anonymous/authenticated callers share entries. `/posts.json` never touches
+the Store (replayed `order:random` pages and whole-population profile
+samples would be lies) and empty `[]` bodies are never cached (dead-end
+searches stay cheap to refetch; caching them would hide new tags for a whole
+TTL). A fresh hit returns before the rate-limit wait, byte-identical and
+unmarked; after retries are exhausted on a retryable failure the expired
+entry is served instead of an error, marked `stale: true` + `cached_at`
+(RFC3339) on the affected tool response — stale-only marking (user decision:
+fresh-hit markers add payload with no actionable information), so both fields
+are `omitempty` and absent everywhere else. The 6 cacheable tools take
+`refresh` (boolean, default false): the tools handler wraps ctx via
+`cache.WithRefresh`, `Get` skips the fresh-hit shortcut and runs the network
+path unchanged, and a successful `Put` restarts the entry's TTL clock; a
+failed refresh still stale-serves. Retries: up to 2 retries on 5xx, network
+errors, and 429/421 with 1s/3s backoff (ctx-interruptible waits; caller
+cancellation never retries and never stale-serves; a parseable `Retry-After`,
+capped 30s, replaces the first backoff). Non-2xx error bodies are shrunk:
+HTML collapses to status + `<title>` (live Downbooru 503 shape:
+`danbooru 503 (Downbooru)` instead of ~2-3KB of markup), other bodies
+truncate at 300 bytes. Request gap tiers: `DANBOORU_REQ_GAP_MS` (0 valid =
+no gap; invalid or negative warns once on stderr and keeps the tier default)
+> credentialed 500ms (`DANBOORU_LOGIN` + `DANBOORU_API_KEY` both set) >
+anonymous 1500ms; `WithReqGap` still overrides everything (tests use it).
+`DANBOORU_MCP_NO_CACHE` (checked in main.go `clientOptions`, alongside an
+empty-LOCALAPPDATA guard) disables the cache; every Store failure degrades
+to cache-less with a stderr WARN — a broken cache must never break requests.
+
 **Rating filter boundary (test-enforced, do not break)**: **no layer injects
 a rating filter** — neither the api layer's `FetchPosts`
 (`TestFetchPosts_DoesNotAddRatingFilter`) nor the service layer's
@@ -93,13 +134,20 @@ strength)**: `SearchPosts` returns each post's full tag list split by category
 (`PostTags`, parsed from the API's `tag_string_*` fields — no extra request)
 plus `score`/`fav_count`/`large_file_url`, and caps `limit` at 20
 pre-flight (a post averages ~44 tags — verified live — so 20 bounds the
-payload at ~20 KB); `Related` drops both the query tag itself and
+payload at ~20 KB). `SearchPosts` also takes a tags mode: `full` (default,
+byte-identical to the old shape) / `none` (per-post `PostTags` omitted;
+id/rating/score/fav/url remain) / `diff` (each post's lists minus the
+query's own content tags, metatags excluded from the subtraction).
+`Related` drops both the query tag itself and
 meta-category (5) entries, because meta tags like `highres` co-occur with
 everything and drown out content tags. Category ids are 0=general, 1=artist,
 3=copyright, 4=character, 5=meta (Danbooru's actual API numbering — verified
 live, do not "fix" to the 0-4 continuous scheme). `Search` takes a numeric
 category id (-1 = no filter); the API rejects category names (verified live)
-so the tools layer maps via `service.CategoryID` before any request. These
+so the tools layer maps via `service.CategoryID` before any request. `Search`
+also takes `minPosts` (local post-count filter applied after the fetch,
+default 0 keeps all and may return fewer than `limit`; a filtered-to-empty
+result still counts as no-live-result for the wd14 fallback). These
 behaviors are pinned by unit tests and the integration script.
 
 **Wiki structured extraction (get_tag_wiki, test-enforced, do not break)**:
@@ -169,9 +217,9 @@ absent from Danbooru yields a `*service.NotFoundError`, and the tools handler
 rides the `wd14` verdict on that error payload. On 0-post rows `Info` also
 resolves `renamed_to` via one extra alias request (`resolveRenamedTo`, live
 rows skip it; alias errors are non-fatal) — every sampled active alias
-antecedent keeps a 0-post row (verified live). `Infos` (batch) does NOT
-resolve aliases: `search[antecedent_name]` comma lists return empty (verified
-live), so `renamed_to` is single-tag only. `search_tags` adds
+antecedent keeps a 0-post row (verified live). `Infos` (batch) resolves
+`renamed_to` the same way since 0.6.0 (see the batch paragraph).
+`search_tags` adds
 `wd14_hits` (vocabulary substring matches, best snapshot count first) when no
 result carries posts (`hasLiveTag`). The wd14 policy translation (probe the
 canonical form via `get_tag_alias`, or describe in prose) stays with the
@@ -187,10 +235,21 @@ align with `get_tag_info`: 0-post placeholder rows are `found` and classify
 local `wd14` verdict (the batch counterpart of the NotFoundError rider);
 all-missing is a valid answer, not an error. `Found` rows carry the canonical
 API row name (rows are matched case-insensitively because the API normalizes
-case while `normalizeTag` does not). Deliberately NOT batched:
-related/wiki/profile/posts — those have unbounded payloads; the batch stays
-on fixed-size rows so the response is a few KB max. `Info` keeps using
-`FetchTagExact` (its tests pin that path; do not migrate it).
+case while `normalizeTag` does not). Since 0.6.0 `Found` rows with
+`post_count == 0` also resolve `renamed_to` (superseding the old
+"batch does not resolve aliases" boundary): `Infos` loops
+`s.resolveRenamedTo(ctx, &result.Found[i])` — one extra alias request per
+0-post row, live rows skip it, alias failures are non-fatal. The bound is
+`maxBatchNames` (<=20 extra requests worst case), amortized to zero by the
+7d alias cache on repeat batches. `search[antecedent_name]` comma lists
+return empty (verified live, still true), so the resolution cannot collapse
+into the batched request itself; if an `_any`/`_normalize` alias variant
+later proves to accept comma lists (deferred probe in the task's
+research/live-probes.md), collapse to one request as a follow-up.
+Deliberately NOT batched: related/wiki/profile/posts — those have unbounded
+payloads; the batch stays on fixed-size rows so the response is a few KB
+max. `Info` keeps using `FetchTagExact` (its tests pin that path; do not
+migrate it).
 
 **Plugin distribution (ZCode / Claude Code, configuration-only)**:
 `plugins/danbooru-tag-mcp/` is the plugin source — a pure MCP wiring plugin,
@@ -256,7 +315,9 @@ inheritance; this is documented in the plugin README.
   online smoke (`make integration` / `scripts/integration-test.sh` — every
   tool called against the live API plus a tagger-era name whose `wd14`
   verdict must ride the response, anonymous, PATH-isolated via
-  `DANBOORU_MCP_NO_BOOTSTRAP`) runs only on the weekly schedule or manual
+  `DANBOORU_MCP_NO_BOOTSTRAP` and cache-disabled via
+  `DANBOORU_MCP_NO_CACHE` so it always verifies the live upstream, never a
+  warm cache) runs only on the weekly schedule or manual
   dispatch, never in the release path. It is the canary for upstream API
   drift (the 2024 related_tag.json revamp broke parsing while unit tests
   stayed green). The repo pins LF line endings via `.gitattributes`

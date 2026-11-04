@@ -4,6 +4,49 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [0.6.0] - Unreleased
+
+### Added
+
+- On-disk response cache with stale fallback: the six tag tools
+  (`search_tags`, `get_tag_info`, `get_tags_info`, `get_related_tags`,
+  `get_tag_alias`, `get_tag_wiki`) cache Danbooru responses per user under
+  `%LOCALAPPDATA%\danbooru-tag-mcp\cache` — related tags 30d, wiki/aliases
+  7d, tag lookups 24h. Posts are never cached (a replayed `order:random`
+  page would lie about being a random sample), and empty `[]` results are
+  never cached either, so new tags stay visible as soon as Danbooru knows
+  them. Fresh hits are served byte-identically with no markers; when
+  Danbooru is unreachable after retries, the last cached answer is served
+  instead of an error, marked `stale: true` + `cached_at`. Every cacheable
+  tool takes `refresh` (default false) to bypass the cache for one call and
+  restart the entry's TTL clock. The cache is capped (2000 entries / 64 MB,
+  oldest-first eviction), is safe to delete at any time, is removed by the
+  NSIS uninstaller, and is disabled with `DANBOORU_MCP_NO_CACHE=1`.
+- Bounded retry + shrunken errors: 5xx, network errors and 429 are retried
+  twice with 1s/3s backoff (context-interruptible, never on caller
+  cancellation; `Retry-After` is honored and capped at 30s). Non-2xx error
+  bodies collapse — an HTML maintenance page renders as
+  `danbooru 503 (Downbooru)` instead of inlining 2-3 KB of markup, other
+  bodies truncate at 300 bytes.
+- `get_tags_info`: 0-post rows now resolve `renamed_to` (one extra alias
+  request each, live rows skip it, failures are non-fatal), closing the
+  rename-visibility gap the batch had versus `get_tag_info`.
+- `search_tags` `min_posts`: local post-count filter applied after the
+  fetch (default 0 keeps all; may return fewer than `limit`).
+- `search_posts` `tags_mode`: `full` (default), `none` (drop the per-post
+  tag lists; id/rating/score/fav/url remain) or `diff` (per-post tag lists
+  minus the query's own content tags, metatags excluded from the
+  subtraction).
+
+### Changed
+
+- Request gap tiers: `DANBOORU_REQ_GAP_MS` overrides the spacing between
+  Danbooru requests in milliseconds (`0` disables the gap; invalid values
+  warn and keep the default). The default gap is now 1500ms anonymous and
+  500ms when `DANBOORU_LOGIN` + `DANBOORU_API_KEY` are both set
+  (browser-parity reasoning, below organic logged-in rates; the 429 /
+  `Retry-After` handling is the safety net).
+
 ## [0.5.0] - 2026-11-03
 
 ### Breaking
