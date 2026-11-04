@@ -8,10 +8,13 @@
 # 2024 the fixture-based unit tests stayed green — only a live call catches
 # that.
 #
-# Isolation: DANBOORU_MCP_NO_BOOTSTRAP=1 is exported unconditionally below,
-# so the test binary never writes the user PATH or registry, even when a
-# release-flavored exe is passed in. The only file written is a temp output
-# file, removed on exit; nothing outside the repo is modified.
+# Isolation: DANBOORU_MCP_NO_BOOTSTRAP=1 and DANBOORU_MCP_NO_CACHE=1 are
+# exported unconditionally below, so the test binary never writes the user
+# PATH or registry (even when a release-flavored exe is passed in) and every
+# tool call hits the live Danbooru API instead of a warm local cache — this
+# is the upstream-drift canary, so replayed bodies would defeat it. The only
+# file written is a temp output file, removed on exit; nothing outside the
+# repo is modified.
 #
 # Usage:
 #   bash scripts/integration-test.sh [exe]
@@ -33,8 +36,10 @@ if ! command -v python >/dev/null 2>&1; then
 fi
 
 # Hard isolation: never touch the machine PATH/registry, whatever the flavor
-# of the binary under test.
+# of the binary under test, and never serve a cached response — the smoke
+# test must verify the live upstream.
 export DANBOORU_MCP_NO_BOOTSTRAP=1
+export DANBOORU_MCP_NO_CACHE=1
 
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT

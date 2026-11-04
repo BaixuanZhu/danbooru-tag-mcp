@@ -226,6 +226,7 @@ try {
         Write-Info ''
         Write-Info "Upgrade later: danbooru-tag-mcp upgrade"
         Write-Info "Uninstall: delete the install dir, then remove it from the user PATH if desired."
+        Write-Info '          The response cache (%LOCALAPPDATA%\danbooru-tag-mcp\cache) is safe to delete too.'
     } finally {
         # Clean up the temp dir (on both success and failure).
         if (Test-Path $workDir) {
