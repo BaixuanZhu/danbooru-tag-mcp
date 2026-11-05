@@ -297,18 +297,21 @@ func TestSweep_ByteCapEvictsOldestFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	if err := s.Put("k1", []byte("payload")); err != nil {
+	if err := s.Put("k1", []byte(strings.Repeat("x", 128))); err != nil {
 		t.Fatalf("Put k1: %v", err)
 	}
-	// Cap the store at exactly one entry file's worth of bytes, then add a
-	// newer entry of the same size: the older one must go.
+	// Cap the store at the OLD entry's file size, then add a much smaller
+	// newer entry: the older one must go and the small one must stay. The
+	// size gap must dwarf the few-byte run-to-run drift of entry files
+	// (RFC3339Nano trailing-zero trimming), which used to flake this test
+	// when both bodies were the same size.
 	info, err := os.Stat(s.path("k1"))
 	if err != nil {
 		t.Fatalf("Stat k1: %v", err)
 	}
 	s.maxBytes = info.Size()
 	backdate(t, s, "k1", time.Hour)
-	if err := s.Put("k2", []byte("payload")); err != nil {
+	if err := s.Put("k2", []byte("x")); err != nil {
 		t.Fatalf("Put k2: %v", err)
 	}
 	if _, _, ok := s.Get("k1"); ok {
