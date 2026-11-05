@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -779,6 +781,114 @@ func TestGet_RefreshFailureStillStaleServes(t *testing.T) {
 	// 1 priming request + 3 attempts (1 + 2 retries) during the outage.
 	if n := atomic.LoadInt32(&hits); n != 4 {
 		t.Errorf("expected retries before the stale fallback (4 requests total), got %d", n)
+	}
+}
+
+// --- Step 9: Get lock granularity ---
+
+func TestGet_CacheHitNotBlockedByInFlightRetry(t *testing.T) {
+	// Regression pin for the lock-granularity defect: Get once held c.mu
+	// across the whole call, so a 1ms cache hit queued behind a caller
+	// stuck in its retry cycle (~94s worst case in production). Now the
+	// cache read runs before any lock is taken, so B must answer while A
+	// is still sleeping between retries.
+	hitCh := make(chan struct{}, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case hitCh <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte("down"))
+	}))
+	defer srv.Close()
+
+	cli := newCachedTestClient(t, srv.URL, t.TempDir())
+	cli.backoffs = []time.Duration{250 * time.Millisecond, 250 * time.Millisecond}
+
+	// B's key is already cached and fresh (planted straight into the
+	// Store; the /tags.json TTL is 24h). A's key has no entry.
+	qMiss := url.Values{"search[name]": []string{"miss_key"}}
+	qHit := url.Values{"search[name]": []string{"hit_key"}}
+	cached := `[{"id":2,"name":"hit_key"}]`
+	if err := cli.store.Put("/tags.json?"+qHit.Encode(), []byte(cached)); err != nil {
+		t.Fatalf("plant the cached entry: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := cli.Get(context.Background(), "/tags.json", qMiss)
+		done <- err
+	}()
+	<-hitCh // A's first attempt reached the server; it now sleeps in its 250ms backoff
+
+	bStart := time.Now()
+	res, err := cli.Get(context.Background(), "/tags.json", qHit)
+	bElapsed := time.Since(bStart)
+	if err != nil {
+		t.Fatalf("cache hit must not fail while a retry cycle is in flight: %v", err)
+	}
+	if string(res.Body) != cached || res.Stale {
+		t.Errorf("unexpected cache-hit result: body=%q stale=%v", res.Body, res.Stale)
+	}
+	// A's retry cycle spans ~500ms of backoffs; B is a file read. 200ms
+	// leaves generous CI margin while still proving B never queued.
+	if bElapsed > 200*time.Millisecond {
+		t.Errorf("cache hit must not queue behind the in-flight retry cycle: took %v", bElapsed)
+	}
+
+	// A still exhausts its retries and surfaces the 500.
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "danbooru 500") {
+		t.Fatalf("in-flight caller must end with the 500 after retries, got: %v", err)
+	}
+}
+
+func TestGet_ConcurrentRequestsPreserveRateGap(t *testing.T) {
+	// waitTurn moved the rate-limit sleep outside c.mu; the re-check loop
+	// must still keep every consecutive pair of outbound request starts
+	// (observed as server arrivals) at least reqGap apart.
+	const (
+		n      = 8
+		reqGap = 50 * time.Millisecond
+		slack  = 10 * time.Millisecond // loopback scheduling jitter allowance
+	)
+	var mu sync.Mutex
+	arrivals := make([]time.Time, 0, n)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		arrivals = append(arrivals, time.Now())
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[{"id":1}]`))
+	}))
+	defer srv.Close()
+
+	cli := newFastTestClient(srv.URL)
+	cli.reqGap = reqGap
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			q := url.Values{"search[name]": []string{fmt.Sprintf("tag_%d", i)}}
+			if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
+				t.Errorf("Get %d: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(arrivals) != n {
+		t.Fatalf("expected %d server arrivals, got %d", n, len(arrivals))
+	}
+	sort.Slice(arrivals, func(i, j int) bool { return arrivals[i].Before(arrivals[j]) })
+	for i := 1; i < len(arrivals); i++ {
+		if gap := arrivals[i].Sub(arrivals[i-1]); gap < reqGap-slack {
+			t.Errorf("concurrent requests broke the rate gap: arrivals %d->%d only %v apart (want >= %v)", i-1, i, gap, reqGap-slack)
+		}
 	}
 }
 

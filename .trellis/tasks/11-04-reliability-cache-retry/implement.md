@@ -93,6 +93,43 @@ test`). Commit boundaries can fall between any two steps.
       `[0.6.0]`.
 - [ ] `server.json` version bump (release-time).
 
+## Step 9 — Get lock granularity fix
+
+Rationale: mcp-go v1.1.1's stdio server runs 5 concurrent tool-call
+workers (module source stdio.go:379,538), so concurrent `Client.Get`
+calls are production reality — but `Get` held `c.mu` for the whole call
+(cache read, rate-limit wait, network execution with retries ≈ 94s worst
+case, cache write), collapsing throughput to ~1 call per retry cycle,
+queuing 1ms cache hits behind 94s outages, and making queued callers
+uncancellable (Go mutexes are not ctx-aware). The fix restructures `Get`
+so `c.mu` guards only the `lastReq` accounting.
+
+- [x] Cache read (`Store.Get`) before any lock acquisition; a fresh hit
+      returns without ever touching `c.mu` (Store is concurrency-safe).
+- [x] Rate limiter extracted as `waitTurn(ctx)`: loop of accounting under
+      the lock / sleeping outside it, with a re-check so simultaneous
+      wakeups still keep consecutive request starts >= reqGap apart;
+      ctx cancellation aborts with `ctx.Err()`; `lastReq` still stamped
+      at issue time.
+- [x] `doWithRetry` (backoffs, Retry-After waits) and `Store.Put` run
+      with no lock held; the stale-fallback entry stays per-call local
+      state captured at the cache-read step (semantics unchanged).
+- [x] `mu` documented as guarding only `lastReq`; other fields fixed
+      after construction.
+- [x] `Get` doc comment updated with the concurrency contract while
+      keeping the single-choke-point framing.
+- [x] Tests: `TestGet_CacheHitNotBlockedByInFlightRetry` (regression
+      pin — verified it FAILS on the pre-fix code with the cache hit
+      queued 502ms behind the retry cycle, PASSES after) and
+      `TestGet_ConcurrentRequestsPreserveRateGap` (8 concurrent misses,
+      every consecutive server arrival >= reqGap - 10ms slack).
+- [x] Docs: concurrency contract item in
+      `.trellis/spec/backend/cache-and-resilience.md`, one clause in the
+      AGENTS.md reliability paragraph.
+- [x] Validation: `gofmt -l .` empty, `go vet ./...`,
+      `go test -race -count=1 ./internal/api/`, `make test`,
+      `make test-race` all green; no existing test needed adjusting.
+
 ## Validation commands
 
 ```bash

@@ -89,7 +89,10 @@ the Store (replayed `order:random` pages and whole-population profile
 samples would be lies) and empty `[]` bodies are never cached (dead-end
 searches stay cheap to refetch; caching them would hide new tags for a whole
 TTL). A fresh hit returns before the rate-limit wait, byte-identical and
-unmarked; after retries are exhausted on a retryable failure the expired
+unmarked (concurrency contract: the cache read is lock-free — a hit never
+queues behind a network caller; `c.mu` guards only the rate-limit
+accounting while sleeps, retries, and cache writes run unlocked); after
+retries are exhausted on a retryable failure the expired
 entry is served instead of an error, marked `stale: true` + `cached_at`
 (RFC3339) on the affected tool response — stale-only marking (user decision:
 fresh-hit markers add payload with no actionable information), so both fields

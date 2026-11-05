@@ -59,8 +59,13 @@ type Client struct {
 	apiKey     string
 	userAgent  string
 	reqGap     time.Duration
-	lastReq    time.Time
-	mu         sync.Mutex
+
+	// mu guards ONLY lastReq (the rate-limit accounting) — Get never holds
+	// it across cache reads, sleeps, or network execution. Every other
+	// field is fixed after construction; tests only retune knobs (reqGap,
+	// backoffs, TTLs) before first use, never concurrently.
+	lastReq time.Time
+	mu      sync.Mutex
 
 	store     *cache.Store // nil = no caching (unit-test default)
 	cacheTTLs map[string]time.Duration
@@ -149,22 +154,27 @@ func resolveReqGap(credentialed bool) time.Duration {
 // body cap, bounded retry on transient failures (5xx, network errors, 429),
 // and stale-cache fallback when retries are exhausted on a retryable failure
 // (a 4xx is a definitive answer from a reachable upstream and always
-// surfaces). A fresh cache hit returns before the rate-limit wait and is
-// byte-identical to a network response; only the stale fallback sets
-// Result.Stale. A refresh request (cache.WithRefresh) skips the fresh-hit
-// shortcut: the network path runs unchanged and a successful write restarts
-// the entry's TTL clock.
+// surfaces). Concurrency contract: the cache read runs before any lock is
+// taken (Store is safe for concurrent use, so a fresh cache hit never
+// queues behind a caller parked in the rate limiter or the network); the
+// rate limit keeps its accounting under c.mu but sleeps unlocked (waitTurn);
+// network execution (retries, backoffs, Retry-After waits) and the cache
+// write also run unlocked — Store serializes its own writers. A fresh cache
+// hit returns before the rate-limit wait and is byte-identical to a network
+// response; only the stale fallback sets Result.Stale. A refresh request
+// (cache.WithRefresh) skips the fresh-hit shortcut: the network path runs
+// unchanged and a successful write restarts the entry's TTL clock.
 func (c *Client) Get(ctx context.Context, path string, params url.Values) (cache.Result, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if params == nil {
 		params = make(url.Values)
 	}
 
 	// Cache key is computed BEFORE credential injection so credentials
 	// never reach disk and anonymous/authenticated callers share entries.
-	// params.Encode sorts keys, so the key is deterministic.
+	// params.Encode sorts keys, so the key is deterministic. The read is
+	// lock-free on purpose: holding c.mu here would let a slow network
+	// caller starve a 1ms cache hit (the lock-granularity regression this
+	// layout pins).
 	ttl, pathCacheable := c.cacheTTLs[path]
 	refresh := cache.RefreshRequested(ctx)
 	var cacheKey string
@@ -182,17 +192,10 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (cache
 		}
 	}
 
-	// Rate limiting: interruptible via context timeout/cancel
-	elapsed := time.Since(c.lastReq)
-	if elapsed < c.reqGap {
-		wait := c.reqGap - elapsed
-		select {
-		case <-ctx.Done():
-			return cache.Result{}, ctx.Err()
-		case <-time.After(wait):
-		}
+	// Rate limiting: interruptible via context timeout/cancel.
+	if err := c.waitTurn(ctx); err != nil {
+		return cache.Result{}, err
 	}
-	c.lastReq = time.Now()
 
 	// Credentials are injected into a copy: mutating the caller's map
 	// would leak them into the next call's cache key when params are
@@ -212,6 +215,9 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (cache
 		reqURL = fmt.Sprintf("%s?%s", reqURL, encoded)
 	}
 
+	// Network execution runs with NO lock held: one caller's retries,
+	// backoff sleeps, and Retry-After waits must not block another
+	// caller's cache hit or rate-limit accounting.
 	res, err := c.doWithRetry(ctx, reqURL)
 	if err != nil {
 		// Context cancellation returns immediately: never stale-serve a
@@ -231,13 +237,41 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (cache
 	}
 
 	// Empty-array bodies are dead-end searches: cheap to refetch, and
-	// caching them would hide new tags for a whole TTL.
+	// caching them would hide new tags for a whole TTL. Unlocked on
+	// purpose: Store.writeMu serializes concurrent writers.
 	if pathCacheable && c.store != nil && !isEmptyJSONList(res.Body) {
 		if err := c.store.Put(cacheKey, res.Body); err != nil {
 			log.Printf("[WARN] cache write failed for %s: %v", path, err)
 		}
 	}
 	return res, nil
+}
+
+// waitTurn blocks until this caller may issue the next outbound request,
+// keeping consecutive request starts at least reqGap apart. Accounting
+// (reading and stamping lastReq) happens under c.mu; the sleep happens with
+// the lock released, so a caller parked here never delays another caller's
+// accounting or cache hit. The re-check loop preserves the global gap when
+// several goroutines wake from their sleeps at once: only the one that finds
+// the gap elapsed stamps lastReq and proceeds, the rest recompute their
+// wait. Context cancellation aborts with ctx.Err().
+func (c *Client) waitTurn(ctx context.Context) error {
+	for {
+		c.mu.Lock()
+		elapsed := time.Since(c.lastReq)
+		if elapsed >= c.reqGap {
+			c.lastReq = time.Now()
+			c.mu.Unlock()
+			return nil
+		}
+		wait := c.reqGap - elapsed
+		c.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
 }
 
 // isEmptyJSONList reports whether body is exactly "[]" modulo whitespace.

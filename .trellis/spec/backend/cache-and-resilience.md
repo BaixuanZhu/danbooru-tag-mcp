@@ -50,6 +50,13 @@ func WithCache(dir string) Option          // Open failure -> WARN + cache-less,
 - Store layout: one JSON file per key under `<dir>/v1/<sha256>.json`,
   atomic temp+rename, dual cap 2000 entries / 64MB, oldest-mtime swept
   first. All Store errors degrade to miss; nothing panics.
+- Concurrency contract: cache reads are lock-free (`Store` is safe for
+  concurrent use, so a cache hit never queues behind a network caller —
+  mcp-go's stdio server runs 5 concurrent tool-call workers);
+  `Client.mu` guards only the `lastReq` rate-limit accounting — sleeps
+  (`waitTurn` account-then-sleep loop), network execution (retries,
+  backoffs), and `Store.Put` all run unlocked, because `Store.writeMu`
+  serializes writers itself.
 
 ### 4. Validation & Error Matrix
 
