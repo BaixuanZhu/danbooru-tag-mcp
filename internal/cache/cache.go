@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,6 +51,10 @@ type Store struct {
 	dir        string // .../v1, the flat entry directory
 	maxEntries int    // sweep threshold: maximum number of entries
 	maxBytes   int64  // sweep threshold: maximum total entry file size
+
+	// writeMu serializes Put (including its trailing sweep) so a sweep can
+	// never observe — and delete — another write's in-flight temp file.
+	writeMu sync.Mutex
 }
 
 // Open returns a Store keeping its entries under dir/v1/, creating the
@@ -98,10 +103,14 @@ func (s *Store) Get(key string) (body []byte, storedAt time.Time, ok bool) {
 
 // Put stores body under key atomically: the entry is written to a temp
 // file and renamed into place, so readers never observe a half-written
-// entry and concurrent writers are last-writer-wins per key. Afterwards a
-// best-effort sweep enforces the entry/byte caps; sweep failures are
-// ignored, only the write itself can fail.
+// entry and concurrent writers are last-writer-wins per key (writers are
+// serialized so a concurrent sweep cannot remove a live write's temp
+// file). Afterwards a best-effort sweep enforces the entry/byte caps and
+// removes leftover temp files; sweep failures are ignored, only the write
+// itself can fail.
 func (s *Store) Put(key string, body []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return fmt.Errorf("cache: create %s: %w", s.dir, err)
 	}
@@ -139,8 +148,10 @@ func (s *Store) Put(key string, body []byte) error {
 
 // sweep enforces the dual caps: it deletes oldest-by-mtime entries until
 // the store holds at most maxEntries entry files totaling at most maxBytes
-// bytes. Best effort — unreadable and undeletable files are skipped, and
-// leftover temp files are never counted.
+// bytes. It also removes leftover "tmp-*" files from crashed writes: they
+// are never valid entries, so they are deleted unconditionally (best
+// effort) and never counted toward the caps. Unreadable and undeletable
+// files are skipped.
 func (s *Store) sweep() {
 	dirEntries, err := os.ReadDir(s.dir)
 	if err != nil {
@@ -154,7 +165,16 @@ func (s *Store) sweep() {
 	var files []fileStat
 	var total int64
 	for _, de := range dirEntries {
-		if de.IsDir() || !strings.HasSuffix(de.Name(), ".json") {
+		if de.IsDir() {
+			continue
+		}
+		// A "tmp-*" file is a crashed write's leftover: garbage by
+		// definition, so always remove it instead of letting it accumulate.
+		if strings.HasPrefix(de.Name(), "tmp-") {
+			os.Remove(filepath.Join(s.dir, de.Name()))
+			continue
+		}
+		if !strings.HasSuffix(de.Name(), ".json") {
 			continue
 		}
 		info, err := de.Info()
