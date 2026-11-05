@@ -143,7 +143,9 @@ check(bool(alias) and alias.get('consequent') == 'sailor',
 #    must distill into summary/intro_tags/rules/see_also/example_posts, keep
 #    linked_tags, expose the appearance prose only via include_description,
 #    and never carry a body key.
-page7 = payload(7).get('wiki_pages')[0]
+# The "or [{}]" keeps an upstream outage survivable: every page7 check below
+# then FAILs cleanly instead of crashing the whole assertion run on None[0].
+page7 = (payload(7).get('wiki_pages') or [{}])[0]
 check(bool(page7.get('summary')) and 'Honkai: Star Rail' in page7['summary'],
       'get_tag_wiki: summary distilled from the intro')
 check(len(page7.get('intro_tags', [])) >= 20
