@@ -12,7 +12,9 @@ when tagging.
   (`search_tags`, `get_tag_info`, `get_tags_info`, `get_related_tags`,
   `get_tag_alias`, `get_tag_wiki`) cache Danbooru responses per user under
   `%LOCALAPPDATA%\danbooru-tag-mcp\cache` — related tags 30d, wiki/aliases
-  7d, tag lookups 24h. Posts are never cached (a replayed `order:random`
+  7d, exact tag lookups 7d (a tag's identity row is reference data; its
+  `post_count` can trail live counts, `refresh` re-fetches), tag searches
+  24h. Posts are never cached (a replayed `order:random`
   page would lie about being a random sample), and empty `[]` results are
   never cached either, so new tags stay visible as soon as Danbooru knows
   them. Fresh hits are served byte-identically with no markers; when

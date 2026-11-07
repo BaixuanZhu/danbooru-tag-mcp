@@ -80,9 +80,14 @@ zero-config client compatibility); `upgrade` / `version` / `help` are CLI
 mode, where writing to stdout is allowed.
 
 **Response cache + retry + error shrink (reliability boundary, test-enforced,
-do not break)**: `Client.Get` caches the four stable endpoints with per-path
-TTLs (`/related_tag.json` 30d, `/wiki_pages.json` + `/tag_aliases.json` 7d,
-`/tags.json` 24h); the cache key is `path + "?" + params.Encode()` computed
+do not break)**: `Client.Get` caches the four stable endpoints with per-class
+TTLs (`/related_tag.json` 30d, `/wiki_pages.json` + `/tag_aliases.json` 7d;
+`/tags.json` splits by query shape — substring search 24h, exact-name lookup
+(`search[name]`/`search[name_normalize]`) 7d via the `tagsExactClass` TTL
+class: identity rows are reference data like wiki/alias while substring
+searches must keep surfacing new tags, and the accepted cost is an exact
+row's `post_count` trailing live Danbooru by up to 7 days — `refresh:true`
+when a decision needs current counts); the cache key is `path + "?" + params.Encode()` computed
 BEFORE credential injection, so credentials never reach disk and
 anonymous/authenticated callers share entries. `/posts.json` never touches
 the Store (replayed `order:random` pages and whole-population profile

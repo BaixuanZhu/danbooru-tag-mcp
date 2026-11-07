@@ -152,7 +152,8 @@ again:
 |------|-----|
 | Related tags (`get_related_tags`) | 30 days |
 | Wiki pages, aliases | 7 days |
-| Tag searches and exact lookups | 24 hours |
+| Tag searches (`search_tags`) | 24 hours |
+| Exact tag lookups (`get_tag_info`, `get_tags_info`) | 7 days |
 | Posts (`search_posts`, `get_tag_profile`) | never cached |
 
 - Location: `%LOCALAPPDATA%\danbooru-tag-mcp\cache` (per user, persists
@@ -165,6 +166,10 @@ again:
   was stored) on the affected tool response.
 - Empty results (`[]`) are never cached, so new tags appear as soon as
   Danbooru knows them.
+- Exact tag lookups keep a tag's identity row for 7 days (like wiki pages,
+  name and category barely change), so `post_count` can trail live Danbooru
+  by up to 7 days — use `refresh: true` when a decision needs current
+  counts.
 - `refresh: true` re-fetches live and restarts the entry's TTL clock.
 - Set `DANBOORU_MCP_NO_CACHE=1` to disable the cache entirely (useful for
   debugging).

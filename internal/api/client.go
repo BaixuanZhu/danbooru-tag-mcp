@@ -37,15 +37,38 @@ const (
 	htmlFallbackBytes = 100
 )
 
-// defaultCacheTTLs maps cacheable Danbooru endpoints to their fresh-entry
-// TTLs. /posts.json is deliberately absent: order:random sampling semantics
-// and the profile's whole-population claims make replayed post pages lies,
-// so posts never touch the cache Store at all.
+// tagsExactClass is the cache-TTL class for /tags.json queries that ask for
+// rows by exact name (search[name], search[name_normalize]) instead of by
+// substring pattern.
+const tagsExactClass = "/tags.json:exact"
+
+// defaultCacheTTLs maps cache-TTL classes to their fresh-entry TTLs. Every
+// cacheable endpoint is its own class keyed by path, except /tags.json which
+// splits by query shape: substring searches answer "what exists matching
+// this pattern today", so a longer window would hide newly created tags
+// (24h), while exact-name lookups answer one name's identity row —
+// reference data in the same family as the 7d wiki/alias entries. The
+// accepted cost: an exact row's post_count may trail live Danbooru by up to
+// 7 days; refresh:true is the escape hatch when a decision needs current
+// counts. /posts.json is deliberately absent: order:random sampling
+// semantics and the profile's whole-population claims make replayed post
+// pages lies, so posts never touch the cache Store at all.
 var defaultCacheTTLs = map[string]time.Duration{
 	"/related_tag.json": 30 * 24 * time.Hour,
 	"/wiki_pages.json":  7 * 24 * time.Hour,
 	"/tag_aliases.json": 7 * 24 * time.Hour,
 	"/tags.json":        24 * time.Hour,
+	tagsExactClass:      7 * 24 * time.Hour,
+}
+
+// ttlClass maps one request to its cache-TTL class: the endpoint path,
+// except exact-name /tags.json queries, which take the longer identity-row
+// TTL.
+func ttlClass(path string, params url.Values) string {
+	if path == "/tags.json" && (params.Has("search[name]") || params.Has("search[name_normalize]")) {
+		return tagsExactClass
+	}
+	return path
 }
 
 // errResponseBodyTooLarge marks the 5MB cap tripping, which a retry cannot
@@ -175,7 +198,7 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) (cache
 	// lock-free on purpose: holding c.mu here would let a slow network
 	// caller starve a 1ms cache hit (the lock-granularity regression this
 	// layout pins).
-	ttl, pathCacheable := c.cacheTTLs[path]
+	ttl, pathCacheable := c.cacheTTLs[ttlClass(path, params)]
 	refresh := cache.RefreshRequested(ctx)
 	var cacheKey string
 	var staleBody []byte

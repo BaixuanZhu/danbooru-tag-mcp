@@ -388,18 +388,40 @@ func TestNewClient_ReqGapResolution(t *testing.T) {
 // --- Step R1 core: response cache with stale fallback ---
 
 func TestDefaultCacheTTLs_Pinned(t *testing.T) {
-	for path, want := range map[string]time.Duration{
+	for class, want := range map[string]time.Duration{
 		"/related_tag.json": 30 * 24 * time.Hour,
 		"/wiki_pages.json":  7 * 24 * time.Hour,
 		"/tag_aliases.json": 7 * 24 * time.Hour,
 		"/tags.json":        24 * time.Hour,
+		tagsExactClass:      7 * 24 * time.Hour,
 	} {
-		if got := defaultCacheTTLs[path]; got != want {
-			t.Errorf("TTL for %s: got %v want %v", path, got, want)
+		if got := defaultCacheTTLs[class]; got != want {
+			t.Errorf("TTL for %s: got %v want %v", class, got, want)
 		}
 	}
 	if _, ok := defaultCacheTTLs["/posts.json"]; ok {
 		t.Error("/posts.json must never have a TTL entry")
+	}
+}
+
+func TestTtlClass_TagsQueryShape(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		path   string
+		params url.Values
+		want   string
+	}{
+		{"exact name", "/tags.json", url.Values{"search[name]": []string{"arm_up"}}, tagsExactClass},
+		{"exact batch", "/tags.json", url.Values{"search[name_normalize]": []string{"arm_up,1girl"}}, tagsExactClass},
+		{"substring search", "/tags.json", url.Values{"search[name_matches]": []string{"*arm*"}}, "/tags.json"},
+		{"no name search key", "/tags.json", url.Values{"limit": []string{"10"}}, "/tags.json"},
+		{"exact key on another path stays per-path", "/wiki_pages.json", url.Values{"search[title]": []string{"arm_up"}}, "/wiki_pages.json"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ttlClass(tc.path, tc.params); got != tc.want {
+				t.Errorf("ttlClass(%s, %v): got %q want %q", tc.path, tc.params, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -487,7 +509,7 @@ func TestGet_CacheTTLExpiryRefetches(t *testing.T) {
 	defer srv.Close()
 
 	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs["/tags.json"] = 20 * time.Millisecond
+	cli.cacheTTLs[tagsExactClass] = 20 * time.Millisecond
 	q := url.Values{"search[name]": []string{"arm_up"}}
 
 	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
@@ -506,6 +528,40 @@ func TestGet_CacheTTLExpiryRefetches(t *testing.T) {
 	}
 	if n := atomic.LoadInt32(&hits); n != 2 {
 		t.Errorf("re-cached entry must be served fresh: expected 2 requests, got %d", n)
+	}
+}
+
+func TestGet_TagsExactOutlivesSearchTTL(t *testing.T) {
+	// The shape split in the live path: an exact-name entry stays fresh past
+	// the substring-search TTL, and each class expires on its own clock.
+	var hits int32
+	srv := countingServer(t, "/tags.json", `[{"id":1}]`, &hits)
+	defer srv.Close()
+
+	cli := newCachedTestClient(t, srv.URL, t.TempDir())
+	cli.cacheTTLs["/tags.json"] = 40 * time.Millisecond // exact class keeps 7d
+	qExact := url.Values{"search[name]": []string{"arm_up"}}
+	qSearch := url.Values{"search[name_matches]": []string{"*arm*"}}
+
+	if _, err := cli.Get(context.Background(), "/tags.json", qExact); err != nil {
+		t.Fatalf("prime exact: %v", err)
+	}
+	if _, err := cli.Get(context.Background(), "/tags.json", qSearch); err != nil {
+		t.Fatalf("prime search: %v", err)
+	}
+	time.Sleep(80 * time.Millisecond) // past the search TTL, inside the exact one
+
+	if _, err := cli.Get(context.Background(), "/tags.json", qExact); err != nil {
+		t.Fatalf("exact after the search TTL: %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 2 {
+		t.Errorf("exact entry must outlive the search TTL: expected 2 requests so far, got %d", n)
+	}
+	if _, err := cli.Get(context.Background(), "/tags.json", qSearch); err != nil {
+		t.Fatalf("search after its own TTL: %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 3 {
+		t.Errorf("search entry must expire on its own TTL: expected 3 requests, got %d", n)
 	}
 }
 
@@ -582,7 +638,7 @@ func TestGet_StaleServeAfterRetriesExhausted(t *testing.T) {
 	defer srv.Close()
 
 	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs["/tags.json"] = 20 * time.Millisecond
+	cli.cacheTTLs[tagsExactClass] = 20 * time.Millisecond
 	q := url.Values{"search[name]": []string{"arm_up"}}
 	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
 		t.Fatalf("prime the cache: %v", err)
@@ -635,7 +691,7 @@ func TestGet_NonRetryableErrorDoesNotStaleServe(t *testing.T) {
 	defer srv.Close()
 
 	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs["/tags.json"] = 20 * time.Millisecond
+	cli.cacheTTLs[tagsExactClass] = 20 * time.Millisecond
 	q := url.Values{"search[name]": []string{"arm_up"}}
 	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
 		t.Fatalf("prime the cache: %v", err)
@@ -807,7 +863,7 @@ func TestGet_CacheHitNotBlockedByInFlightRetry(t *testing.T) {
 	cli.backoffs = []time.Duration{250 * time.Millisecond, 250 * time.Millisecond}
 
 	// B's key is already cached and fresh (planted straight into the
-	// Store; the /tags.json TTL is 24h). A's key has no entry.
+	// Store; the exact /tags.json TTL is 7d). A's key has no entry.
 	qMiss := url.Values{"search[name]": []string{"miss_key"}}
 	qHit := url.Values{"search[name]": []string{"hit_key"}}
 	cached := `[{"id":2,"name":"hit_key"}]`
