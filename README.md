@@ -134,16 +134,101 @@ See [plugins/danbooru-tag-mcp/README.md](plugins/danbooru-tag-mcp/README.md).
 
 ## Tools
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `search_tags` | Search tags by keyword, ordered by post count; when no result has posts, adds `wd14_hits` (WD14 tagger vocab names containing the query); optional category filter | `query` (required, e.g. `blue hair`), `limit` (default 10), `category` (one of `general`/`artist`/`copyright`/`character`/`meta`), `min_posts` (default 0, drops tags below the threshold), `refresh` (default false) |
-| `get_tag_info` | Exact info for one tag (category, post count), plus a `wd14` verdict: `live` (current Danbooru), `tagger_era` (WD14 tagger vocab only, likely renamed — see `renamed_to` / `get_tag_alias`), `unknown` (neither). A 0-post name with an active alias also returns `renamed_to` (the canonical tag) | `name` (required, e.g. `blue_hair`), `refresh` (default false) |
-| `get_tags_info` | Batch version of `get_tag_info`: up to 20 exact names in one request; returns `found` (each with the same fields as `get_tag_info`, including `renamed_to` on 0-post rows) and `missing` (names absent from Danbooru, each still carrying its `wd14` verdict) | `names` (required, e.g. `["blue_hair","1girl"]`, max 20), `refresh` (default false) |
-| `get_related_tags` | Tags that co-occur with the given tag (meta-category tags like `highres` are filtered out as noise) | `tag` (required), `limit` (default 10), `refresh` (default false) |
-| `get_tag_alias` | Resolve an alias or misspelling to its canonical tag (`null` = input is already canonical) | `name` (required, e.g. `sailor_suit`), `refresh` (default false) |
-| `get_tag_wiki` | Wiki page of a tag as structured fields: `summary` (first paragraph), `intro_tags` (definition-section link targets), `rules` (disambiguation/usage sentences), `see_also`, `example_posts`, plus the raw `linked_tags` union and multilingual `other_names`. The raw DText body is not returned; opt into `include_description` for the intro prose as plain text (character appearance descriptions) | `title` or `other_names` (one required), `limit` (default 5), `include_description` (default false), `refresh` (default false) |
-| `search_posts` | Search posts by a tag combination, no rating filter by default (add a `rating:g/s/q/e` metatag to narrow). Each post carries `score`, `fav_count`, `large_file_url` and `tags` split by category: `copyright` / `artist` / `character` / `general` / `meta` | `tags` (required, space-separated), `limit` (default 5, max 20), `tags_mode` (`full` default, `none` drops the per-post tag lists, `diff` keeps only tags not already in the query) |
-| `get_tag_profile` | Distribution profile of one tag from a post sample (default 200, random = whole population): `co_tags` ordered by in-sample frequency, `ubiquitous` corpus constants (`freq >= 0.5`), `top_pairs` combinations ranked by lift, `ratings` mix. `order` picks random (default) / `score` / `favcount` (top-post biased); `rating` filters the sample; `with` profiles the 200 most recent joint posts of a tag pair instead | `tag` (required, e.g. `arm_up`), `sample` (default 200, range 20-200), `with`, `rating` (`g`/`s`/`q`/`e`), `order` |
+| Tool | What it does |
+|------|--------------|
+| `search_tags` | Search tags by keyword, ordered by post count |
+| `get_tag_info` | Exact info for one tag, with a WD14 verdict on the name |
+| `get_tags_info` | The same for up to 20 names in one request |
+| `get_related_tags` | Tags that co-occur with a given tag |
+| `get_tag_alias` | Resolve an alias or misspelling to its canonical tag |
+| `get_tag_wiki` | A tag's wiki page as structured fields |
+| `search_posts` | Posts matching a tag combination, with their tag lists |
+| `get_tag_profile` | What a tag actually renders as, from a post sample |
+
+<details>
+<summary>Parameters and return fields for all eight tools</summary>
+
+#### `search_tags`
+
+`query` (required, e.g. `blue hair`) · `limit` (10) · `category`
+(`general`/`artist`/`copyright`/`character`/`meta`) · `min_posts` (0, drops
+tags below the threshold) · `refresh` (false)
+
+When no result carries posts, the response adds `wd14_hits` — WD14 tagger
+vocabulary names containing the query.
+
+#### `get_tag_info`
+
+`name` (required, e.g. `blue_hair`) · `refresh` (false)
+
+Returns category and post count plus a `wd14` verdict: `live` (current
+Danbooru), `tagger_era` (WD14 vocabulary only, likely renamed — the canonical
+name is in `renamed_to`) or `unknown` (neither). A 0-post name with an active
+alias also returns `renamed_to`.
+
+#### `get_tags_info`
+
+`names` (required, e.g. `["blue_hair","1girl"]`, max 20) · `refresh` (false)
+
+Returns `found` (each with the fields of `get_tag_info`, `renamed_to`
+included on 0-post rows) and `missing` (absent from Danbooru, each still
+carrying its `wd14` verdict).
+
+#### `get_related_tags`
+
+`tag` (required) · `limit` (10) · `refresh` (false)
+
+Meta-category tags like `highres` are filtered out as noise.
+
+#### `get_tag_alias`
+
+`name` (required, e.g. `sailor_suit`) · `refresh` (false)
+
+`null` means the input is already canonical.
+
+#### `get_tag_wiki`
+
+`title` or `other_names` (one required) · `limit` (5) · `include_description`
+(false) · `refresh` (false)
+
+Returns `summary` (first paragraph), `intro_tags` (definition-section link
+targets), `rules` (disambiguation and usage sentences), `see_also`,
+`example_posts`, the raw `linked_tags` union and multilingual `other_names`.
+The raw DText body is not returned; `include_description` adds the intro prose
+as plain text, for character appearance descriptions.
+
+#### `search_posts`
+
+`tags` (required, space-separated) · `limit` (5, max 20) · `tags_mode`
+(`full` default, `none` drops the per-post tag lists, `diff` keeps only tags
+not already in the query)
+
+No rating filter by default; add a `rating:g/s/q/e` metatag to narrow. Each
+post carries `score`, `fav_count`, `large_file_url` and `tags` split by
+category: `copyright` / `artist` / `character` / `general` / `meta`.
+
+#### `get_tag_profile`
+
+`tag` (required, e.g. `arm_up`) · `sample` (200, range 20-200) · `with` ·
+`rating` (`g`/`s`/`q`/`e`) · `order` (random by default, or `score` /
+`favcount` for a top-post view, which is biased)
+
+Samples a page of the tag's posts and returns `co_tags` ordered by in-sample
+frequency, `ubiquitous` corpus constants (`freq >= 0.5`), `top_pairs`
+combinations ranked by lift, and the `ratings` mix. Random sampling covers the
+whole population; `rating` filters the sample; `with` profiles the 200 most
+recent joint posts of a tag pair instead.
+
+</details>
+
+The six tag tools (`search_tags`, `get_tag_info`, `get_tags_info`,
+`get_related_tags`, `get_tag_alias`, `get_tag_wiki`) read from the
+[response cache](#response-cache): repeat calls inside the TTL skip the
+network round trip, and during a Danbooru outage the last cached answer is
+served instead of an error, marked with `stale: true` and `cached_at` (when
+it was stored). Their `refresh` parameter (default false) bypasses the cache
+for a single call and re-fetches live. Post search and profiles are never
+cached, so they carry no `refresh`.
 
 The six tag tools (`search_tags`, `get_tag_info`, `get_tags_info`,
 `get_related_tags`, `get_tag_alias`, `get_tag_wiki`) read from the
