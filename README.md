@@ -313,37 +313,15 @@ Releases are automated: pushing a `v*` tag makes GitHub Actions run the test
 suite and publish the setup exes, portable zips, and `checksums.txt` for both
 architectures.
 
-## Reproducible builds & verifying downloads
+## Verifying a download
 
-Release binaries are **not** Authenticode-signed; integrity rests on
-reproducible builds plus SHA-256, all free and verifiable by anyone:
-
-- The exe and portable zips are **byte-reproducible**: the exact Go toolchain
-  is pinned in `go.mod`, builds use `CGO_ENABLED=0 -trimpath -buildvcs=false`,
-  and zips are written by `scripts/zipfile` with entry timestamps pinned to
-  the commit time (`SOURCE_DATE_EPOCH`). Same source + toolchain ⇒ identical
-  bytes on any machine, any timezone.
-- Every release job runs a **verify-repro** check: it rebuilds the exe from
-  the tagged source on a Linux runner and compares it byte-for-byte against
-  the published Windows-built asset — a green check on the release proves
-  the artifacts were built from the tag without tampering.
-- All artifacts carry **SHA-256 checksums** (`checksums.txt`) and free
-  keyless **build-provenance attestations** signed by the GitHub workflow.
-
-Verify a download:
+Binaries are not Authenticode-signed; integrity rests on reproducible builds,
+SHA-256 checksums and build provenance.
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt   # integrity vs the manifest
 gh attestation verify --repo BaixuanZhu/danbooru-tag-mcp danbooru-tag-mcp.exe   # provenance
 ```
 
-Reproduce the portable exe yourself and compare:
-
-```bash
-git checkout v0.4.0
-make build-dist VERSION=0.4.0 GOARCH=amd64
-sha256sum dist/amd64/danbooru-tag-mcp.exe     # must equal the hash inside the published zip
-```
-
-The NSIS setup exe is the one non-reproducible artifact (makensis embeds
-build metadata); it is still covered by `checksums.txt` and the attestations.
+[How the builds stay byte-reproducible, and how to rebuild one yourself →
+](docs/reproducible-builds.md)
