@@ -37,6 +37,55 @@ Point your MCP client at the command:
 
 That's it — the client picks up the eight tools below on its next session.
 
+## What the client gets back
+
+Live responses, abridged for length. Post counts move daily; these were
+captured on 2026-11-12.
+
+`search_tags` for *blue hair* — the names that actually exist, so the model
+stops guessing `bluehair`:
+
+```json
+{"tags": [
+  {"id": 10953, "name": "blue_hair", "category": 0, "post_count": 1234156},
+  {"id": 545704, "name": "blue_hairband", "category": 0, "post_count": 33332},
+  {"id": 1564040, "name": "blue_hair-chan_(ramchi)", "category": 4, "post_count": 120}
+]}
+```
+
+`get_tag_info` for `blue_hair` — the count, plus whether the WD14 taggers know
+the name at all:
+
+```json
+{"id": 10953, "name": "blue_hair", "category": 0, "post_count": 1234156,
+ "wd14": {"status": "live", "sources": [
+   {"vocab": "wd-eva02-large-tagger-v3", "count": 704952},
+   {"vocab": "wd-v1-4-moat-tagger-v2", "count": 564360}]}}
+```
+
+`get_tag_profile` for `arm_up`, all-ages sample of 200 — what the tag actually
+renders alongside, ranked by in-sample frequency, and which combinations are
+specific to it rather than merely common:
+
+```json
+{"name": "arm_up", "post_count": 314588, "rating": "g", "sample": 200,
+ "ratings": {"g": 1},
+ "ubiquitous": [
+   {"tag": "smile", "category": 0, "freq": 0.51},
+   {"tag": "solo", "category": 0, "freq": 0.51}],
+ "co_tags": [
+   {"tag": "looking_at_viewer", "category": 0, "freq": 0.5},
+   {"tag": "long_sleeves", "category": 0, "freq": 0.48},
+   {"tag": "1girl", "category": 0, "freq": 0.46},
+   {"tag": "open_mouth", "category": 0, "freq": 0.45}],
+ "top_pairs": [
+   {"pair": "pokemon + pokemon_(creature)", "freq": 0.05, "lift": 16.7},
+   {"pair": "japanese_clothes + kimono", "freq": 0.05, "lift": 15.4}]}
+```
+
+The full profile returns 30 co-occurring tags and 10 ranked pairs. Every field
+is documented under [Tools](#tools).
+
 ## Features
 
 - **8 MCP tools** — search tags, exact and batch lookup, aliases, related
