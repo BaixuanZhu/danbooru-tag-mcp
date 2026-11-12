@@ -1,5 +1,7 @@
 # danbooru-tag-mcp
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/BaixuanZhu/danbooru-tag-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/BaixuanZhu/danbooru-tag-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/BaixuanZhu/danbooru-tag-mcp)](https://github.com/BaixuanZhu/danbooru-tag-mcp/releases/latest)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows&logoColor=white)](#install)
@@ -269,15 +271,6 @@ whole population; `rating` filters the sample; `with` profiles the 200 most
 recent joint posts of a tag pair instead.
 
 </details>
-
-The six tag tools (`search_tags`, `get_tag_info`, `get_tags_info`,
-`get_related_tags`, `get_tag_alias`, `get_tag_wiki`) read from the
-[response cache](#response-cache): repeat calls inside the TTL skip the
-network round trip, and during a Danbooru outage the last cached answer is
-served instead of an error, marked with `stale: true` and `cached_at` (when
-it was stored). Their `refresh` parameter (default false) bypasses the cache
-for a single call and re-fetches live. Post search and profiles are never
-cached, so they carry no `refresh`.
 
 The six tag tools (`search_tags`, `get_tag_info`, `get_tags_info`,
 `get_related_tags`, `get_tag_alias`, `get_tag_wiki`) read from the
