@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.BaixuanZhu/danbooru-tag-mcp",
-  "description": "Danbooru MCP server for AI image generation: cached search, batch lookup, profiles, wiki, posts",
+  "description": "Danbooru tag MCP for anime prompts: tags, aliases, WD14 names, wiki rules, co-occurrence. Windows.",
   "title": "danbooru-tag-mcp",
   "repository": {
     "url": "https://github.com/BaixuanZhu/danbooru-tag-mcp",
