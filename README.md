@@ -2,18 +2,17 @@
 
 [![CI](https://github.com/BaixuanZhu/danbooru-tag-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/BaixuanZhu/danbooru-tag-mcp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/BaixuanZhu/danbooru-tag-mcp)](https://github.com/BaixuanZhu/danbooru-tag-mcp/releases/latest)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows&logoColor=white)](#install)
 [![Go](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/github/license/BaixuanZhu/danbooru-tag-mcp)](LICENSE)
 
-A Danbooru tag lookup [MCP](https://modelcontextprotocol.io) (Model Context
-Protocol) server for local AI image generation: your AI client resolves real
-Danbooru tags — exact names, aliases, categories, post counts, co-occurrence
-statistics, wiki descriptions, and the tag lists of real posts — before
-composing prompts, which noticeably improves tag accuracy in generated images.
+A Danbooru tag lookup [MCP](https://modelcontextprotocol.io) server for local AI
+image generation. Your AI client looks tags up instead of recalling them —
+exact names, aliases, categories, post counts, co-occurrence stats and wiki
+rules, resolved before it writes the prompt.
 
-<p align="center">
-  <img src="docs/demo.gif" alt="danbooru-tag-mcp demo: verifying Danbooru tags with search_tags, get_tag_wiki and search_posts before composing a prompt" width="720">
-</p>
+Windows 10/11 on x64 or ARM64. Anonymous access works, so there is no API key
+to obtain before the first query.
 
 ## Quick start
 
