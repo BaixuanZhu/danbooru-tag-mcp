@@ -29,3 +29,10 @@ Makefile text eol=lf
 # picking either side (task state lives in task.json, not index.md). See
 # .trellis/spec/cli/backend/directory-structure.md for details.
 .trellis/workspace/*/journal-*.md merge=union
+
+# Language stats. .trellis/ is the agent plugin workspace — Python tooling,
+# task archives and specs that ship with the repo but are not part of the
+# MCP server. Left in the stats its ~400 KB of Python outweighs the Go
+# source and the repo gets labelled "Python" on GitHub, which hides it from
+# language:go searches and misstates what the project is.
+.trellis/** linguist-vendored
