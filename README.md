@@ -39,17 +39,32 @@ That's it — the client picks up the eight tools below on its next session.
 
 ## Features
 
-- **8 MCP tools**: tag search, exact tag info, batch tag lookup, related tags, alias resolution, wiki lookup, post search, and tag distribution profiles
-- **Batch tag lookup**: `get_tags_info` resolves up to 20 exact tag names in a single request — one tool call instead of 20, with found/missing split and a `wd14` verdict on every name
-- **Tag distribution profiles, single or pair**: `get_tag_profile` samples a page of a big tag's posts and answers what it actually renders as — co-occurring tags by in-sample frequency (corpus constants like `1girl`/`solo` split into `ubiquitous`), combinations ranked by lift, and the sample's rating mix. `with` profiles a tag pair over the 200 most recent joint posts (what does `arm_up` + `holding_weapon` render as?); `order: score/favcount` switches to a top-post view (biased), `rating:` narrows either mode
-- **Structured wiki pages**: `get_tag_wiki` distills the DText body into `summary`, `intro_tags` (definition/appearance tag targets), `rules` (the "if X, use Y instead" disambiguation sentences), `see_also` and `example_posts` — no raw body to re-parse; `include_description` opts into the intro prose as plain text for character appearance descriptions
-- **Tag lists back from post search**: `search_posts` returns each post's full tag list split by category (copyright/artist/character/general/meta) plus `score`/`fav_count`/`large_file_url`, so mining a few posts reveals which tags naturally go together
-- **Tagger-era tag detection**: `get_tag_info` classifies every name against the pinned WD14 tagger vocabularies (`wd14` field: `live` / `tagger_era` — a tagger-era name Danbooru has since renamed, with the canonical name in `renamed_to` / `unknown`), so LoRA card captions stop dead-ending at "tag not found"; `search_tags` adds `wd14_hits` fallback hits when no result carries posts, and filters by category (general/artist/copyright/character/meta) so character or artist lookups stop drowning in general tags
-- **Uncensored by default**: `search_posts` applies no rating filter — results reflect a tag's whole population (arm_up is ~95% g/s/q); add a `rating:g/s/q/e` metatag when you want only R-18 or only all-ages
-- **Outage-tolerant**: repeat queries are served from an on-disk response cache (posts never); when Danbooru is unreachable, the last cached answer is served stale — marked `stale` + `cached_at` — after automatic retries, and HTML maintenance error pages collapse to a one-line summary
-- **Self-updating**: `danbooru-tag-mcp upgrade` checks GitHub Releases, verifies SHA256 and replaces the binary atomically
-- **Zero-config install**: per-user installer (setup wizard or one-line PowerShell) that registers the install directory into the user PATH automatically
-- **Polite API usage**: requests are throttled to one per 1.5 seconds anonymous (500ms with credentials, both tunable via `DANBOORU_REQ_GAP_MS`); anonymous access works, credentials raise the limits (free/anonymous post searches are still capped at 2 content tags per query)
+- **8 MCP tools** — search tags, exact and batch lookup, aliases, related
+  tags, wiki pages, post search, and distribution profiles.
+- **Batch lookup** — 20 exact names in one call instead of 20, with a
+  found/missing split and a WD14 verdict on every name.
+- **Distribution profiles** — what a tag actually renders as: co-occurring
+  tags by in-sample frequency, corpus constants like `1girl`/`solo` split
+  into `ubiquitous`, combinations ranked by lift, and the sample's rating
+  mix. `with` profiles a tag pair instead, answering what `arm_up` plus
+  `holding_weapon` renders as.
+- **Structured wiki pages** — the DText body distilled into `summary`,
+  `intro_tags`, `rules`, `see_also` and `example_posts`, so rules like
+  "if X, use Y instead" arrive as data rather than prose to re-parse.
+- **Tagger-era detection** — every name is checked against the pinned WD14
+  vocabularies and classified as `live`, `tagger_era` (renamed upstream, the
+  canonical name included) or `unknown`, so LoRA card captions stop
+  dead-ending at "tag not found".
+- **Post tag lists** — each post comes back with its full tag list split by
+  category, so mining a few posts shows which tags naturally go together. No
+  rating filter by default; add `rating:g` for all-ages only.
+- **Built to stay installed** — an on-disk cache that serves stale answers
+  during outages, `upgrade` verifying SHA256 and swapping the binary
+  atomically, a per-user installer that registers PATH, and 1.5 s request
+  spacing (500 ms with credentials) that keeps anonymous access viable.
+
+Tags come back as plain strings with no model coupling, so they paste
+straight into ComfyUI, Stable Diffusion or Illustrious prompt fields.
 
 ## Install
 
