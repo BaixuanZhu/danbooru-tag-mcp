@@ -250,10 +250,10 @@ case while `normalizeTag` does not). Since 0.6.0 `Found` rows with
 0-post row, live rows skip it, alias failures are non-fatal. The bound is
 `maxBatchNames` (<=20 extra requests worst case), amortized to zero by the
 7d alias cache on repeat batches. `search[antecedent_name]` comma lists
-return empty (verified live, still true), so the resolution cannot collapse
-into the batched request itself; if an `_any`/`_normalize` alias variant
-later proves to accept comma lists (deferred probe in the task's
-research/live-probes.md), collapse to one request as a follow-up.
+return empty and no `_any`/`_normalize` variant exists (probed live
+2026-11-12: those params are silently ignored — the response is
+byte-identical to the no-search-param default listing), so the resolution
+cannot collapse into the batched request itself.
 Deliberately NOT batched: related/wiki/profile/posts — those have unbounded
 payloads; the batch stays on fixed-size rows so the response is a few KB
 max. `Info` keeps using `FetchTagExact` (its tests pin that path; do not

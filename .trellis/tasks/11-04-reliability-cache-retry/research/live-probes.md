@@ -41,3 +41,26 @@ curl -sg -A "danbooru-tag-mcp/<ver> (planning probe)" \
 ```
 
 The `only=` param keeps probe payloads small; keep ~2s between calls.
+
+## Results (2026-11-12, API recovered, probes run live)
+
+Both questions answered **no** — no follow-up optimization is possible via
+comma lists.
+
+1. `tag_aliases.json`: `search[antecedent_name_any]=barefoot_sandals,gold_footwear`
+   and `search[antecedent_name_normalize]=...` both return HTTP 200 with a
+   listing **byte-identical to the no-search-param default listing** — the
+   params do not exist and are silently ignored (they neither 422 nor filter).
+   `search[antecedent_name]=a,b` returns `[]` (re-confirmed). So R3's
+   per-name alias loop stays; batch `renamed_to` cannot collapse to one
+   request.
+2. `wiki_pages.json`: `search[title_normalize]=arm_up,solo` and
+   `search[title]=arm_up,solo` both return `[]` (single-name controls return
+   the row). Wiki batch lookup has no comma-list route; a batch would mean
+   per-title requests.
+
+Side observation: the `barefoot_sandals → barefoot_sandals_(jewelry)` alias
+row now carries `status: "deleted"` (probe did not filter status). Does not
+affect the released behavior — the 2026-11-12 online smoke passed all
+tagger-era checks — but worth remembering if `renamed_to` resolution ever
+looks stale for that name.
