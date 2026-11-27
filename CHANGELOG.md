@@ -4,6 +4,20 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [0.6.1] - Unreleased
+
+### Fixed
+
+- Transport errors no longer leak credentials: when a request fails
+  mid-flight (timeout, DNS failure, connection refused, cancellation), the
+  error text previously embedded the full request URL including the
+  `login` / `api_key` query parameters, and that text reached MCP tool
+  error payloads. Error messages now keep the scheme, host and path of the
+  request plus the underlying cause, but never the query string. Error
+  semantics are unchanged (`errors.Is` against `context.Canceled` /
+  `context.DeadlineExceeded` still matches; retry and stale-fallback
+  behavior are untouched).
+
 ## [0.6.0] - 2026-11-12
 
 ### Added

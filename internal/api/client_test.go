@@ -286,6 +286,72 @@ func TestGet_ContextCancelAbortsWithoutRetry(t *testing.T) {
 	}
 }
 
+// TestGet_TransportErrorsOmitCredentials pins the credential-hygiene rule
+// for transport failures: with credentials configured, an error from a
+// request that fails mid-flight must carry neither the login nor the api
+// key nor any query string, while staying useful (scheme, host, path,
+// cause) and keeping errors.Is(err, context.DeadlineExceeded) true.
+func TestGet_TransportErrorsOmitCredentials(t *testing.T) {
+	var hits int32
+	var once sync.Once
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		once.Do(func() { close(started) })
+		<-r.Context().Done() // hold the request until the client gives up
+	}))
+	defer srv.Close()
+
+	const (
+		probeLogin = "probe_login"
+		probeKey   = "probe_api_key_0123456789"
+	)
+	cli := NewClient(
+		WithBaseURL(srv.URL),
+		WithReqGap(0),
+		WithCredentials(probeLogin, probeKey),
+	)
+	cli.backoffs = []time.Duration{0, 0}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	params := url.Values{"limit": {"1"}, "search[name]": {"probe_tag"}}
+	_, err := cli.Get(ctx, "/tags.json", params)
+	<-started
+	if err == nil {
+		t.Fatal("expected a transport error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error identity lost: expected context.DeadlineExceeded, got: %v", err)
+	}
+	msg := err.Error()
+	if strings.Contains(msg, probeLogin) {
+		t.Errorf("error text leaks the login: %v", err)
+	}
+	if strings.Contains(msg, probeKey) {
+		t.Errorf("error text leaks the api key: %v", err)
+	}
+	if strings.Contains(msg, "limit=1") || strings.Contains(msg, "search%5Bname%5D") {
+		t.Errorf("error text carries a query string: %v", err)
+	}
+	if !strings.Contains(msg, "/tags.json") {
+		t.Errorf("error text lost the request path: %v", err)
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		t.Fatalf("expected a *url.Error, got %T", err)
+	}
+	if strings.Contains(ue.URL, "?") {
+		t.Errorf("error URL must carry no query string, got %q", ue.URL)
+	}
+	if !strings.HasPrefix(ue.URL, srv.URL+"/tags.json") {
+		t.Errorf("error URL lost scheme/host/path, got %q", ue.URL)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Errorf("cancellation must not retry: expected 1 request, got %d", n)
+	}
+}
+
 func TestGet_HTMLErrorCollapsedToTitle(t *testing.T) {
 	var hits int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

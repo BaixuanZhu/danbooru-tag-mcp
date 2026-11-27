@@ -366,17 +366,20 @@ func (c *Client) doWithRetry(ctx context.Context, reqURL string) (cache.Result, 
 }
 
 // doOnce performs one request/response cycle: context binding, UA
-// injection, and the 5MB body cap (overflow is fatal for retries).
+// injection, and the 5MB body cap (overflow is fatal for retries). Every
+// error it returns is sanitized (see sanitizeTransportError) — this is the
+// single point where transport errors are created, so nothing downstream
+// can see a credentialed URL.
 func (c *Client) doOnce(ctx context.Context, reqURL string) fetchOutcome {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
-		return fetchOutcome{err: err, fatal: true}
+		return fetchOutcome{err: sanitizeTransportError(err), fatal: true}
 	}
 	req.Header.Set("User-Agent", c.userAgent)
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fetchOutcome{err: err}
+		return fetchOutcome{err: sanitizeTransportError(err)}
 	}
 	defer resp.Body.Close()
 
@@ -384,10 +387,10 @@ func (c *Client) doOnce(ctx context.Context, reqURL string) fetchOutcome {
 	limitedReader := io.LimitReader(resp.Body, maxResponseBody+1)
 	body, err := io.ReadAll(limitedReader)
 	if err != nil {
-		return fetchOutcome{err: err}
+		return fetchOutcome{err: sanitizeTransportError(err)}
 	}
 	if len(body) > maxResponseBody {
-		return fetchOutcome{err: errResponseBodyTooLarge, fatal: true}
+		return fetchOutcome{err: sanitizeTransportError(errResponseBodyTooLarge), fatal: true}
 	}
 	return fetchOutcome{
 		body:        body,
@@ -395,6 +398,38 @@ func (c *Client) doOnce(ctx context.Context, reqURL string) fetchOutcome {
 		contentType: resp.Header.Get("Content-Type"),
 		retryAfter:  resp.Header.Get("Retry-After"),
 	}
+}
+
+// sanitizeTransportError strips the request URL's query string and userinfo
+// from a transport error before it leaves the api layer. The request URL
+// carries the injected login/api_key credentials, and error text flows
+// verbatim into MCP tool error payloads (agent context, session logs), so a
+// timeout or refused connection must not leak them. The rewritten *url.Error
+// keeps Op, Err, and the scheme/host/path of the request — the message stays
+// diagnosable and errors.Is(err, context.Canceled / DeadlineExceeded) still
+// matches through the preserved cause chain. Values that are not *url.Error
+// (directly or wrapped) pass through untouched; when the URL string cannot
+// be re-parsed, everything after the first '?' is cut so credentials still
+// cannot ride the text.
+func sanitizeTransportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if !errors.As(err, &ue) {
+		return err
+	}
+	u, perr := url.Parse(ue.URL)
+	if perr != nil {
+		if i := strings.IndexByte(ue.URL, '?'); i >= 0 {
+			return &url.Error{Op: ue.Op, URL: ue.URL[:i], Err: ue.Err}
+		}
+		return err
+	}
+	u.RawQuery = ""
+	u.ForceQuery = false
+	u.User = nil
+	return &url.Error{Op: ue.Op, URL: u.String(), Err: ue.Err}
 }
 
 // httpStatusError builds the shrunken error for a non-2xx response: an

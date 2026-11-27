@@ -69,6 +69,7 @@ func WithCache(dir string) Option          // Open failure -> WARN + cache-less,
 | definitive 4xx (401/403/404/422) | shrunken error; NEVER stale-serve |
 | HTML error body | error carries status + `<title>` only |
 | non-HTML error body | truncated to 300 bytes |
+| transport failure error text | sanitized: URL keeps scheme + host + path only — query/userinfo dropped (the query carries the injected credentials; `TestGet_TransportErrorsOmitCredentials`) |
 | Store corrupt/unwritable | WARN + behave cache-less |
 
 ### 5. Good/Base/Bad Cases

@@ -111,7 +111,12 @@ cancellation never retries and never stale-serves; a parseable `Retry-After`,
 capped 30s, replaces the first backoff). Non-2xx error bodies are shrunk:
 HTML collapses to status + `<title>` (live Downbooru 503 shape:
 `danbooru 503 (Downbooru)` instead of ~2-3KB of markup), other bodies
-truncate at 300 bytes. Request gap tiers: `DANBOORU_REQ_GAP_MS` (0 valid =
+truncate at 300 bytes. Transport errors are sanitized at creation
+(`sanitizeTransportError` in `doOnce`): the `*url.Error` URL keeps only
+scheme + host + path because the query string carries the injected
+`login`/`api_key` and the text flows verbatim into MCP tool error payloads
+(`TestGet_TransportErrorsOmitCredentials`; cause chain and cancellation
+semantics preserved). Request gap tiers: `DANBOORU_REQ_GAP_MS` (0 valid =
 no gap; invalid or negative warns once on stderr and keeps the tier default)
 > credentialed 500ms (`DANBOORU_LOGIN` + `DANBOORU_API_KEY` both set) >
 anonymous 1500ms; `WithReqGap` still overrides everything (tests use it).
