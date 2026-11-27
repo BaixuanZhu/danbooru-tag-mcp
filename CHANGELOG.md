@@ -4,6 +4,41 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [0.7.0] - Unreleased
+
+### Breaking
+
+- The on-disk response cache (shipped in 0.6.0) is removed: every tool now
+  answers from live Danbooru on every call. The `refresh` parameter leaves
+  the six tag tools (`search_tags`, `get_tag_info`, `get_tags_info`,
+  `get_related_tags`, `get_tag_alias`, `get_tag_wiki`) and the `stale` /
+  `cached_at` response fields are gone; a stale client sending
+  `refresh:true` gets it silently ignored, so drop the parameter. The
+  `DANBOORU_MCP_NO_CACHE` environment variable is a no-op and no longer
+  documented. What the cache actually delivered did not justify its upkeep:
+  over 64 days of real call history it saved about 292 seconds of tool
+  latency and rescued exactly one outage, and `refresh` was never used
+  once. Bounded retry and shrunken error text — the parts that carried the
+  value — are unchanged. A leftover
+  `%LOCALAPPDATA%\danbooru-tag-mcp\cache` directory from 0.6.x is inert
+  (never read, written or deleted at runtime; the uninstaller still removes
+  it) and can be deleted manually at any time. With no cache, request costs
+  that hits used to hide are paid on every call: `get_tag_profile` issues
+  its row lookup plus the posts request, and `get_tags_info` one batch
+  request plus one alias request per 0-post row.
+- Upstream failures are now unmistakable: when a request fails on a network
+  error, a 5xx or a 429/421 and stays failed after retries, every one of
+  the eight tools returns the same result flagged at the protocol level
+  (`isError: true`) with one code —
+  `{"error":"upstream_unavailable","message":"Danbooru is not answering
+  right now: <cause>. All tools of this server are affected; retry
+  later."}`. Agents matching the old per-tool codes must switch to the new
+  code. `get_tag_info` no longer reports outages as `tag_not_found`: that
+  code now appears only for a genuine not-found (unchanged payload with the
+  `wd14` verdict), while its other non-upstream failures get the new
+  `tag_info_failed` code. A definitive 4xx, a validation error, a parse
+  error and a caller cancellation stay unmarked plain results.
+
 ## [0.6.1] - Unreleased
 
 ### Fixed

@@ -26,7 +26,6 @@ type MissingTag struct {
 type TagsInfo struct {
 	Found   []TagInfo    `json:"found"`
 	Missing []MissingTag `json:"missing,omitempty"`
-	CacheMarks
 }
 
 // Infos resolves up to maxBatchNames exact tag names in ONE Danbooru request
@@ -60,7 +59,7 @@ func (s *TagService) Infos(ctx context.Context, names []string) (*TagsInfo, erro
 		return nil, err
 	}
 	var rows []Tag
-	if err := json.Unmarshal(res.Body, &rows); err != nil {
+	if err := json.Unmarshal(res, &rows); err != nil {
 		return nil, fmt.Errorf("failed to parse tags info response: %w", err)
 	}
 
@@ -71,7 +70,7 @@ func (s *TagService) Infos(ctx context.Context, names []string) (*TagsInfo, erro
 		byName[strings.ToLower(r.Name)] = r
 	}
 
-	result := &TagsInfo{Found: make([]TagInfo, 0, len(clean)), CacheMarks: marksFrom(res)}
+	result := &TagsInfo{Found: make([]TagInfo, 0, len(clean))}
 	for _, name := range clean {
 		row, ok := byName[strings.ToLower(name)]
 		if !ok {

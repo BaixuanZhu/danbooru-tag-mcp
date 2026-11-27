@@ -45,16 +45,8 @@ layers are decoupled via interfaces for mock-based unit tests:
 - **internal/api/**: Danbooru REST HTTP client. `Client.Get` is the **single
   choke point** for all outbound requests (rate-limit gap + mutex, context
   cancellation, UA/credential injection, 5MB body cap, bounded retry, error
-  shrink, and the response-cache read/write/stale-fallback policy — see the
-  reliability boundary below). New API endpoints must go through it; never
-  use `http` directly.
-- **internal/cache/**: persistent response cache, a stdlib-only leaf package
-  (same discipline as internal/vocab). `Store` keeps one JSON entry per key
-  under `<dir>/v1/<sha256>.json` (atomic temp+rename writes; oldest-by-mtime
-  eviction under a dual cap: 2000 entries AND 64MB total payload);
-  `Result` carries the body plus stale provenance; `WithRefresh` /
-  `RefreshRequested` thread the per-call cache-bypass flag through ctx.
-  Knows nothing about HTTP, Danbooru, or TTLs — the api layer owns those.
+  shrink, and the upstream-failure marker — see the reliability boundary
+  below). New API endpoints must go through it; never use `http` directly.
 - **internal/service/**: business logic and JSON parsing; depends on the
   `TagFetcher` interface (unaware of the concrete client) and on the
   `vocab.Store` for WD14 classification.
@@ -68,8 +60,10 @@ layers are decoupled via interfaces for mock-based unit tests:
   data change only (provenance and rules in `internal/vocab/data/README.md`).
   Leaf package with no dependencies; nil `*Store` answers miss so callers
   can run unenriched.
-- **internal/app/**: `Version` (ldflags injected), `Fail`, `UserAgent`, and
-  the bootstrap switch (`BootstrapEnabled`).
+- **internal/app/**: `Version` (ldflags injected), `Fail`, `UserAgent`,
+  `ErrUpstreamUnavailable` (the upstream-failure sentinel `errors.Is`
+  matches; api raises it, tools turn it into the uniform result), and the
+  bootstrap switch (`BootstrapEnabled`).
 - **internal/env/**: user PATH injection (registry `HKCU\Environment` +
   WM_SETTINGCHANGE broadcast; never setx).
 - **internal/upgrade/**: GitHub Release self-update (version compare ->
@@ -79,37 +73,18 @@ layers are decoupled via interfaces for mock-based unit tests:
 zero-config client compatibility); `upgrade` / `version` / `help` are CLI
 mode, where writing to stdout is allowed.
 
-**Response cache + retry + error shrink (reliability boundary, test-enforced,
-do not break)**: `Client.Get` caches the four stable endpoints with per-class
-TTLs (`/related_tag.json` 30d, `/wiki_pages.json` + `/tag_aliases.json` 7d;
-`/tags.json` splits by query shape — substring search 24h, exact-name lookup
-(`search[name]`/`search[name_normalize]`) 7d via the `tagsExactClass` TTL
-class: identity rows are reference data like wiki/alias while substring
-searches must keep surfacing new tags, and the accepted cost is an exact
-row's `post_count` trailing live Danbooru by up to 7 days — `refresh:true`
-when a decision needs current counts); the cache key is `path + "?" + params.Encode()` computed
-BEFORE credential injection, so credentials never reach disk and
-anonymous/authenticated callers share entries. `/posts.json` never touches
-the Store (replayed `order:random` pages and whole-population profile
-samples would be lies) and empty `[]` bodies are never cached (dead-end
-searches stay cheap to refetch; caching them would hide new tags for a whole
-TTL). A fresh hit returns before the rate-limit wait, byte-identical and
-unmarked (concurrency contract: the cache read is lock-free — a hit never
-queues behind a network caller; `c.mu` guards only the rate-limit
-accounting while sleeps, retries, and cache writes run unlocked); after
-retries are exhausted on a retryable failure the expired
-entry is served instead of an error, marked `stale: true` + `cached_at`
-(RFC3339) on the affected tool response — stale-only marking (user decision:
-fresh-hit markers add payload with no actionable information), so both fields
-are `omitempty` and absent everywhere else. The 6 cacheable tools take
-`refresh` (boolean, default false): the tools handler wraps ctx via
-`cache.WithRefresh`, `Get` skips the fresh-hit shortcut and runs the network
-path unchanged, and a successful `Put` restarts the entry's TTL clock; a
-failed refresh still stale-serves. Retries: up to 2 retries on 5xx, network
+**Retry + error shrink + upstream marking (reliability boundary,
+test-enforced, do not break)**: every tool answers from live Danbooru — the
+response cache (0.6.0) was removed in 0.7.0, so there is no stale-serve
+fallback and no `refresh`/`stale`/`cached_at` anywhere. `Client.Get` is a
+straight line: rate-limit wait, credential injection, retry loop.
+Concurrency contract: `c.mu` guards only the rate-limit accounting while
+sleeps and retries run unlocked. Retries: up to 2 retries on 5xx, network
 errors, and 429/421 with 1s/3s backoff (ctx-interruptible waits; caller
-cancellation never retries and never stale-serves; a parseable `Retry-After`,
-capped 30s, replaces the first backoff). Non-2xx error bodies are shrunk:
-HTML collapses to status + `<title>` (live Downbooru 503 shape:
+cancellation never retries; a parseable `Retry-After`, capped 30s, replaces
+the first backoff). A definitive 4xx returns after ONE attempt — pinned by
+`TestGet_NonRetryable4xxReturnsAfterOneAttempt`. Non-2xx error bodies are
+shrunk: HTML collapses to status + `<title>` (live Downbooru 503 shape:
 `danbooru 503 (Downbooru)` instead of ~2-3KB of markup), other bodies
 truncate at 300 bytes. Transport errors are sanitized at creation
 (`sanitizeTransportError` in `doOnce`): the `*url.Error` URL keeps only
@@ -120,9 +95,20 @@ semantics preserved). Request gap tiers: `DANBOORU_REQ_GAP_MS` (0 valid =
 no gap; invalid or negative warns once on stderr and keeps the tier default)
 > credentialed 500ms (`DANBOORU_LOGIN` + `DANBOORU_API_KEY` both set) >
 anonymous 1500ms; `WithReqGap` still overrides everything (tests use it).
-`DANBOORU_MCP_NO_CACHE` (checked in main.go `clientOptions`, alongside an
-empty-LOCALAPPDATA guard) disables the cache; every Store failure degrades
-to cache-less with a stderr WARN — a broken cache must never break requests.
+**Upstream marker contract (R10-R12)**: when a request still fails after
+retries on one of the three transient classes (transport error, 5xx,
+429/421), `doWithRetry` wraps the shrunken cause in `*upstreamError`, whose
+`Is` matches `app.ErrUpstreamUnavailable`. The tools layer's `failResult`
+turns that into ONE uniform marked result on every tool:
+`isError: true` + `{"error":"upstream_unavailable","message":"Danbooru is
+not answering right now: <cause>. All tools of this server are affected;
+retry later."}` (`TestHandlers_UpstreamFailureIsUniform` pins all 8 tools;
+`TestChain_UpstreamFailureReachesTheClient` runs the real api -> service ->
+tools chain against a local 503). Only those three classes are marked: a
+definitive 4xx, a validation error, a parse error and a caller cancellation
+stay unmarked plain text results. `tag_not_found` is reserved for a genuine
+not-found (payload with the `wd14` verdict unchanged); other `get_tag_info`
+failures get `tag_info_failed`.
 
 **Rating filter boundary (test-enforced, do not break)**: **no layer injects
 a rating filter** — neither the api layer's `FetchPosts`
@@ -253,8 +239,9 @@ case while `normalizeTag` does not). Since 0.6.0 `Found` rows with
 "batch does not resolve aliases" boundary): `Infos` loops
 `s.resolveRenamedTo(ctx, &result.Found[i])` — one extra alias request per
 0-post row, live rows skip it, alias failures are non-fatal. The bound is
-`maxBatchNames` (<=20 extra requests worst case), amortized to zero by the
-7d alias cache on repeat batches. `search[antecedent_name]` comma lists
+`maxBatchNames` (<=20 extra requests worst case), and since the response
+cache was removed (0.7.0) those alias requests are paid on every call.
+`search[antecedent_name]` comma lists
 return empty and no `_any`/`_normalize` variant exists (probed live
 2026-11-12: those params are silently ignored — the response is
 byte-identical to the no-search-param default listing), so the resolution
@@ -328,11 +315,12 @@ inheritance; this is documented in the plugin README.
   online smoke (`make integration` / `scripts/integration-test.sh` — every
   tool called against the live API plus a tagger-era name whose `wd14`
   verdict must ride the response, anonymous, PATH-isolated via
-  `DANBOORU_MCP_NO_BOOTSTRAP` and cache-disabled via
-  `DANBOORU_MCP_NO_CACHE` so it always verifies the live upstream, never a
-  warm cache) runs only on the weekly schedule or manual
-  dispatch, never in the release path. It is the canary for upstream API
-  drift (the 2024 related_tag.json revamp broke parsing while unit tests
+  `DANBOORU_MCP_NO_BOOTSTRAP` so it never writes the user PATH or registry;
+  every call reaching the live upstream is structural since the 0.7.0 cache
+  removal, and the script also pins that no tool exposes `refresh` or
+  carries `stale`/`cached_at` markers) runs only on the weekly schedule or
+  manual dispatch, never in the release path. It is the canary for upstream
+  API drift (the 2024 related_tag.json revamp broke parsing while unit tests
   stayed green). The repo pins LF line endings via `.gitattributes`
   (shell scripts break under Git Bash / CI windows runners when autocrlf
   converts them to CRLF).

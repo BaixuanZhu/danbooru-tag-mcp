@@ -1,12 +1,20 @@
 // Package app provides cross-package shared infrastructure: version number,
-// error exit, User-Agent, and the startup bootstrap (PATH injection) switch.
-// Centralizing these here avoids import cycles between env / upgrade, etc.
+// error exit, User-Agent, the upstream-failure sentinel, and the startup
+// bootstrap (PATH injection) switch. Centralizing these here avoids import
+// cycles between env / upgrade / api / tools, etc.
 package app
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
+
+// ErrUpstreamUnavailable is matched (errors.Is) by every error that means
+// Danbooru could not serve a request even after retries: a transport
+// failure, a 5xx, or a 429/421. The api layer raises it; the tools layer
+// turns it into one uniform result on every tool.
+var ErrUpstreamUnavailable = errors.New("danbooru unavailable")
 
 // Version is the version of danbooru-tag-mcp itself.
 // Injected via ldflags at build time (see Makefile: -X danbooru-tag-mcp/internal/app.Version=...);

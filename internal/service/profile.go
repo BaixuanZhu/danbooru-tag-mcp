@@ -161,7 +161,6 @@ func (s *TagService) profileSingle(ctx context.Context, tag string, sample int, 
 		return nil, err // *NotFoundError propagates; the handler rides the wd14 verdict
 	}
 	profile.TagInfo = *info
-	profile.TagInfo.CacheMarks = CacheMarks{} // profiles never carry cache markers
 	if order == "" {
 		order = "random"
 	}
@@ -207,7 +206,6 @@ func (s *TagService) profilePair(ctx context.Context, tag, with string, sample i
 	// Infos already resolved renamed_to on the 0-post rows (the same
 	// dead-end enhancement Info applies), so the row embeds as-is.
 	profile.TagInfo = *tagRow
-	profile.TagInfo.CacheMarks = CacheMarks{} // profiles never carry cache markers
 	profile.With = &ProfileWith{Tag: withRow.Name, PostCount: withRow.PostCount}
 	profile.Order = "recent"
 	if tagRow.PostCount == 0 || withRow.PostCount == 0 {
@@ -237,7 +235,7 @@ func (s *TagService) fetchProfilePosts(ctx context.Context, query string, limit 
 		return nil, err
 	}
 	var posts []danbooruPost
-	if err := json.Unmarshal(res.Body, &posts); err != nil {
+	if err := json.Unmarshal(res, &posts); err != nil {
 		return nil, fmt.Errorf("failed to parse posts: %w", err)
 	}
 	return posts, nil

@@ -9,9 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
-	"danbooru-tag-mcp/internal/cache"
 	"danbooru-tag-mcp/internal/vocab"
 )
 
@@ -80,38 +78,16 @@ type Post struct {
 }
 
 // TagFetcher decouples the service from the concrete api.Client for
-// mock-based unit tests. Fetch methods return cache.Result so response
-// provenance (stale fallback) can flow to the caller alongside the raw
-// Danbooru JSON body.
+// mock-based unit tests. Fetch methods return the raw Danbooru JSON body.
 type TagFetcher interface {
 	// category is a Danbooru category id filter; -1 means no filter.
-	FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) (cache.Result, error)
-	FetchTagExact(ctx context.Context, name string) (cache.Result, error)
-	FetchTagsByNames(ctx context.Context, names []string) (cache.Result, error)
-	FetchRelated(ctx context.Context, tag string) (cache.Result, error)
-	FetchAlias(ctx context.Context, name string) (cache.Result, error)
-	FetchWiki(ctx context.Context, title, otherNames string, limit int) (cache.Result, error)
-	FetchPosts(ctx context.Context, tags string, limit int) (cache.Result, error)
-}
-
-// CacheMarks carries expired-cache provenance on a cacheable response. Both
-// fields stay zero — and out of the JSON — on every network path and every
-// fresh cache hit; they are set only when the owning fetch fell back to an
-// expired cache entry after retries were exhausted. CachedAt is that
-// entry's storage time (RFC3339). Posts and profile responses never carry
-// marks: posts are never cached, and profiles pin no cache fields.
-type CacheMarks struct {
-	Stale    bool   `json:"stale,omitempty"`
-	CachedAt string `json:"cached_at,omitempty"`
-}
-
-// marksFrom converts a fetch result's provenance into response marks:
-// empty unless the fetch served a stale entry.
-func marksFrom(res cache.Result) CacheMarks {
-	if !res.Stale {
-		return CacheMarks{}
-	}
-	return CacheMarks{Stale: true, CachedAt: res.CachedAt.Format(time.RFC3339)}
+	FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error)
+	FetchTagExact(ctx context.Context, name string) ([]byte, error)
+	FetchTagsByNames(ctx context.Context, names []string) ([]byte, error)
+	FetchRelated(ctx context.Context, tag string) ([]byte, error)
+	FetchAlias(ctx context.Context, name string) ([]byte, error)
+	FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error)
+	FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error)
 }
 
 // WD14 status values: how a name stands relative to current Danbooru and
@@ -132,14 +108,11 @@ type WD14Status struct {
 
 // TagInfo is get_tag_info's payload: the live tag row (embedded, so the
 // found-response shape stays flat) plus the WD14 verdict, and RenamedTo on
-// 0-post placeholder rows that an active alias points elsewhere. When
-// embedded in a TagProfile the cache marks are cleared: profiles carry no
-// cache fields by contract.
+// 0-post placeholder rows that an active alias points elsewhere.
 type TagInfo struct {
 	Tag
 	WD14      WD14Status `json:"wd14"`
 	RenamedTo string     `json:"renamed_to,omitempty"`
-	CacheMarks
 }
 
 // SearchResult is search_tags' payload: the matched tag rows plus the
@@ -148,26 +121,22 @@ type TagInfo struct {
 type SearchResult struct {
 	Tags     []Tag       `json:"tags"`
 	WD14Hits []vocab.Hit `json:"wd14_hits,omitempty"`
-	CacheMarks
 }
 
 // RelatedResult is get_related_tags' payload: the co-occurring tags.
 type RelatedResult struct {
 	Related []RelatedTag `json:"related"`
-	CacheMarks
 }
 
 // AliasResult is get_tag_alias' payload: Alias is null when the input is
 // already canonical.
 type AliasResult struct {
 	Alias *TagAlias `json:"alias"`
-	CacheMarks
 }
 
 // WikiResult is get_tag_wiki' payload: the distilled wiki pages.
 type WikiResult struct {
 	Pages []WikiPage `json:"wiki_pages"`
-	CacheMarks
 }
 
 // NotFoundError reports that current Danbooru carries no exact match for
@@ -223,7 +192,7 @@ func (s *TagService) Search(ctx context.Context, query string, limit, category, 
 	}
 
 	var tags []Tag
-	if err := json.Unmarshal(res.Body, &tags); err != nil {
+	if err := json.Unmarshal(res, &tags); err != nil {
 		return nil, fmt.Errorf("failed to parse tags response: %w", err)
 	}
 	if minPosts > 0 {
@@ -235,7 +204,7 @@ func (s *TagService) Search(ctx context.Context, query string, limit, category, 
 		}
 		tags = kept
 	}
-	return &SearchResult{Tags: tags, CacheMarks: marksFrom(res)}, nil
+	return &SearchResult{Tags: tags}, nil
 }
 
 // Info resolves a name to its exact tag row plus the WD14 verdict. A
@@ -249,7 +218,7 @@ func (s *TagService) Info(ctx context.Context, name string) (*TagInfo, error) {
 	}
 
 	var tags []Tag
-	if err := json.Unmarshal(res.Body, &tags); err != nil {
+	if err := json.Unmarshal(res, &tags); err != nil {
 		return nil, fmt.Errorf("failed to parse tag info response: %w", err)
 	}
 	if len(tags) == 0 {
@@ -258,7 +227,7 @@ func (s *TagService) Info(ctx context.Context, name string) (*TagInfo, error) {
 	// A returned row with 0 posts is a placeholder (renamed-away antecedent,
 	// unused tag — verified live: barefoot_sandals, gold_footwear and even
 	// painted_toenails all return rows). It does not make the name live.
-	info := &TagInfo{Tag: tags[0], WD14: s.wd14Status(cleanName, tags[0].PostCount > 0), CacheMarks: marksFrom(res)}
+	info := &TagInfo{Tag: tags[0], WD14: s.wd14Status(cleanName, tags[0].PostCount > 0)}
 	s.resolveRenamedTo(ctx, info)
 	return info, nil
 }
@@ -342,7 +311,7 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) (*Relat
 	}
 
 	var resp danbooruRelatedResponse
-	if err := json.Unmarshal(res.Body, &resp); err != nil {
+	if err := json.Unmarshal(res, &resp); err != nil {
 		return nil, fmt.Errorf("failed to parse related tags: %w", err)
 	}
 
@@ -370,7 +339,7 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) (*Relat
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
-	return &RelatedResult{Related: results, CacheMarks: marksFrom(res)}, nil
+	return &RelatedResult{Related: results}, nil
 }
 
 // Alias resolves a user-typed alias to its canonical Danbooru tag via
@@ -384,10 +353,10 @@ func (s *TagService) Alias(ctx context.Context, name string) (*AliasResult, erro
 	}
 
 	var aliases []danbooruAliasResponse
-	if err := json.Unmarshal(res.Body, &aliases); err != nil {
+	if err := json.Unmarshal(res, &aliases); err != nil {
 		return nil, fmt.Errorf("failed to parse tag alias response: %w", err)
 	}
-	result := &AliasResult{CacheMarks: marksFrom(res)}
+	result := &AliasResult{}
 	if len(aliases) > 0 {
 		result.Alias = &TagAlias{Antecedent: aliases[0].AntecedentName, Consequent: aliases[0].ConsequentName}
 	}
@@ -425,7 +394,7 @@ func (s *TagService) Wiki(ctx context.Context, title, otherNames string, limit i
 	}
 
 	var pages []danbooruWikiResponse
-	if err := json.Unmarshal(res.Body, &pages); err != nil {
+	if err := json.Unmarshal(res, &pages); err != nil {
 		return nil, fmt.Errorf("failed to parse wiki response: %w", err)
 	}
 
@@ -437,7 +406,7 @@ func (s *TagService) Wiki(ctx context.Context, title, otherNames string, limit i
 		}
 		results = append(results, extractWikiPage(p.Title, p.Body, other, includeDescription))
 	}
-	return &WikiResult{Pages: results, CacheMarks: marksFrom(res)}, nil
+	return &WikiResult{Pages: results}, nil
 }
 
 // Wiki extraction caps: bounded output even for the longest bodies
@@ -880,7 +849,7 @@ func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, ta
 	}
 
 	var rawPosts []danbooruPost
-	if err := json.Unmarshal(res.Body, &rawPosts); err != nil {
+	if err := json.Unmarshal(res, &rawPosts); err != nil {
 		return nil, fmt.Errorf("failed to parse posts: %w", err)
 	}
 	var exclude map[string]bool

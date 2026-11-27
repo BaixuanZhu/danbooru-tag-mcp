@@ -3,13 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -17,7 +17,14 @@ import (
 	"testing"
 	"time"
 
-	"danbooru-tag-mcp/internal/cache"
+	"danbooru-tag-mcp/internal/app"
+	"danbooru-tag-mcp/internal/service"
+	"danbooru-tag-mcp/internal/tools"
+	"danbooru-tag-mcp/internal/vocab"
+
+	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 func newTestClient(serverURL string) *Client {
@@ -33,28 +40,6 @@ func newFastTestClient(serverURL string) *Client {
 	cli := newTestClient(serverURL)
 	cli.backoffs = []time.Duration{0, 0}
 	return cli
-}
-
-// newCachedTestClient is a fast client with the cache rooted at cacheDir.
-func newCachedTestClient(t *testing.T, serverURL, cacheDir string) *Client {
-	t.Helper()
-	cli := newFastTestClient(serverURL)
-	WithCache(cacheDir)(cli)
-	return cli
-}
-
-// countingServer serves body on path and counts requests via hits.
-func countingServer(t *testing.T, path, body string, hits *int32) *httptest.Server {
-	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != path {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		atomic.AddInt32(hits, 1)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(body))
-	}))
 }
 
 func TestGet_InjectsAuthParams(t *testing.T) {
@@ -231,12 +216,12 @@ func TestGet_Retries5xxThenSucceeds(t *testing.T) {
 	defer srv.Close()
 
 	cli := newFastTestClient(srv.URL)
-	res, err := cli.Get(context.Background(), "/test", nil)
+	body, err := cli.Get(context.Background(), "/test", nil)
 	if err != nil {
 		t.Fatalf("expected the retry to recover, got: %v", err)
 	}
-	if string(res.Body) != "ok" {
-		t.Errorf("unexpected body: %q", res.Body)
+	if string(body) != "ok" {
+		t.Errorf("unexpected body: %q", body)
 	}
 	if n := atomic.LoadInt32(&hits); n != 2 {
 		t.Errorf("expected 2 requests (1 fail + 1 retry), got %d", n)
@@ -448,520 +433,6 @@ func TestNewClient_ReqGapResolution(t *testing.T) {
 				t.Errorf("reqGap: got %v want %v", got, tc.want)
 			}
 		})
-	}
-}
-
-// --- Step R1 core: response cache with stale fallback ---
-
-func TestDefaultCacheTTLs_Pinned(t *testing.T) {
-	for class, want := range map[string]time.Duration{
-		"/related_tag.json": 30 * 24 * time.Hour,
-		"/wiki_pages.json":  7 * 24 * time.Hour,
-		"/tag_aliases.json": 7 * 24 * time.Hour,
-		"/tags.json":        24 * time.Hour,
-		tagsExactClass:      7 * 24 * time.Hour,
-	} {
-		if got := defaultCacheTTLs[class]; got != want {
-			t.Errorf("TTL for %s: got %v want %v", class, got, want)
-		}
-	}
-	if _, ok := defaultCacheTTLs["/posts.json"]; ok {
-		t.Error("/posts.json must never have a TTL entry")
-	}
-}
-
-func TestTtlClass_TagsQueryShape(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		path   string
-		params url.Values
-		want   string
-	}{
-		{"exact name", "/tags.json", url.Values{"search[name]": []string{"arm_up"}}, tagsExactClass},
-		{"exact batch", "/tags.json", url.Values{"search[name_normalize]": []string{"arm_up,1girl"}}, tagsExactClass},
-		{"substring search", "/tags.json", url.Values{"search[name_matches]": []string{"*arm*"}}, "/tags.json"},
-		{"no name search key", "/tags.json", url.Values{"limit": []string{"10"}}, "/tags.json"},
-		{"exact key on another path stays per-path", "/wiki_pages.json", url.Values{"search[title]": []string{"arm_up"}}, "/wiki_pages.json"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := ttlClass(tc.path, tc.params); got != tc.want {
-				t.Errorf("ttlClass(%s, %v): got %q want %q", tc.path, tc.params, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestGet_CacheFreshHitIsTransparent(t *testing.T) {
-	var hits int32
-	body := `[{"id":1,"name":"arm_up"}]`
-	srv := countingServer(t, "/tags.json", body, &hits)
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	q := url.Values{"search[name]": []string{"arm_up"}}
-
-	res1, err := cli.Get(context.Background(), "/tags.json", q)
-	if err != nil {
-		t.Fatalf("first Get: %v", err)
-	}
-	res2, err := cli.Get(context.Background(), "/tags.json", q)
-	if err != nil {
-		t.Fatalf("second Get: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
-		t.Errorf("fresh hit must not hit the network: expected 1 request, got %d", n)
-	}
-	if string(res2.Body) != string(res1.Body) || string(res2.Body) != body {
-		t.Errorf("cached body must be byte-identical: got %q want %q", res2.Body, body)
-	}
-	if res2.Stale || !res2.CachedAt.IsZero() {
-		t.Errorf("fresh hit must carry no markers: Stale=%v CachedAt=%v", res2.Stale, res2.CachedAt)
-	}
-}
-
-func TestGet_CacheHitSkipsRateLimitWait(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/tags.json", `[{"id":1}]`, &hits)
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	q := url.Values{"search[name]": []string{"arm_up"}}
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("prime the cache: %v", err)
-	}
-	// A network path would now stall for an hour in the rate limiter, and
-	// a canceled context would abort inside it. Only the pre-rate-limit
-	// cache short-circuit can answer — deterministic, no timing.
-	cli.reqGap = time.Hour
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	res, err := cli.Get(ctx, "/tags.json", q)
-	if err != nil {
-		t.Fatalf("canceled ctx must still be served from the cache: %v", err)
-	}
-	if string(res.Body) != `[{"id":1}]` {
-		t.Errorf("unexpected cached body: %q", res.Body)
-	}
-}
-
-func TestGet_CacheKeyIgnoresCredentials(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/tags.json", "shared", &hits)
-	defer srv.Close()
-
-	dir := t.TempDir()
-	alice := NewClient(WithBaseURL(srv.URL), WithReqGap(0), WithCache(dir), WithCredentials("alice", "k1"))
-	bob := NewClient(WithBaseURL(srv.URL), WithReqGap(0), WithCache(dir), WithCredentials("bob", "k2"))
-	q := url.Values{"search[name]": []string{"arm_up"}}
-
-	if _, err := alice.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("alice Get: %v", err)
-	}
-	res, err := bob.Get(context.Background(), "/tags.json", q)
-	if err != nil {
-		t.Fatalf("bob Get: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
-		t.Errorf("credentials must not split the cache key: expected 1 request, got %d", n)
-	}
-	if string(res.Body) != "shared" {
-		t.Errorf("bob must see alice's cached body, got %q", res.Body)
-	}
-}
-
-func TestGet_CacheTTLExpiryRefetches(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/tags.json", `[{"id":1}]`, &hits)
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs[tagsExactClass] = 20 * time.Millisecond
-	q := url.Values{"search[name]": []string{"arm_up"}}
-
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("first Get: %v", err)
-	}
-	time.Sleep(40 * time.Millisecond) // entry expires
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("second Get: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("expired entry must refetch: expected 2 requests, got %d", n)
-	}
-	// The refetch re-cached the entry, so the clock restarted.
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("third Get: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("re-cached entry must be served fresh: expected 2 requests, got %d", n)
-	}
-}
-
-func TestGet_TagsExactOutlivesSearchTTL(t *testing.T) {
-	// The shape split in the live path: an exact-name entry stays fresh past
-	// the substring-search TTL, and each class expires on its own clock.
-	var hits int32
-	srv := countingServer(t, "/tags.json", `[{"id":1}]`, &hits)
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs["/tags.json"] = 40 * time.Millisecond // exact class keeps 7d
-	qExact := url.Values{"search[name]": []string{"arm_up"}}
-	qSearch := url.Values{"search[name_matches]": []string{"*arm*"}}
-
-	if _, err := cli.Get(context.Background(), "/tags.json", qExact); err != nil {
-		t.Fatalf("prime exact: %v", err)
-	}
-	if _, err := cli.Get(context.Background(), "/tags.json", qSearch); err != nil {
-		t.Fatalf("prime search: %v", err)
-	}
-	time.Sleep(80 * time.Millisecond) // past the search TTL, inside the exact one
-
-	if _, err := cli.Get(context.Background(), "/tags.json", qExact); err != nil {
-		t.Fatalf("exact after the search TTL: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("exact entry must outlive the search TTL: expected 2 requests so far, got %d", n)
-	}
-	if _, err := cli.Get(context.Background(), "/tags.json", qSearch); err != nil {
-		t.Fatalf("search after its own TTL: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 3 {
-		t.Errorf("search entry must expire on its own TTL: expected 3 requests, got %d", n)
-	}
-}
-
-func TestGet_PostsNeverCached(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/posts.json", `[{"id":1}]`, &hits)
-	defer srv.Close()
-
-	dir := t.TempDir()
-	cli := newCachedTestClient(t, srv.URL, dir)
-	q := url.Values{"tags": []string{"arm_up"}}
-	for i := 0; i < 2; i++ {
-		if _, err := cli.Get(context.Background(), "/posts.json", q); err != nil {
-			t.Fatalf("Get %d: %v", i+1, err)
-		}
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("posts must always go to the network: expected 2 requests, got %d", n)
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, "v1"))
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("/posts.json must never write a cache entry, found %d files", len(entries))
-	}
-}
-
-func TestGet_EmptyArrayBodyNotCached(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/tags.json", " [] ", &hits)
-	defer srv.Close()
-
-	dir := t.TempDir()
-	cli := newCachedTestClient(t, srv.URL, dir)
-	q := url.Values{"search[name]": []string{"no_such_tag"}}
-	for i := 0; i < 2; i++ {
-		if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-			t.Fatalf("Get %d: %v", i+1, err)
-		}
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("dead-end searches must refetch: expected 2 requests, got %d", n)
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, "v1"))
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("empty-array bodies must never be cached, found %d files", len(entries))
-	}
-}
-
-func TestGet_StaleServeAfterRetriesExhausted(t *testing.T) {
-	var hits int32
-	var down atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		if r.URL.Path == "/tags.json" {
-			if down.Load() {
-				w.Header().Set("Content-Type", "text/html")
-				w.WriteHeader(http.StatusServiceUnavailable)
-				w.Write([]byte("<html><head><title>Downbooru</title></head></html>"))
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`[{"id":1,"name":"arm_up"}]`))
-			return
-		}
-		w.Header().Set("Content-Type", "text/html")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte("<html><head><title>Downbooru</title></head></html>"))
-	}))
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs[tagsExactClass] = 20 * time.Millisecond
-	q := url.Values{"search[name]": []string{"arm_up"}}
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("prime the cache: %v", err)
-	}
-	time.Sleep(40 * time.Millisecond) // entry expires
-	down.Store(true)
-
-	res, err := cli.Get(context.Background(), "/tags.json", q)
-	if err != nil {
-		t.Fatalf("expired entry must be served when retries exhaust, got: %v", err)
-	}
-	if !res.Stale {
-		t.Error("fallback result must be marked Stale")
-	}
-	if res.CachedAt.IsZero() {
-		t.Error("fallback result must carry CachedAt")
-	}
-	if string(res.Body) != `[{"id":1,"name":"arm_up"}]` {
-		t.Errorf("stale body must be the cached one, got %q", res.Body)
-	}
-	// 1 priming request + 3 attempts (1 + 2 retries) during the outage.
-	if n := atomic.LoadInt32(&hits); n != 4 {
-		t.Errorf("expected retries before the stale fallback (4 requests total), got %d", n)
-	}
-
-	// No cached entry for this path: the shrunken error is the answer.
-	_, err = cli.Get(context.Background(), "/tag_aliases.json", url.Values{"search[antecedent_name]": []string{"x"}})
-	if err == nil || err.Error() != "danbooru 503 (Downbooru)" {
-		t.Fatalf("cache miss during outage must yield the shrunken error, got: %v", err)
-	}
-}
-
-func TestGet_NonRetryableErrorDoesNotStaleServe(t *testing.T) {
-	// A 4xx is a definitive answer from a reachable upstream (bad query,
-	// revoked credentials): an expired entry must NOT shadow it — only
-	// unreachable-upstream failures fall back to stale data.
-	var hits int32
-	var reject atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		if reject.Load() {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnprocessableEntity)
-			w.Write([]byte(`{"error":"query rejected"}`))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[{"id":1,"name":"arm_up"}]`))
-	}))
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.cacheTTLs[tagsExactClass] = 20 * time.Millisecond
-	q := url.Values{"search[name]": []string{"arm_up"}}
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("prime the cache: %v", err)
-	}
-	time.Sleep(40 * time.Millisecond) // entry expires
-	reject.Store(true)
-
-	res, err := cli.Get(context.Background(), "/tags.json", q)
-	if err == nil || !strings.Contains(err.Error(), "danbooru 422") {
-		t.Fatalf("the 4xx must surface, got result=%+v err=%v", res, err)
-	}
-	if res.Stale {
-		t.Error("a 4xx must never be answered with stale cache data")
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("4xx must not retry: expected 2 requests total, got %d", n)
-	}
-}
-
-func TestGet_StoreFailureFallsThroughToNetwork(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/tags.json", `[{"id":1}]`, &hits)
-	defer srv.Close()
-
-	// A regular file where the cache directory should be: Open fails, the
-	// client warns and keeps serving from the network.
-	blocker := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
-		t.Fatalf("plant the blocker: %v", err)
-	}
-	cli := NewClient(WithBaseURL(srv.URL), WithReqGap(0), WithCache(blocker))
-	cli.backoffs = []time.Duration{0, 0}
-	if cli.store != nil {
-		t.Fatal("WithCache must disable the store when Open fails")
-	}
-	q := url.Values{"search[name]": []string{"arm_up"}}
-	for i := 0; i < 2; i++ {
-		res, err := cli.Get(context.Background(), "/tags.json", q)
-		if err != nil {
-			t.Fatalf("Get %d must succeed without a cache: %v", i+1, err)
-		}
-		if string(res.Body) != `[{"id":1}]` {
-			t.Errorf("unexpected body: %q", res.Body)
-		}
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("cache-less client must always fetch: expected 2 requests, got %d", n)
-	}
-}
-
-// --- Step R1 refresh control ---
-
-func TestGet_RefreshBypassesFreshHitAndBumpsStoredAt(t *testing.T) {
-	var hits int32
-	srv := countingServer(t, "/tags.json", `[{"id":1}]`, &hits)
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	q := url.Values{"search[name]": []string{"arm_up"}}
-	key := "/tags.json?" + q.Encode()
-
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("prime the cache: %v", err)
-	}
-	_, at1, ok := cli.store.Get(key)
-	if !ok {
-		t.Fatal("primed entry missing")
-	}
-
-	// A plain second call is a fresh hit: no network, no markers.
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("plain second Get: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 1 {
-		t.Errorf("fresh hit must stay off the network: expected 1 request, got %d", n)
-	}
-
-	// The refresh request bypasses the fresh hit and rewrites the entry, so
-	// the TTL clock (stored_at) restarts.
-	time.Sleep(20 * time.Millisecond) // separate the two stored_at timestamps
-	res, err := cli.Get(cache.WithRefresh(context.Background()), "/tags.json", q)
-	if err != nil {
-		t.Fatalf("refresh Get: %v", err)
-	}
-	if res.Stale || !res.CachedAt.IsZero() {
-		t.Errorf("a served refresh must carry no markers: Stale=%v CachedAt=%v", res.Stale, res.CachedAt)
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("refresh must bypass the fresh hit: expected 2 requests, got %d", n)
-	}
-	_, at2, ok := cli.store.Get(key)
-	if !ok {
-		t.Fatal("refreshed entry missing")
-	}
-	if !at2.After(at1) {
-		t.Errorf("refresh must restart the TTL clock: stored_at %v not after %v", at2, at1)
-	}
-
-	// The refreshed entry is fresh again: a plain call stays off the network.
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("post-refresh plain Get: %v", err)
-	}
-	if n := atomic.LoadInt32(&hits); n != 2 {
-		t.Errorf("refreshed entry must serve fresh: expected 2 requests, got %d", n)
-	}
-}
-
-func TestGet_RefreshFailureStillStaleServes(t *testing.T) {
-	var hits int32
-	var down atomic.Bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&hits, 1)
-		if down.Load() {
-			w.Header().Set("Content-Type", "text/html")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			w.Write([]byte("<html><head><title>Downbooru</title></head></html>"))
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`[{"id":1,"name":"arm_up"}]`))
-	}))
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	q := url.Values{"search[name]": []string{"arm_up"}}
-	if _, err := cli.Get(context.Background(), "/tags.json", q); err != nil {
-		t.Fatalf("prime the cache: %v", err)
-	}
-	down.Store(true)
-
-	// The entry is still FRESH, but a refresh that exhausts its retries must
-	// still fall back to it, marked stale.
-	res, err := cli.Get(cache.WithRefresh(context.Background()), "/tags.json", q)
-	if err != nil {
-		t.Fatalf("failed refresh must stale-serve, got: %v", err)
-	}
-	if !res.Stale || res.CachedAt.IsZero() {
-		t.Errorf("fallback must be marked stale with cached_at: Stale=%v CachedAt=%v", res.Stale, res.CachedAt)
-	}
-	if string(res.Body) != `[{"id":1,"name":"arm_up"}]` {
-		t.Errorf("stale body must be the cached one, got %q", res.Body)
-	}
-	// 1 priming request + 3 attempts (1 + 2 retries) during the outage.
-	if n := atomic.LoadInt32(&hits); n != 4 {
-		t.Errorf("expected retries before the stale fallback (4 requests total), got %d", n)
-	}
-}
-
-// --- Step 9: Get lock granularity ---
-
-func TestGet_CacheHitNotBlockedByInFlightRetry(t *testing.T) {
-	// Regression pin for the lock-granularity defect: Get once held c.mu
-	// across the whole call, so a 1ms cache hit queued behind a caller
-	// stuck in its retry cycle (~94s worst case in production). Now the
-	// cache read runs before any lock is taken, so B must answer while A
-	// is still sleeping between retries.
-	hitCh := make(chan struct{}, 8)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		select {
-		case hitCh <- struct{}{}:
-		default:
-		}
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("down"))
-	}))
-	defer srv.Close()
-
-	cli := newCachedTestClient(t, srv.URL, t.TempDir())
-	cli.backoffs = []time.Duration{250 * time.Millisecond, 250 * time.Millisecond}
-
-	// B's key is already cached and fresh (planted straight into the
-	// Store; the exact /tags.json TTL is 7d). A's key has no entry.
-	qMiss := url.Values{"search[name]": []string{"miss_key"}}
-	qHit := url.Values{"search[name]": []string{"hit_key"}}
-	cached := `[{"id":2,"name":"hit_key"}]`
-	if err := cli.store.Put("/tags.json?"+qHit.Encode(), []byte(cached)); err != nil {
-		t.Fatalf("plant the cached entry: %v", err)
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := cli.Get(context.Background(), "/tags.json", qMiss)
-		done <- err
-	}()
-	<-hitCh // A's first attempt reached the server; it now sleeps in its 250ms backoff
-
-	bStart := time.Now()
-	res, err := cli.Get(context.Background(), "/tags.json", qHit)
-	bElapsed := time.Since(bStart)
-	if err != nil {
-		t.Fatalf("cache hit must not fail while a retry cycle is in flight: %v", err)
-	}
-	if string(res.Body) != cached || res.Stale {
-		t.Errorf("unexpected cache-hit result: body=%q stale=%v", res.Body, res.Stale)
-	}
-	// A's retry cycle spans ~500ms of backoffs; B is a file read. 200ms
-	// leaves generous CI margin while still proving B never queued.
-	if bElapsed > 200*time.Millisecond {
-		t.Errorf("cache hit must not queue behind the in-flight retry cycle: took %v", bElapsed)
-	}
-
-	// A still exhausts its retries and surfaces the 500.
-	if err := <-done; err == nil || !strings.Contains(err.Error(), "danbooru 500") {
-		t.Fatalf("in-flight caller must end with the 500 after retries, got: %v", err)
 	}
 }
 
@@ -1183,5 +654,242 @@ func TestFetchPosts_DoesNotAddRatingFilter(t *testing.T) {
 	}
 	if strings.Contains(gotTags, "rating:") {
 		t.Errorf("api layer must NOT inject rating filter, got tags: %s", gotTags)
+	}
+}
+
+// TestGet_NonRetryable4xxReturnsAfterOneAttempt pins the invariant the old
+// stale-serve test carried: a definitive 4xx is an answer from a reachable
+// upstream (bad query, revoked credentials), so it surfaces after exactly
+// one attempt with its shrunken error text — no retry, no masking.
+func TestGet_NonRetryable4xxReturnsAfterOneAttempt(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.Write([]byte(`{"error":"query rejected"}`))
+	}))
+	defer srv.Close()
+
+	cli := newFastTestClient(srv.URL)
+	_, err := cli.Get(context.Background(), "/tags.json", url.Values{"search[name]": {"arm_up"}})
+	if err == nil {
+		t.Fatal("expected the 4xx to surface")
+	}
+	if !strings.Contains(err.Error(), "danbooru 422") {
+		t.Errorf("expected the shrunken danbooru 422 error, got: %v", err)
+	}
+	if errors.Is(err, app.ErrUpstreamUnavailable) {
+		t.Error("a 4xx is definitive and must not carry the upstream-unavailable marker")
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Errorf("a 4xx must not retry: expected 1 attempt, got %d", n)
+	}
+}
+
+// TestGet_UpstreamFailuresAreMarked pins the marker contract: 5xx, 429 and
+// refused connections (each after the retry budget is spent) satisfy
+// errors.Is(err, app.ErrUpstreamUnavailable), while a definitive 4xx and a
+// caller cancellation do not.
+func TestGet_UpstreamFailuresAreMarked(t *testing.T) {
+	t.Run("5xx after retries", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte("still down"))
+		}))
+		defer srv.Close()
+
+		cli := newFastTestClient(srv.URL)
+		_, err := cli.Get(context.Background(), "/test", nil)
+		if err == nil || !strings.Contains(err.Error(), "danbooru 500") {
+			t.Fatalf("expected the shrunken 500 error, got: %v", err)
+		}
+		if !errors.Is(err, app.ErrUpstreamUnavailable) {
+			t.Errorf("retries-exhausted 5xx must carry the upstream marker, got: %v", err)
+		}
+	})
+
+	t.Run("429 after retries", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}))
+		defer srv.Close()
+
+		// Zeroed backoffs: only the Retry-After header can delay, keeping
+		// the marker assertion at ~1s.
+		cli := newFastTestClient(srv.URL)
+		_, err := cli.Get(context.Background(), "/test", nil)
+		if err == nil || !strings.Contains(err.Error(), "rate limited") {
+			t.Fatalf("expected the rate-limited error, got: %v", err)
+		}
+		if !errors.Is(err, app.ErrUpstreamUnavailable) {
+			t.Errorf("retries-exhausted 429 must carry the upstream marker, got: %v", err)
+		}
+	})
+
+	t.Run("refused connection", func(t *testing.T) {
+		// A closed port: the OS refuses instantly, so no sleeps are needed.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		addr := ln.Addr().String()
+		ln.Close()
+
+		cli := newTestClient("http://" + addr)
+		cli.backoffs = []time.Duration{0, 0}
+		_, err = cli.Get(context.Background(), "/test", nil)
+		if err == nil {
+			t.Fatal("expected a transport error")
+		}
+		if !errors.Is(err, app.ErrUpstreamUnavailable) {
+			t.Errorf("a refused connection must carry the upstream marker, got: %v", err)
+		}
+	})
+
+	t.Run("4xx unmarked", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte("resource not found"))
+		}))
+		defer srv.Close()
+
+		cli := newFastTestClient(srv.URL)
+		_, err := cli.Get(context.Background(), "/test", nil)
+		if err == nil || !strings.Contains(err.Error(), "danbooru 404") {
+			t.Fatalf("expected the shrunken 404 error, got: %v", err)
+		}
+		if errors.Is(err, app.ErrUpstreamUnavailable) {
+			t.Errorf("a definitive 4xx must not carry the upstream marker, got: %v", err)
+		}
+	})
+
+	t.Run("cancellation unmarked", func(t *testing.T) {
+		var hits int32
+		var once sync.Once
+		started := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&hits, 1)
+			once.Do(func() { close(started) })
+			<-r.Context().Done() // hold the request until the client gives up
+		}))
+		defer srv.Close()
+
+		cli := newFastTestClient(srv.URL)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := cli.Get(ctx, "/test", nil)
+		<-started
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context deadline error, got: %v", err)
+		}
+		if errors.Is(err, app.ErrUpstreamUnavailable) {
+			t.Errorf("a caller cancellation must not carry the upstream marker, got: %v", err)
+		}
+	})
+}
+
+// TestChain_UpstreamFailureReachesTheClient runs the whole api -> service ->
+// tools chain against one local server: during a 503 outage the real
+// handlers return the marked upstream-unavailable result; for a genuine
+// not-found (healthy upstream, empty row list) get_tag_info still answers
+// the unmarked tag_not_found payload with its wd14 verdict.
+func TestChain_UpstreamFailureReachesTheClient(t *testing.T) {
+	var down atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if down.Load() {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte("<html><head><title>Downbooru</title></head></html>"))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	cli := newFastTestClient(srv.URL)
+	svc := service.NewTagService(cli, vocab.Default())
+	s := server.NewMCPServer("test", "0.0.0.0", server.WithToolCapabilities(true))
+	tools.Register(s, svc)
+
+	mcpCli, err := client.NewInProcessClient(s)
+	if err != nil {
+		t.Fatalf("in-process client: %v", err)
+	}
+	defer mcpCli.Close()
+	if err := mcpCli.Start(context.Background()); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{Name: "chain-test", Version: "0.0.1"}
+	if _, err := mcpCli.Initialize(context.Background(), initReq); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	call := func(name string, args map[string]any) *mcp.CallToolResult {
+		t.Helper()
+		req := mcp.CallToolRequest{}
+		req.Params.Name = name
+		req.Params.Arguments = args
+		res, err := mcpCli.CallTool(context.Background(), req)
+		if err != nil {
+			t.Fatalf("CallTool %s: %v", name, err)
+		}
+		return res
+	}
+	textOf := func(res *mcp.CallToolResult) string {
+		t.Helper()
+		if len(res.Content) != 1 {
+			t.Fatalf("expected 1 content item, got %d", len(res.Content))
+		}
+		tc, ok := res.Content[0].(mcp.TextContent)
+		if !ok {
+			t.Fatalf("expected text content, got %T", res.Content[0])
+		}
+		return tc.Text
+	}
+
+	// Outage: the marked result must reach the MCP client.
+	down.Store(true)
+	res := call("get_tag_info", map[string]any{"name": "blue_hair"})
+	if !res.IsError {
+		t.Fatalf("the outage must be flagged at the protocol level, got: %+v", res)
+	}
+	var marked map[string]string
+	if err := json.Unmarshal([]byte(textOf(res)), &marked); err != nil {
+		t.Fatalf("marked payload is not JSON: %v (%s)", err, textOf(res))
+	}
+	if marked["error"] != "upstream_unavailable" {
+		t.Errorf("error code = %q, want upstream_unavailable", marked["error"])
+	}
+	if !strings.Contains(marked["message"], "danbooru 503 (Downbooru)") ||
+		!strings.Contains(marked["message"], "All tools of this server are affected") {
+		t.Errorf("message must carry the cause and the server-wide note, got: %q", marked["message"])
+	}
+	if strings.Contains(marked["message"], "tag_not_found") {
+		t.Errorf("an upstream failure must never be reported as tag_not_found, got: %q", marked["message"])
+	}
+
+	// Healthy upstream, absent name: the unmarked not-found payload survives.
+	down.Store(false)
+	res = call("get_tag_info", map[string]any{"name": "gold_footwear"})
+	if res.IsError {
+		t.Fatalf("a genuine not-found must stay an unmarked result, got IsError: %+v", res)
+	}
+	var nf map[string]any
+	if err := json.Unmarshal([]byte(textOf(res)), &nf); err != nil {
+		t.Fatalf("not-found payload is not JSON: %v (%s)", err, textOf(res))
+	}
+	if nf["error"] != "tag_not_found" {
+		t.Errorf("error code = %v, want tag_not_found", nf["error"])
+	}
+	if nf["message"] != "tag not found: gold_footwear" {
+		t.Errorf("message = %v, want the NotFoundError text", nf["message"])
+	}
+	wd14, ok := nf["wd14"].(map[string]any)
+	if !ok || wd14["status"] != "tagger_era" {
+		t.Errorf("the wd14 verdict must ride the not-found payload, got: %v", nf["wd14"])
 	}
 }

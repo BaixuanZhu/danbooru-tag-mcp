@@ -125,8 +125,10 @@ Section "Uninstall"
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\danbooru-tag-mcp"
   DeleteRegKey HKCU "Software\danbooru-tag-mcp"
 
-  ; Per-user response cache (cached API bodies only; safe to delete).
-  ; RMDir drops the now-empty parent without touching anything else there.
+  ; Leftover response cache from 0.6.x (cached API bodies only; safe to
+  ; delete — the server no longer reads or writes it, but it should not
+  ; outlive the product). RMDir drops the now-empty parent without touching
+  ; anything else there.
   RMDir /r "$LOCALAPPDATA\danbooru-tag-mcp\cache"
   RMDir "$LOCALAPPDATA\danbooru-tag-mcp"
 

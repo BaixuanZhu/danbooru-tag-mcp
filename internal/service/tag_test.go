@@ -7,9 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
-	"danbooru-tag-mcp/internal/cache"
 	"danbooru-tag-mcp/internal/vocab"
 )
 
@@ -21,11 +19,6 @@ type mockFetcher struct {
 	aliasResp   []byte
 	wikiResp    []byte
 	postsResp   []byte
-
-	// stale makes every fetch report a stale-marked result (CachedAt
-	// = staleAt), pinning how provenance flows into response marks.
-	stale   bool
-	staleAt time.Time
 
 	aliasCalls int   // number of FetchAlias invocations
 	aliasErr   error // returned by FetchAlias instead of a body
@@ -39,48 +32,43 @@ type mockFetcher struct {
 	lastPostsLim     int
 }
 
-// result wraps a canned body with the mock's provenance settings.
-func (m *mockFetcher) result(body []byte) cache.Result {
-	return cache.Result{Body: body, Stale: m.stale, CachedAt: m.staleAt}
-}
-
-func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) (cache.Result, error) {
+func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error) {
 	m.lastTagsArg = namePattern
 	m.lastTagsCategory = category
-	return m.result(m.tagsResp), nil
+	return m.tagsResp, nil
 }
 
-func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) (cache.Result, error) {
-	return m.result(m.exactResp), nil
+func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) ([]byte, error) {
+	return m.exactResp, nil
 }
 
-func (m *mockFetcher) FetchTagsByNames(ctx context.Context, names []string) (cache.Result, error) {
+func (m *mockFetcher) FetchTagsByNames(ctx context.Context, names []string) ([]byte, error) {
 	m.lastNamesArg = names
-	return m.result(m.namesResp), nil
+	return m.namesResp, nil
 }
 
-func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) (cache.Result, error) {
-	return m.result(m.relatedResp), nil
+func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
+	return m.relatedResp, nil
 }
 
-func (m *mockFetcher) FetchAlias(ctx context.Context, name string) (cache.Result, error) {
+func (m *mockFetcher) FetchAlias(ctx context.Context, name string) ([]byte, error) {
 	m.aliasCalls++
 	if m.aliasErr != nil {
-		return cache.Result{}, m.aliasErr
+		return nil, m.aliasErr
 	}
-	return m.result(m.aliasResp), nil
+	return m.aliasResp, nil
 }
 
-func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, limit int) (cache.Result, error) {
+func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error) {
 	m.lastWikiTitle = title
 	m.lastWikiOther = otherNames
-	return m.result(m.wikiResp), nil
+	return m.wikiResp, nil
 }
 
-func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) (cache.Result, error) {
+func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
 	m.lastPostsArg = tags
 	m.lastPostsLim = limit
-	return m.result(m.postsResp), nil
+	return m.postsResp, nil
 }
 
 func TestSearch_ParsesTags(t *testing.T) {
@@ -617,64 +605,6 @@ func TestSearchPosts_MetatagCounting(t *testing.T) {
 	}
 	if mock.lastPostsArg != "" {
 		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
-	}
-}
-
-// --- Step R1 visible half: stale marks on cacheable responses ---
-
-func TestCacheableResponses_StaleMarksMarshaled(t *testing.T) {
-	// One canned body per path, live rows so no alias fetch intervenes.
-	bodies := func(m *mockFetcher) {
-		m.tagsResp = []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":1200000}]`)
-		m.exactResp = []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":1200000}]`)
-		m.namesResp = []byte(`[{"id":1,"name":"blue_hair","category":0,"post_count":1200000}]`)
-		m.relatedResp = []byte(`{"query":"blue_hair","related_tags":[]}`)
-		m.aliasResp = []byte(`[{"antecedent_name":"sailor_suit","consequent_name":"sailor","status":"active"}]`)
-		m.wikiResp = []byte(`[{"title":"arm_up","body":"Body.","other_names":[],"is_deleted":false}]`)
-	}
-	cases := []struct {
-		name string
-		call func(svc *TagService) (any, error)
-	}{
-		{"search_tags", func(svc *TagService) (any, error) { return svc.Search(context.Background(), "blue hair", 10, -1, 0) }},
-		{"get_tag_info", func(svc *TagService) (any, error) { return svc.Info(context.Background(), "blue_hair") }},
-		{"get_tags_info", func(svc *TagService) (any, error) { return svc.Infos(context.Background(), []string{"blue_hair"}) }},
-		{"get_related_tags", func(svc *TagService) (any, error) { return svc.Related(context.Background(), "blue_hair", 10) }},
-		{"get_tag_alias", func(svc *TagService) (any, error) { return svc.Alias(context.Background(), "sailor_suit") }},
-		{"get_tag_wiki", func(svc *TagService) (any, error) { return svc.Wiki(context.Background(), "arm_up", "", 5, false) }},
-	}
-	at := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Fresh network/cache path: both markers absent (the transparent
-			// fresh-hit contract).
-			freshMock := &mockFetcher{}
-			bodies(freshMock)
-			got, err := tc.call(NewTagService(freshMock, nil))
-			if err != nil {
-				t.Fatalf("fresh path: %v", err)
-			}
-			raw, _ := json.Marshal(got)
-			if strings.Contains(string(raw), `"stale":`) || strings.Contains(string(raw), `"cached_at":`) {
-				t.Errorf("fresh response must omit both markers, got: %s", raw)
-			}
-
-			// Stale fallback: both markers present with the entry's storage
-			// time in RFC3339.
-			staleMock := &mockFetcher{stale: true, staleAt: at}
-			bodies(staleMock)
-			got, err = tc.call(NewTagService(staleMock, nil))
-			if err != nil {
-				t.Fatalf("stale path: %v", err)
-			}
-			raw, _ = json.Marshal(got)
-			for _, want := range []string{`"stale":true`, `"cached_at":"2026-11-01T12:00:00Z"`} {
-				if !strings.Contains(string(raw), want) {
-					t.Errorf("stale response must carry %s, got: %s", want, raw)
-				}
-			}
-		})
 	}
 }
 

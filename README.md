@@ -109,10 +109,13 @@ is documented under [Tools](#tools).
 - **Post tag lists** — each post comes back with its full tag list split by
   category, so mining a few posts shows which tags naturally go together. No
   rating filter by default; add `rating:g` for all-ages only.
-- **Built to stay installed** — an on-disk cache that serves stale answers
-  during outages, `upgrade` verifying SHA256 and swapping the binary
-  atomically, a per-user installer that registers PATH, and 1.5 s request
-  spacing (500 ms with credentials) that keeps anonymous access viable.
+- **Built to stay installed** — transient failures are retried with backoff,
+  HTML maintenance pages collapse to a one-line summary, and if Danbooru
+  still does not answer, every tool returns the same protocol-level
+  `upstream_unavailable` error so an agent stops calling; `upgrade` verifies
+  SHA256 and swaps the binary atomically, a per-user installer registers
+  PATH, and 1.5 s request spacing (500 ms with credentials) keeps anonymous
+  access viable.
 
 Tags come back as plain strings with no model coupling, so they paste
 straight into ComfyUI, Stable Diffusion or Illustrious prompt fields.
@@ -203,14 +206,14 @@ See [plugins/danbooru-tag-mcp/README.md](plugins/danbooru-tag-mcp/README.md).
 
 `query` (required, e.g. `blue hair`) · `limit` (10) · `category`
 (`general`/`artist`/`copyright`/`character`/`meta`) · `min_posts` (0, drops
-tags below the threshold) · `refresh` (false)
+tags below the threshold)
 
 When no result carries posts, the response adds `wd14_hits` — WD14 tagger
 vocabulary names containing the query.
 
 #### `get_tag_info`
 
-`name` (required, e.g. `blue_hair`) · `refresh` (false)
+`name` (required, e.g. `blue_hair`)
 
 Returns category and post count plus a `wd14` verdict: `live` (current
 Danbooru), `tagger_era` (WD14 vocabulary only, likely renamed — the canonical
@@ -219,7 +222,7 @@ alias also returns `renamed_to`.
 
 #### `get_tags_info`
 
-`names` (required, e.g. `["blue_hair","1girl"]`, max 20) · `refresh` (false)
+`names` (required, e.g. `["blue_hair","1girl"]`, max 20)
 
 Returns `found` (each with the fields of `get_tag_info`, `renamed_to`
 included on 0-post rows) and `missing` (absent from Danbooru, each still
@@ -227,20 +230,20 @@ carrying its `wd14` verdict).
 
 #### `get_related_tags`
 
-`tag` (required) · `limit` (10) · `refresh` (false)
+`tag` (required) · `limit` (10)
 
 Meta-category tags like `highres` are filtered out as noise.
 
 #### `get_tag_alias`
 
-`name` (required, e.g. `sailor_suit`) · `refresh` (false)
+`name` (required, e.g. `sailor_suit`)
 
 `null` means the input is already canonical.
 
 #### `get_tag_wiki`
 
 `title` or `other_names` (one required) · `limit` (5) · `include_description`
-(false) · `refresh` (false)
+(false)
 
 Returns `summary` (first paragraph), `intro_tags` (definition-section link
 targets), `rules` (disambiguation and usage sentences), `see_also`,
@@ -272,45 +275,14 @@ recent joint posts of a tag pair instead.
 
 </details>
 
-The six tag tools (`search_tags`, `get_tag_info`, `get_tags_info`,
-`get_related_tags`, `get_tag_alias`, `get_tag_wiki`) read from the
-[response cache](#response-cache): repeat calls inside the TTL skip the
-network round trip, and during a Danbooru outage the last cached answer is
-served instead of an error, marked with `stale: true` and `cached_at` (when
-it was stored). Their `refresh` parameter (default false) bypasses the cache
-for a single call and re-fetches live. Post search and profiles are never
-cached, so they carry no `refresh`.
-
-## Response cache
-
-Repeat queries are answered from an on-disk cache instead of hitting Danbooru
-again:
-
-| Data | TTL |
-|------|-----|
-| Related tags (`get_related_tags`) | 30 days |
-| Wiki pages, aliases | 7 days |
-| Tag searches (`search_tags`) | 24 hours |
-| Exact tag lookups (`get_tag_info`, `get_tags_info`) | 7 days |
-| Posts (`search_posts`, `get_tag_profile`) | never cached |
-
-- Location: `%LOCALAPPDATA%\danbooru-tag-mcp\cache` (per user, persists
-  across restarts, capped at 2000 entries / 64 MB with oldest-first
-  eviction). It holds only API response bodies and is safe to delete at any
-  time; the uninstaller removes it.
-- Fresh hits are served byte-identically to a network response — no markers.
-- When Danbooru is unreachable (after retries), the expired cached answer is
-  served instead of an error, marked `stale: true` plus `cached_at` (when it
-  was stored) on the affected tool response.
-- Empty results (`[]`) are never cached, so new tags appear as soon as
-  Danbooru knows them.
-- Exact tag lookups keep a tag's identity row for 7 days (like wiki pages,
-  name and category barely change), so `post_count` can trail live Danbooru
-  by up to 7 days — use `refresh: true` when a decision needs current
-  counts.
-- `refresh: true` re-fetches live and restarts the entry's TTL clock.
-- Set `DANBOORU_MCP_NO_CACHE=1` to disable the cache entirely (useful for
-  debugging).
+Every tool answers from live Danbooru on every call. When a request fails
+on a network error, a 5xx or a 429/421 and stays failed after the automatic
+retries, the tool returns the same protocol-level error (`isError: true`,
+`"error":"upstream_unavailable"`, the cause in the message) — identical on
+all eight tools, so an agent stops calling this server instead of trying
+other names and tools. `tag_not_found` appears only for a genuine not-found
+(still carrying the `wd14` verdict); validation errors, a definitive 4xx and
+caller cancellations stay plain results.
 
 ## CLI
 
@@ -336,8 +308,6 @@ danbooru-tag-mcp help       show help
   `DANBOORU_LOGIN` and `DANBOORU_API_KEY` are both set.
 - `DANBOORU_MCP_NO_BOOTSTRAP` — skip the startup PATH registration when
   non-empty.
-- `DANBOORU_MCP_NO_CACHE` — disable the [response cache](#response-cache)
-  when non-empty.
 
 ## Building from source
 

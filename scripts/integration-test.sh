@@ -8,11 +8,11 @@
 # 2024 the fixture-based unit tests stayed green — only a live call catches
 # that.
 #
-# Isolation: DANBOORU_MCP_NO_BOOTSTRAP=1 and DANBOORU_MCP_NO_CACHE=1 are
-# exported unconditionally below, so the test binary never writes the user
-# PATH or registry (even when a release-flavored exe is passed in) and every
-# tool call hits the live Danbooru API instead of a warm local cache — this
-# is the upstream-drift canary, so replayed bodies would defeat it. The only
+# Isolation: DANBOORU_MCP_NO_BOOTSTRAP=1 is exported unconditionally below,
+# so the test binary never writes the user PATH or registry (even when a
+# release-flavored exe is passed in). Every call hits the live Danbooru API
+# structurally: the response cache was removed in 0.7.0, so there is nothing
+# to serve from but the network — this is the upstream-drift canary. The only
 # file written is a temp output file, removed on exit; nothing outside the
 # repo is modified.
 #
@@ -36,10 +36,9 @@ if ! command -v python >/dev/null 2>&1; then
 fi
 
 # Hard isolation: never touch the machine PATH/registry, whatever the flavor
-# of the binary under test, and never serve a cached response — the smoke
-# test must verify the live upstream.
+# of the binary under test. The live-upstream guarantee needs no flag: the
+# response cache was removed in 0.7.0, so every call must reach the network.
 export DANBOORU_MCP_NO_BOOTSTRAP=1
-export DANBOORU_MCP_NO_CACHE=1
 
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
@@ -111,11 +110,34 @@ info = resp.get(1, {}).get('result', {}).get('serverInfo', {})
 check(info.get('name') == 'danbooru-tags', 'initialize: server reports danbooru-tags')
 
 # 2. all eight tools registered
-names = sorted(t['name'] for t in resp.get(2, {}).get('result', {}).get('tools', []))
+tools_listed = resp.get(2, {}).get('result', {}).get('tools', [])
+names = sorted(t['name'] for t in tools_listed)
 expected = sorted(['search_tags', 'get_tag_info', 'get_tags_info',
                    'get_related_tags', 'get_tag_alias', 'get_tag_wiki',
                    'search_posts', 'get_tag_profile'])
 check(names == expected, 'tools/list: exactly the eight tools')
+
+# 2b. anti-regression (the 0.7.0 cache removal): no tool may offer the old
+#     refresh parameter again — if the cache ever comes back it must not
+#     silently re-add per-call bypass flags.
+refreshed = [t['name'] for t in tools_listed
+             if 'refresh' in (t.get('inputSchema') or {}).get('properties', {})]
+check(not refreshed, 'tools/list: no tool exposes a refresh parameter%s'
+      % (' (found on %s)' % refreshed if refreshed else ''))
+
+# 2c. anti-regression (PRD R2): no response text may carry the old
+#     stale-cache markers, at any depth (the serialized JSON key patterns,
+#     so prose mentions cannot false-positive).
+def carries_marker(msg):
+    for c in (msg.get('result', {}) or {}).get('content') or []:
+        text = c.get('text') if isinstance(c, dict) else None
+        if isinstance(text, str) and ('"stale":' in text or '"cached_at":' in text):
+            return True
+    return False
+
+marker_ids = sorted(rid for rid, msg in resp.items() if carries_marker(msg))
+check(not marker_ids, 'no response carries stale/cached_at cache markers%s'
+      % (' (ids %s)' % marker_ids if marker_ids else ''))
 
 # 3. search_tags
 tags = payload(3).get('tags')

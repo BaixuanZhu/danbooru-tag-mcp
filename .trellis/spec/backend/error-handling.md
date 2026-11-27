@@ -48,21 +48,25 @@ Questions to answer:
 
 ### Common Mistake: fallback paths that fire on definitive errors
 
-**Symptom**: revoked credentials (401/403) or invalid queries (422)
-silently return stale cached data instead of surfacing the error.
+**Symptom**: revoked credentials (401/403) or invalid queries (422) are
+treated as "the answer is unavailable" — the failure that motivated this
+lesson was a stale-cache fallback replaying old data for a revoked key
+(the cache itself left with 0.7.0, but the classification rule stays).
 
-**Cause**: gating a fallback (stale cache, default value, retry) on
+**Cause**: gating a fallback (default value, retry, synthetic result) on
 `err != nil` instead of classifying the error first. Only transient
 failures (5xx, network, 429) mean "the answer is unavailable"; a 4xx is a
 definitive answer from a reachable upstream.
 
-**Fix**: wrap retryable failures in a sentinel type
-(`transientError` in `internal/api/client.go`) and gate every fallback on
-`errors.As`.
+**Fix**: wrap retryable failures in a sentinel type (today:
+`upstreamError` in `internal/api/client.go`, whose `Is` matches
+`app.ErrUpstreamUnavailable` — it descends from the old `transientError`
+sentinel that gated the removed stale fallback) and gate every fallback or
+result-mapping branch on `errors.Is` / `errors.As`, never on `err != nil`.
 
 **Prevention**: any new fallback or masking path must answer "which error
 classes may trigger me?" before review. See
-[Cache and Resilience Guidelines](./cache-and-resilience.md) §4.
+[Resilience Guidelines](./resilience.md) §4.
 
 ### Common Mistake: unbounded error bodies from upstream HTML pages
 
