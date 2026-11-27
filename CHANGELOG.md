@@ -4,7 +4,7 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
-## [0.7.0] - Unreleased
+## [0.7.0] - 2026-11-28
 
 ### Breaking
 
@@ -49,8 +49,6 @@ when tagging.
   router dispatches through, so a command cannot be accepted without being
   documented.
 
-## [0.6.1] - Unreleased
-
 ### Fixed
 
 - Transport errors no longer leak credentials: when a request fails
@@ -60,8 +58,7 @@ when tagging.
   error payloads. Error messages now keep the scheme, host and path of the
   request plus the underlying cause, but never the query string. Error
   semantics are unchanged (`errors.Is` against `context.Canceled` /
-  `context.DeadlineExceeded` still matches; retry and stale-fallback
-  behavior are untouched).
+  `context.DeadlineExceeded` still matches; retry behavior is untouched).
 
 ## [0.6.0] - 2026-11-12
 
