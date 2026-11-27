@@ -86,7 +86,7 @@ iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/in
 - **结构化 wiki 页** —— 把 DText 正文拆成 `summary`、`intro_tags`、`rules`、`see_also`、`example_posts`，「if X, use Y instead」这类规则直接以数据形式给出，不用再解析散文。
 - **Tagger 时代名称识别** —— 每个名称都与锁定版本的 WD14 词表比对，判定为 `live`、`tagger_era`（上游已改名，附规范名）或 `unknown`，LoRA 卡片的标注不会再卡在「tag not found」上。
 - **帖子标签列表** —— 每篇帖子都带回按分类拆开的完整标签列表，翻几篇就能看出哪些标签天然一起出现。默认不做分级过滤，只要全年龄就加 `rating:g`。
-- **装上就不用管** —— 落盘缓存，Danbooru 故障时继续用过期数据兜底；`upgrade` 校验 SHA256 后原子替换二进制；安装器按用户安装并注册 PATH；请求间隔 1.5 秒（有凭据时 500 毫秒），保证匿名访问也站得住。
+- **装上就不用管** —— 瞬时故障自动重试退避，HTML 维护页折叠成一行摘要；Danbooru 仍不响应时，每个工具返回同一个协议级 `upstream_unavailable` 错误，agent 拿到即停手；`upgrade` 校验 SHA256 后原子替换二进制；安装器按用户安装并注册 PATH；请求间隔 1.5 秒（有凭据时 500 毫秒），保证匿名访问也站得住。
 
 返回的就是纯标签串，不绑定任何模型，可以直接粘进 ComfyUI、Stable Diffusion 或 Illustrious 的提示词框。
 
@@ -158,37 +158,37 @@ iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/in
 
 #### `search_tags`
 
-`query`（必填，例如 `blue hair`）· `limit`（10）· `category`（`general`/`artist`/`copyright`/`character`/`meta`）· `min_posts`（0，低于阈值的标签会被丢弃）· `refresh`（false）
+`query`（必填，例如 `blue hair`）· `limit`（10）· `category`（`general`/`artist`/`copyright`/`character`/`meta`）· `min_posts`（0，低于阈值的标签会被丢弃）
 
 当没有任何结果带帖子时，返回里会多出 `wd14_hits`，即词表中包含该查询词的 WD14 tagger 名称。
 
 #### `get_tag_info`
 
-`name`（必填，例如 `blue_hair`）· `refresh`（false）
+`name`（必填，例如 `blue_hair`）
 
 返回分类与帖子数，外加 `wd14` 判定：`live`（当前 Danbooru 上存在）、`tagger_era`（仅存在于 WD14 词表，多半已改名，规范名在 `renamed_to` 里）或 `unknown`（两边都没有）。0 帖且存在生效别名的名称，也会返回 `renamed_to`。
 
 #### `get_tags_info`
 
-`names`（必填，例如 `["blue_hair","1girl"]`，最多 20）· `refresh`（false）
+`names`（必填，例如 `["blue_hair","1girl"]`，最多 20）
 
 返回 `found`（字段与 `get_tag_info` 相同，0 帖行同样带 `renamed_to`）与 `missing`（Danbooru 上不存在，但仍带各自的 `wd14` 判定）。
 
 #### `get_related_tags`
 
-`tag`（必填）· `limit`（10）· `refresh`（false）
+`tag`（必填）· `limit`（10）
 
 `highres` 这类 meta 分类标签会作为噪声过滤掉。
 
 #### `get_tag_alias`
 
-`name`（必填，例如 `sailor_suit`）· `refresh`（false）
+`name`（必填，例如 `sailor_suit`）
 
 返回 `null` 表示输入本身已是规范标签。
 
 #### `get_tag_wiki`
 
-`title` 或 `other_names`（二选一必填）· `limit`（5）· `include_description`（false）· `refresh`（false）
+`title` 或 `other_names`（二选一必填）· `limit`（5）· `include_description`（false）
 
 返回 `summary`（首段）、`intro_tags`（定义段的链接目标）、`rules`（消歧与用法句子）、`see_also`、`example_posts`，以及原始 `linked_tags` 并集与多语言 `other_names`。原始 DText 正文不返回；`include_description` 会把引言散文作为纯文本附上，用于角色外观描述。
 
@@ -206,35 +206,15 @@ iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/in
 
 </details>
 
-六个标签工具（`search_tags`、`get_tag_info`、`get_tags_info`、`get_related_tags`、`get_tag_alias`、`get_tag_wiki`）走[响应缓存](#响应缓存)：TTL 内重复调用跳过网络往返，Danbooru 故障时返回上一次缓存的答案而不是报错，并标记 `stale: true` 与 `cached_at`（缓存写入时间）。它们的 `refresh` 参数（默认 false）可对单次调用绕过缓存、重新拉取。帖子搜索与画像从不缓存，因此没有 `refresh`。
-
-## 响应缓存
-
-重复查询由落盘缓存作答，不再打 Danbooru：
-
-| 数据 | TTL |
-|------|-----|
-| 相关标签（`get_related_tags`） | 30 天 |
-| wiki 页、别名 | 7 天 |
-| 标签搜索（`search_tags`） | 24 小时 |
-| 精确标签查询（`get_tag_info`、`get_tags_info`） | 7 天 |
-| 帖子（`search_posts`、`get_tag_profile`） | 从不缓存 |
-
-- 位置：`%LOCALAPPDATA%\danbooru-tag-mcp\cache`，按用户隔离，重启后保留，上限 2000 条 / 64 MB，超限按最旧优先淘汰。里面只有 API 响应体，随时可以删除；卸载程序会一并清掉。
-- 命中新鲜缓存时，返回与网络响应逐字节一致，不加任何标记。
-- Danbooru 不可达（重试之后）时，返回过期的缓存答案而不是报错，并在受影响的工具响应上标记 `stale: true` 与 `cached_at`（缓存写入时间）。
-- 空结果（`[]`）从不缓存，Danbooru 一收录新标签就能立刻查到。
-- 精确标签查询会把标签的身份行保留 7 天（名称与分类几乎不变，和 wiki 页同理），因此 `post_count` 最多可能滞后线上 7 天。需要当前数值做判断时用 `refresh: true`。
-- `refresh: true` 重新拉取，并重置该条目的 TTL 计时。
-- 设 `DANBOORU_MCP_NO_CACHE=1` 可完全关闭缓存，排查问题时有用。
+每个工具每次调用都直接访问线上 Danbooru。当请求因网络错误、5xx 或 429/421 失败且自动重试后仍然失败时，工具返回同一个协议级错误（`isError: true`、`"error":"upstream_unavailable"`，原因在 message 里）——八个工具完全一致，agent 拿到后应停止调用本服务器，而不是换工具、换名称继续试。`tag_not_found` 只用于真实不存在（仍带 `wd14` 判定）；校验错误、明确的 4xx 与调用方取消都保持普通结果。
 
 ## 命令行
 
 ```
-danbooru-tag-mcp            启动 MCP 服务器（MCP 客户端启动的就是它）
-danbooru-tag-mcp upgrade    通过 GitHub Release 自更新（SHA256 校验）
-danbooru-tag-mcp version    打印版本
-danbooru-tag-mcp help       显示帮助
+danbooru-tag-mcp serve      以 stdio 运行 MCP 服务器（默认；MCP 客户端启动的就是它）
+danbooru-tag-mcp upgrade    替换为最新 GitHub Release 的 exe（SHA256 校验）
+danbooru-tag-mcp version    打印版本（别名：-v、--version）
+danbooru-tag-mcp help       显示帮助（别名：-h、--help）
 ```
 
 ## 环境变量
@@ -243,7 +223,6 @@ danbooru-tag-mcp help       显示帮助
 - `DANBOORU_API_KEY` —— Danbooru API key，在个人资料的 API key 区块生成。可选。两项都设置时，每个请求都以你的账号认证发出（更高的速率上限与内容访问权限）；否则客户端为匿名，Danbooru 施加更低的限额。
 - `DANBOORU_REQ_GAP_MS` —— Danbooru 请求之间的最小间隔，毫秒。`0` 关闭间隔；非法值会回落到默认并给出警告。默认 1500（匿名），两项凭据都设置时为 500。
 - `DANBOORU_MCP_NO_BOOTSTRAP` —— 非空时跳过启动时的 PATH 注册。
-- `DANBOORU_MCP_NO_CACHE` —— 非空时关闭[响应缓存](#响应缓存)。
 
 ## 从源码构建
 
