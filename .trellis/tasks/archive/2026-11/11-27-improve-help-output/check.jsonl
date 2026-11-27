@@ -1,0 +1,3 @@
+{"file": ".trellis/tasks/11-27-improve-help-output/research/help-current-state.md", "reason": "Verify each documented command, alias, exit code and environment variable against the captured evidence"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify the documented exit codes agree with the app.Fail convention"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Backend quality bar for the review pass"}

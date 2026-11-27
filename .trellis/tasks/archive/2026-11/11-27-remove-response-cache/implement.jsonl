@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/11-27-remove-response-cache/research/cache-value-and-removal-inventory.md", "reason": "Measured cache value, the rejected fallback-only variant, and the line-level inventory of everything to remove"}
+{"file": ".trellis/tasks/11-27-remove-response-cache/research/outage-signalling.md", "reason": "Captured tool results during a simulated outage; the target shape for the uniform upstream_unavailable result"}
+{"file": ".trellis/tasks/11-27-sanitize-error-credentials/research/leak-paths.md", "reason": "The credential-safe error text must survive the removal; keep sanitizeTransportError on every doOnce error return"}
+{"file": ".trellis/spec/backend/cache-and-resilience.md", "reason": "Current retry and error contracts; the cache parts are replaced, the retry parts must be preserved verbatim"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error-handling conventions; the fallback lesson needs rewording when the sentinel type is renamed"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend layer entry point and English-only documentation rule; its index row follows the spec rename"}

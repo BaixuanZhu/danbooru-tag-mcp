@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/11-27-remove-response-cache/research/cache-value-and-removal-inventory.md", "reason": "Check that every inventoried reference is gone and nothing outside the inventory was touched"}
+{"file": ".trellis/tasks/11-27-remove-response-cache/research/outage-signalling.md", "reason": "Verify the uniform upstream_unavailable result on all eight tools, and that tag_not_found is reserved for genuine not-founds"}
+{"file": ".trellis/tasks/11-27-sanitize-error-credentials/research/leak-paths.md", "reason": "Verify error text is still credential-safe after client.go is reworked"}
+{"file": ".trellis/spec/backend/cache-and-resilience.md", "reason": "Verify retry, Retry-After, cancellation and error-shrink contracts are unchanged"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Verify the reworded fallback lesson still matches the code"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Backend quality bar for the review pass"}
