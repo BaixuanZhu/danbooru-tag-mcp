@@ -39,6 +39,16 @@ when tagging.
   `tag_info_failed` code. A definitive 4xx, a validation error, a parse
   error and a caller cancellation stay unmarked plain results.
 
+### Changed
+
+- `help` (`-h` / `--help`) is rewritten: the Commands section documents
+  every accepted spelling (aliases included) and what each command does and
+  returns, the exit codes are listed, and the install instructions are gone
+  — they restated a subset of the README and only mattered before the
+  binary existed. The Commands section is rendered from the same table the
+  router dispatches through, so a command cannot be accepted without being
+  documented.
+
 ## [0.6.1] - Unreleased
 
 ### Fixed

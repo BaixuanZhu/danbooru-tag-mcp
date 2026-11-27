@@ -287,10 +287,10 @@ caller cancellations stay plain results.
 ## CLI
 
 ```
-danbooru-tag-mcp            run the MCP server (what MCP clients launch)
-danbooru-tag-mcp upgrade    self-update via GitHub Release (SHA256 verified)
-danbooru-tag-mcp version    print the version
-danbooru-tag-mcp help       show help
+danbooru-tag-mcp serve      run the MCP server over stdio (default; what MCP clients launch)
+danbooru-tag-mcp upgrade    replace this exe with the latest GitHub Release (SHA256 verified)
+danbooru-tag-mcp version    print the version (aliases: -v, --version)
+danbooru-tag-mcp help       show help (aliases: -h, --help)
 ```
 
 ## Environment variables
