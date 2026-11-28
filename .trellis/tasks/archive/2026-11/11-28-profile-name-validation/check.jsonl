@@ -1,0 +1,2 @@
+{"file": ".trellis/tasks/11-28-profile-name-validation/research/profile-name-validation-facts.md", "reason": "Check the implementation against the measured facts and analysis verdicts"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Error-response conventions including upstream_unavailable and code hygiene"}

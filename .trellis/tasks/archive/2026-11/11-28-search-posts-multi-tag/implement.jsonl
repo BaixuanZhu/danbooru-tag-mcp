@@ -1,0 +1,4 @@
+{"file": ".trellis/tasks/11-28-search-posts-multi-tag/research/multi-tag-local-and-facts.md", "reason": "Verified live facts and upstream source: tag limits per account, why the local scan is exact, only= payload, cost numbers"}
+{"file": ".trellis/spec/backend/resilience.md", "reason": "Retry, error-shrink and upstream marking contracts; the new tag-limit sentinel must fit them"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Fallbacks must branch on a classified error, never on err != nil"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Backend layer entry point and English-only documentation rule"}
