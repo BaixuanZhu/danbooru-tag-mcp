@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 
 	"danbooru-tag-mcp/internal/app"
@@ -182,12 +184,157 @@ func (s *brokenService) Wiki(ctx context.Context, title, otherNames string, limi
 	return nil, s.upstreamErr()
 }
 
-func (s *brokenService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) ([]service.Post, error) {
+func (s *brokenService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*service.PostsResult, error) {
 	return nil, s.upstreamErr()
 }
 
 func (s *brokenService) Profile(ctx context.Context, tag string, sample int, opts service.ProfileOptions) (*service.TagProfile, error) {
 	return nil, s.upstreamErr()
+}
+
+// postsMockService is a mock TagService for the search_posts handler: its
+// SearchPosts answers from the canned posts/err fields and records the call.
+// Every other method keeps brokenService's upstream failure; the tests that
+// use this mock never call them.
+type postsMockService struct {
+	brokenService
+
+	posts *service.PostsResult
+	err   error
+
+	calls    int
+	gotTags  string
+	gotLimit int
+	gotMode  string
+}
+
+// SearchPosts records the call and answers from the canned fields.
+func (s *postsMockService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*service.PostsResult, error) {
+	s.calls++
+	s.gotTags, s.gotLimit, s.gotMode = tags, limit, tagsMode
+	return s.posts, s.err
+}
+
+// inProcessClient wires a real MCP server around svc and returns a started
+// in-process client, so handler tests see exactly what an MCP client gets.
+func inProcessClient(t *testing.T, svc TagService) *client.Client {
+	t.Helper()
+	s := server.NewMCPServer("test", "0.0.0.0", server.WithToolCapabilities(true))
+	Register(s, svc)
+
+	cli, err := client.NewInProcessClient(s)
+	if err != nil {
+		t.Fatalf("in-process client: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	if err := cli.Start(context.Background()); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{Name: "handler-test", Version: "0.0.1"}
+	if _, err := cli.Initialize(context.Background(), initReq); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	return cli
+}
+
+// callText calls one tool and returns its result together with the text of
+// its single content item, i.e. the wire payload an MCP client reads.
+func callText(t *testing.T, cli *client.Client, name string, args map[string]any) (*mcp.CallToolResult, string) {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Name = name
+	req.Params.Arguments = args
+	res, err := cli.CallTool(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CallTool %s: %v", name, err)
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("%s: expected 1 content item, got %d", name, len(res.Content))
+	}
+	tc, ok := res.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("%s: expected text content, got %T", name, res.Content[0])
+	}
+	return res, tc.Text
+}
+
+// TestSearchPostsHandler_PayloadBytesUnchanged pins the wire bytes the
+// search_posts handler must keep whatever the service learns later: a valid
+// query answers {"posts":[...]} and nothing else, a dead query answers the
+// bare {"posts":[]} (never null, no diagnostic key), and a validation error
+// stays the plain post_search_failed result. The marked
+// upstream_unavailable result would tell the agent to stop calling this
+// server, which is the wrong lesson for a malformed query. Each call must
+// reach the service exactly once, with the tags as typed.
+func TestSearchPostsHandler_PayloadBytesUnchanged(t *testing.T) {
+	fullPost := service.Post{
+		ID:       900,
+		Rating:   "e",
+		Score:    42,
+		FavCount: 7,
+		Tags: &service.PostTags{
+			Copyright: []string{"touhou"},
+			Artist:    []string{"kantoku"},
+			Character: []string{"hakurei_reimu"},
+			General:   []string{"1girl", "solo"},
+			Meta:      []string{"highres"},
+		},
+		PreviewURL:   "https://cdn.donmai.us/preview/x.jpg",
+		LargeFileURL: "https://cdn.donmai.us/large/x.jpg",
+	}
+	overLimit := errors.New("too many content tags: 3 (max 2, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query")
+
+	tests := []struct {
+		name string
+		svc  *postsMockService
+		args map[string]any
+		want string
+	}{
+		{
+			name: "non-empty result carries posts only",
+			svc:  &postsMockService{posts: &service.PostsResult{Posts: []service.Post{fullPost}}},
+			args: map[string]any{"tags": "touhou"},
+			want: `{"posts":[{"id":900,"rating":"e","score":42,"fav_count":7,"tags":{"copyright":["touhou"],"artist":["kantoku"],"character":["hakurei_reimu"],"general":["1girl","solo"],"meta":["highres"]},"preview_file_url":"https://cdn.donmai.us/preview/x.jpg","large_file_url":"https://cdn.donmai.us/large/x.jpg"}]}`,
+		},
+		{
+			name: "dead query is a bare empty array",
+			svc:  &postsMockService{posts: &service.PostsResult{Posts: []service.Post{}}},
+			args: map[string]any{"tags": "not_a_real_tag_xyz"},
+			want: `{"posts":[]}`,
+		},
+		{
+			// The real service appends a hint to this message only for a
+			// query that names a candidate, so the query is one that names
+			// none: the fixture mirrors a combination the chain produces.
+			name: "over-limit query is the plain validation result",
+			svc:  &postsMockService{err: overLimit},
+			args: map[string]any{"tags": "1girl blue_hair long_hair"},
+			want: `{"error":"post_search_failed","message":"` + overLimit.Error() + `"}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, text := callText(t, inProcessClient(t, tt.svc), "search_posts", tt.args)
+			if text != tt.want {
+				t.Errorf("payload:\n got: %s\nwant: %s", text, tt.want)
+			}
+			if res.IsError {
+				t.Errorf("a successful or validation result must not be flagged at the protocol level, got: %+v", res)
+			}
+			if strings.Contains(text, "upstream_unavailable") {
+				t.Errorf("a validation error must never be marked upstream_unavailable, got: %s", text)
+			}
+			if tt.svc.calls != 1 {
+				t.Errorf("the handler must call the service exactly once (no retry), got %d", tt.svc.calls)
+			}
+			if tt.svc.gotTags != tt.args["tags"] {
+				t.Errorf("tags must reach the service as typed, got %q", tt.svc.gotTags)
+			}
+		})
+	}
 }
 
 // TestHandlers_UpstreamFailureIsUniform pins PRD R10: during an outage every
@@ -259,5 +406,34 @@ func TestHandlers_UpstreamFailureIsUniform(t *testing.T) {
 				t.Errorf("%s: message = %q, want %q", tt.name, parsed["message"], wantMessage)
 			}
 		})
+	}
+}
+
+// TestSearchPostsHandler_PossibleTagsRideThePayload pins the handler side of
+// the space-split diagnostic: it marshals the service's result as is — posts
+// first, possible_tags after it — so the empty answer reads
+// {"posts":[],"possible_tags":["blue_hair"]}.
+func TestSearchPostsHandler_PossibleTagsRideThePayload(t *testing.T) {
+	svc := &postsMockService{posts: &service.PostsResult{
+		Posts:        []service.Post{},
+		PossibleTags: []string{"blue_hair"},
+	}}
+
+	res, text := callText(t, inProcessClient(t, svc), "search_posts", map[string]any{"tags": "blue hair"})
+	if want := `{"posts":[],"possible_tags":["blue_hair"]}`; text != want {
+		t.Errorf("payload:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError {
+		t.Errorf("a diagnostic is not an error, got: %+v", res)
+	}
+}
+
+// TestSearchPostsTool_DescriptionNamesPossibleTagsOnce pins that the
+// space-split diagnostic costs at most one clause of the tool description:
+// every MCP client injects that text into each session, so the field gets
+// exactly one mention — enough for an agent to know it exists.
+func TestSearchPostsTool_DescriptionNamesPossibleTagsOnce(t *testing.T) {
+	if got := strings.Count(SearchPostsTool.Description, "possible_tags"); got != 1 {
+		t.Errorf("search_posts description must mention possible_tags exactly once, got %d: %s", got, SearchPostsTool.Description)
 	}
 }

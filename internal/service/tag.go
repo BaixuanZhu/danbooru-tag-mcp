@@ -139,6 +139,14 @@ type WikiResult struct {
 	Pages []WikiPage `json:"wiki_pages"`
 }
 
+// PostsResult is search_posts' payload: the matched posts plus the optional
+// space-split diagnostic. Posts is always non-nil so an empty answer
+// marshals as [] rather than null.
+type PostsResult struct {
+	Posts        []Post   `json:"posts"`
+	PossibleTags []string `json:"possible_tags,omitempty"` // vocabulary names two adjacent query tokens form; only on an empty answer
+}
+
 // NotFoundError reports that current Danbooru carries no exact match for
 // the name; the WD14 verdict for it is still computable locally.
 type NotFoundError struct {
@@ -715,6 +723,11 @@ func extractLinkedTags(body string) []string {
 // accounts allow 2 tags per query (Gold unlocks 6).
 const maxContentTags = 2
 
+// maxPossibleTags caps the space-split candidates one search_posts answer
+// names: the diagnostic points at the likely cause, it is not a suggestion
+// list.
+const maxPossibleTags = 3
+
 // maxPostLimit caps posts per search_posts call: a post carries ~44 tags on
 // average (verified live), so 20 posts bound the payload at roughly 20 KB.
 const maxPostLimit = 20
@@ -825,6 +838,64 @@ func queryContentTags(query string) map[string]bool {
 	return out
 }
 
+// tagPairCandidate is one space-split suspect in a posts query: two adjacent
+// plain tokens whose underscore join is a name the tagger vocabularies
+// carry.
+type tagPairCandidate struct {
+	Pair  string // the two tokens as typed, one space between: "blue hair"
+	Joins string // the vocabulary name they form: "blue_hair"
+}
+
+// tagPairCandidates finds the space-split suspects of a posts query. The
+// query is split on whitespace because that is Danbooru's multi-tag syntax,
+// so a space inside one tag name ("blue hair" meaning blue_hair) becomes two
+// near-empty tokens and an empty answer with no hint. A candidate is a pair
+// of adjacent tokens, neither metatag-looking (the tag count's predicate,
+// isMetatagToken), whose lowercase underscore join the store carries.
+// Candidates keep query order, are deduped by the joined name and capped at
+// maxPossibleTags; a nil store yields none. Local computation, no request —
+// and deliberately no check that the tokens really have no posts, which
+// would cost requests.
+func tagPairCandidates(query string, store *vocab.Store) []tagPairCandidate {
+	tokens := strings.Fields(query)
+	seen := make(map[string]bool)
+	var out []tagPairCandidate
+	for i := 0; i+1 < len(tokens); i++ {
+		a, b := tokens[i], tokens[i+1]
+		if isMetatagToken(a) || isMetatagToken(b) {
+			continue
+		}
+		joined := strings.ToLower(a) + "_" + strings.ToLower(b)
+		if seen[joined] {
+			continue
+		}
+		if _, ok := store.Lookup(joined); !ok {
+			continue
+		}
+		seen[joined] = true
+		out = append(out, tagPairCandidate{Pair: a + " " + b, Joins: joined})
+		if len(out) == maxPossibleTags {
+			break
+		}
+	}
+	return out
+}
+
+// tagPairHint renders candidates as error-message segments, one per
+// candidate ("; 'blue hair' may be one tag: blue_hair"), so the
+// too-many-tags error can name the space-split pair that burned the tag
+// slots. No candidate yields "", which keeps that error byte-identical.
+func tagPairHint(candidates []tagPairCandidate) string {
+	if len(candidates) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, c := range candidates {
+		fmt.Fprintf(&b, "; '%s' may be one tag: %s", c.Pair, c.Joins)
+	}
+	return b.String()
+}
+
 // SearchPosts sends the tags out verbatim: no layer injects a rating
 // filter. The caller pins rating:<x> when they want one (rating: metatags
 // are exempt from the tag-count limit), so an unfiltered query describes
@@ -832,10 +903,20 @@ func queryContentTags(query string) map[string]bool {
 // get_tag_profile samples by. tagsMode reshapes only the response: full
 // (default, the historical shape) keeps every per-post category list, none
 // omits the tag lists, diff keeps only tags not already in the query.
-func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) ([]Post, error) {
+//
+// A space inside one tag name is the multi-tag syntax, so "blue hair" asks
+// Danbooru for two near-empty tokens and comes back empty. That dead end is
+// reported, not repaired: when the answer has no posts and an adjacent token
+// pair joins into a tagger-vocabulary name (tagPairCandidates), PossibleTags
+// names the candidates, and the local too-many-tags error gains a segment
+// per candidate. The query is never retried or rewritten; the caller
+// decides. Both diagnostics are local, cost no request, and are omitted
+// when there is no candidate, so every other payload stays byte-identical.
+func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*PostsResult, error) {
 	query := strings.TrimSpace(tags)
 	if n := countContentTags(query); n > maxContentTags {
-		return nil, fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query", n, maxContentTags)
+		return nil, fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query%s",
+			n, maxContentTags, tagPairHint(tagPairCandidates(query, s.vocab)))
 	}
 	if limit > maxPostLimit {
 		return nil, fmt.Errorf("too many posts requested: %d (max %d); a post carries its full tag list, so keep pages small", limit, maxPostLimit)
@@ -861,7 +942,7 @@ func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, ta
 	if mode == tagsModeDiff {
 		exclude = queryContentTags(query)
 	}
-	posts := make([]Post, 0, len(rawPosts))
+	result := &PostsResult{Posts: make([]Post, 0, len(rawPosts))}
 	for _, p := range rawPosts {
 		post := Post{
 			ID:           p.ID,
@@ -878,7 +959,13 @@ func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, ta
 			}
 			post.Tags = &pt
 		}
-		posts = append(posts, post)
+		result.Posts = append(result.Posts, post)
 	}
-	return posts, nil
+	if len(result.Posts) == 0 {
+		// Local lookup, run only on the empty answer it explains.
+		for _, c := range tagPairCandidates(query, s.vocab) {
+			result.PossibleTags = append(result.PossibleTags, c.Joins)
+		}
+	}
+	return result, nil
 }

@@ -145,9 +145,10 @@ single-token input is `isSingleTagName`'s rule, not the predicate's.
 When a wrong verdict rejects input or counts a token against a limit, use
 the known-key predicate; a colon token whose key is not listed is a content
 tag unless Danbooru says otherwise. Keep the two lists apart: query
-classification wants the search keys only. The one deliberately broader
-check is `isMetatagToken` in `tag.go` (`search_posts` tag counting):
-exempting a token from the cap is the safe side there, so it differs from
+classification wants the search keys only. `isMetatagToken` in `tag.go` is
+deliberately broader (any colon) and `search_posts` uses it for the tag
+count, the diff subtraction and the space-split candidate detection; for
+the count, exempting a token is the safe side, so it differs from
 `isDanbooruMetatag` on purpose. The guard is a clear-error path, not the
 injection barrier — profile sample queries are built from resolved row
 names, never from caller text.
@@ -162,3 +163,40 @@ Pinned by `TestIsDanbooruMetatag_OnlyKnownKeysMatch`,
 `TestProfile_ColonFirstNameReachesTheApi` and
 `TestProfile_RejectsAnyWhitespace`; integration checks 19-21 cover both
 names live and the edit-only rejection.
+
+### Common Mistake: answering a malformed query with a bare empty array
+
+**Symptom**: `search_posts` with `blue hair` (meaning `blue_hair`)
+answered `{"posts":[]}`. True, but a dead end: the caller has no signal
+that the space itself was the problem.
+
+**Cause**: a space is Danbooru's multi-tag separator, so the query becomes
+two near-0-post tokens, and the server reported the empty result without a
+word about why.
+
+**Fix** (a facts-only diagnostic, not a repair):
+`tagPairCandidates(query, store)` in `internal/service/tag.go` finds
+adjacent plain-token pairs whose lowercase underscore join the embedded WD14
+vocabulary carries (`vocab.Store.Lookup`: local, nil-safe, no request);
+query order, deduped, max 3 (`maxPossibleTags`). `SearchPosts` returns a
+`PostsResult` and hooks the candidates in twice: an empty answer carries
+`possible_tags` (`omitempty`), and the local too-many-tags error appends
+one `; '<pair>' may be one tag: <name>` segment per candidate.
+
+| Query | Result |
+|---|---|
+| `blue hair` | `{"posts":[],"possible_tags":["blue_hair"]}` |
+| `rating:g blue hair` | same: a metatag token is never joined itself, but does not block the pair after it |
+| `blue hair order:random` (over the cap) | `post_search_failed`; the message ends with `; 'blue hair' may be one tag: blue_hair` |
+| `blue xyzzy`, `not_a_real_tag_xyz`, a single token, a nil vocabulary | `{"posts":[]}`, no `possible_tags` key |
+| `1girl blue hair` with posts coming back | `{"posts":[...]}`, no `possible_tags` key |
+
+**Prevention**: an empty answer to a syntactically suspicious query is a
+dead end. When a request-free local signal exists, name the candidate and
+let the caller decide; never auto-retry or rewrite a query, the caller owns
+it. Pin the bytes of every payload that must not change before adding a
+field (`TestSearchPostsHandler_PayloadBytesUnchanged`).
+
+Pinned by `TestTagPairCandidates_*`, `TestSearchPosts_SpaceSplit*`,
+`TestSearchPosts_NoSpaceSplitDiagnostic*`, `TestSearchPosts_OverLimit*`;
+integration checks 22-24.

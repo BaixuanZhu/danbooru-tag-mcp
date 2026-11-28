@@ -137,6 +137,17 @@ payload at ~20 KB). `SearchPosts` also takes a tags mode: `full` (default,
 byte-identical to the old shape) / `none` (per-post `PostTags` omitted;
 id/rating/score/fav/url remain) / `diff` (each post's lists minus the
 query's own content tags, metatags excluded from the subtraction).
+`SearchPosts` returns a `PostsResult`, and a space inside one tag name is
+the multi-tag syntax: `blue hair` asks for two near-empty tokens and used
+to answer a bare `[]`. When no posts come back and two adjacent plain
+tokens join into a WD14 vocabulary name, `possible_tags` names the
+candidates (local `tagPairCandidates`, query order, deduped, max 3;
+omitted otherwise, so every other payload stays byte-identical), and the
+local too-many-tags error gains one `; '<pair>' may be one tag: <name>`
+segment per candidate. Facts only — no retry, no query rewrite, no extra
+request — and a metatag-looking token (`isMetatagToken`) is never joined
+(`TestSearchPostsHandler_PayloadBytesUnchanged`,
+`TestSearchPosts_SpaceSplit*`).
 `Related` drops both the query tag itself and
 meta-category (5) entries, because meta tags like `highres` co-occur with
 everything and drown out content tags. Category ids are 0=general, 1=artist,

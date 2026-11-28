@@ -6,6 +6,21 @@ when tagging.
 
 ## [Unreleased]
 
+### Added
+
+- `search_posts` now names a likely space-split miss instead of answering a
+  bare empty array. A space inside one tag name is the multi-tag syntax, so
+  `blue hair` asked Danbooru for two near-empty tokens and returned `[]`
+  with no hint. When no posts come back and two adjacent query tokens join
+  into a WD14 tagger-vocabulary name, the response adds `possible_tags`:
+  `{"posts":[],"possible_tags":["blue_hair"]}`. The same hint rides the
+  local too-many-tags error, because a space-split pair burns both tag
+  slots (`blue hair order:random` is rejected although
+  `blue_hair order:random` is a legal query). The candidates come from the
+  embedded vocabularies, so the diagnostic costs no request; the server
+  never retries or rewrites the query, and every other payload is
+  unchanged.
+
 ### Fixed
 
 - `get_tag_profile` no longer rejects valid Danbooru names that contain a

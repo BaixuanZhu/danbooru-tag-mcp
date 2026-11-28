@@ -16,6 +16,8 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
+// TagService is the service surface the tool handlers depend on: the tools
+// layer never sees the concrete service, so unit tests substitute mocks.
 type TagService interface {
 	Search(ctx context.Context, query string, limit, category, minPosts int) (*service.SearchResult, error)
 	Info(ctx context.Context, name string) (*service.TagInfo, error)
@@ -25,7 +27,7 @@ type TagService interface {
 	Related(ctx context.Context, tag string, limit int) (*service.RelatedResult, error)
 	Alias(ctx context.Context, name string) (*service.AliasResult, error)
 	Wiki(ctx context.Context, title, otherNames string, limit int, includeDescription bool) (*service.WikiResult, error)
-	SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) ([]service.Post, error)
+	SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*service.PostsResult, error)
 	Profile(ctx context.Context, tag string, sample int, opts service.ProfileOptions) (*service.TagProfile, error)
 }
 
@@ -178,7 +180,7 @@ var (
 	)
 
 	SearchPostsTool = mcp.NewTool("search_posts",
-		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta). tags_mode=none drops tag lists; diff keeps only tags not already in the query"),
+		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta). tags_mode=none drops tag lists; diff keeps only tags not already in the query. On an empty result, possible_tags lists WD14 vocab names formed by joining two adjacent query tokens ('blue hair' -> blue_hair) without retrying the query"),
 		mcp.WithString("tags",
 			mcp.Required(),
 			mcp.Description("space-separated tags"),
@@ -349,11 +351,11 @@ func Register(s *server.MCPServer, svc TagService) {
 		}
 		limit := getIntArg(args, "limit", 5)
 
-		posts, err := svc.SearchPosts(ctx, tags, limit, getStringArg(args, "tags_mode"))
+		res, err := svc.SearchPosts(ctx, tags, limit, getStringArg(args, "tags_mode"))
 		if err != nil {
 			return failResult(err, "post_search_failed")
 		}
-		return jsonResult(map[string]any{"posts": posts})
+		return jsonResult(res)
 	})
 
 	// tool 7: get_tag_profile

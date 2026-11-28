@@ -48,7 +48,7 @@ unset DANBOORU_LOGIN DANBOORU_API_KEY
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 21 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 24 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -75,6 +75,9 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"firefly_(honkai:_star_rail)","sample":20}}}'
   req '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"firefly_(honkai:_star_rail)","with":"honkai:_star_rail","sample":20}}}'
   req '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"character:firefly_(honkai:_star_rail)","sample":20}}}'
+  req '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue hair"}}}'
+  req '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue hair order:random"}}}'
+  req '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue xyzzy"}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -331,6 +334,29 @@ prof21 = payload(21)
 check(prof21.get('error') == 'profile_failed'
       and prof21.get('message') == "profile takes a single exact tag name (e.g. 'arm_up'); metatags and multi-tag queries are not supported",
       'get_tag_profile: edit-only prefix rejected locally')
+
+# 22. search_posts space-split diagnostic: a space inside one tag name is
+#     the multi-tag syntax, so "blue hair" is two 0-post tokens (verified
+#     live) and the answer is empty; the payload must name the
+#     vocabulary-backed join in possible_tags (key order is pinned by
+#     TestSearchPostsHandler_PossibleTagsRideThePayload at the unit layer).
+r22 = payload(22)
+check(r22.get('posts') == [] and r22.get('possible_tags') == ['blue_hair'],
+      'search_posts: empty answer names the joined tag in possible_tags')
+
+# 23. The same hint on the local over-limit error (no network round trip):
+#     "blue hair order:random" counts 3 content tokens, one over the
+#     anonymous cap, although blue_hair order:random is a legal query.
+err23 = payload(23)
+check(err23.get('error') == 'post_search_failed'
+      and 'too many content tags' in err23.get('message', '')
+      and "'blue hair' may be one tag: blue_hair" in err23.get('message', ''),
+      'search_posts: over-limit error names the joined tag')
+
+# 24. A genuinely dead query stays bare: no possible_tags key.
+r24 = payload(24)
+check(r24.get('posts') == [] and 'possible_tags' not in r24,
+      'search_posts: dead query stays a bare empty array')
 
 print()
 if failures:

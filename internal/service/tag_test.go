@@ -33,6 +33,7 @@ type mockFetcher struct {
 	lastWikiOther    string
 	lastPostsArg     string
 	lastPostsLim     int
+	postsCalls       int // number of FetchPosts invocations
 }
 
 func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error) {
@@ -71,6 +72,7 @@ func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, l
 }
 
 func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
+	m.postsCalls++
 	m.lastPostsArg = tags
 	m.lastPostsLim = limit
 	return m.postsResp, nil
@@ -470,18 +472,18 @@ func TestSearchPosts_Fields(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "touhou", 1, "")
+	res, err := svc.SearchPosts(context.Background(), "touhou", 1, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	p := posts[0]
+	p := res.Posts[0]
 	if p.Score != 42 || p.FavCount != 7 {
 		t.Errorf("score/fav_count not copied: %+v", p)
 	}
 	if p.LargeFileURL != "https://cdn.donmai.us/large/x.jpg" {
 		t.Errorf("large_file_url not copied: %q", p.LargeFileURL)
 	}
-	raw, _ := json.Marshal(posts)
+	raw, _ := json.Marshal(res.Posts)
 	for _, want := range []string{`"score":42`, `"fav_count":7`, `"large_file_url":"https://cdn.donmai.us/large/x.jpg"`} {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("expected %s in payload, got: %s", want, raw)
@@ -518,10 +520,11 @@ func TestSearchPosts_NoRatingInjection(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "cat_ears 1girl", 5, "")
+	res, err := svc.SearchPosts(context.Background(), "cat_ears 1girl", 5, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	posts := res.Posts
 	if mock.lastPostsArg != "cat_ears 1girl" {
 		t.Errorf("query must be sent verbatim with no rating appended, got: %s", mock.lastPostsArg)
 	}
@@ -565,10 +568,11 @@ func TestSearchPosts_ParsesCategorizedTags(t *testing.T) {
 	}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "touhou", 1, "")
+	res, err := svc.SearchPosts(context.Background(), "touhou", 1, "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	posts := res.Posts
 	if len(posts) != 1 {
 		t.Fatalf("expected 1 post, got %d", len(posts))
 	}
@@ -687,11 +691,11 @@ func TestSearchPosts_TagsModeDefaultFullIsByteIdentical(t *testing.T) {
 
 	want := `[{"id":900,"rating":"e","score":42,"fav_count":7,"tags":{"copyright":["touhou"],"artist":["kantoku"],"character":["hakurei_reimu"],"general":["1girl","solo"],"meta":["highres"]},"preview_file_url":"https://cdn.donmai.us/preview/x.jpg","large_file_url":"https://cdn.danbooru.us/large/x.jpg"}]`
 	for _, mode := range []string{"", "full"} {
-		posts, err := svc.SearchPosts(context.Background(), "touhou", 1, mode)
+		res, err := svc.SearchPosts(context.Background(), "touhou", 1, mode)
 		if err != nil {
 			t.Fatalf("mode %q: %v", mode, err)
 		}
-		raw, err := json.Marshal(posts)
+		raw, err := json.Marshal(res.Posts)
 		if err != nil {
 			t.Fatalf("mode %q: marshal: %v", mode, err)
 		}
@@ -710,10 +714,11 @@ func TestSearchPosts_TagsModeNoneOmitsTagLists(t *testing.T) {
 	}]`)}
 	svc := NewTagService(mock, nil)
 
-	posts, err := svc.SearchPosts(context.Background(), "touhou", 1, "none")
+	res, err := svc.SearchPosts(context.Background(), "touhou", 1, "none")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	posts := res.Posts
 	if len(posts) != 1 {
 		t.Fatalf("expected 1 post, got %d", len(posts))
 	}
@@ -744,10 +749,11 @@ func TestSearchPosts_TagsModeDiffSubtractsQueryContentTags(t *testing.T) {
 
 	// The query mixes case and a metatag: only arm_up is subtracted,
 	// rating:g never names a literal tag so it cannot be.
-	posts, err := svc.SearchPosts(context.Background(), "Arm_Up rating:g", 1, "diff")
+	res, err := svc.SearchPosts(context.Background(), "Arm_Up rating:g", 1, "diff")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	posts := res.Posts
 	if len(posts) != 1 || posts[0].Tags == nil {
 		t.Fatalf("diff mode must keep the tag block, got: %+v", posts)
 	}

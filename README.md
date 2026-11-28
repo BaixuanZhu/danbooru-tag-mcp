@@ -261,6 +261,11 @@ No rating filter by default; add a `rating:g/s/q/e` metatag to narrow. Each
 post carries `score`, `fav_count`, `large_file_url` and `tags` split by
 category: `copyright` / `artist` / `character` / `general` / `meta`.
 
+When no posts come back and two adjacent tokens join into a WD14 vocabulary
+name (`blue hair` -> `blue_hair`), the response adds `possible_tags` with the
+candidates (at most 3); the too-many-tags error carries the same hint. The
+server does not retry the query.
+
 #### `get_tag_profile`
 
 `tag` (required, e.g. `arm_up`) · `sample` (200, range 20-200) · `with` ·
