@@ -617,3 +617,166 @@ func TestSearchPostsTool_DescriptionNamesPossibleTagsOnce(t *testing.T) {
 		t.Errorf("search_posts description must mention possible_tags exactly once, got %d: %s", got, SearchPostsTool.Description)
 	}
 }
+
+// relatedMockService is a mock TagService for the get_related_tags handler:
+// its Related answers from the canned result/err fields and records the
+// call. Every other method keeps brokenService's upstream failure; the tests
+// that use this mock never call them.
+type relatedMockService struct {
+	brokenService
+
+	related *service.RelatedResult
+	err     error
+
+	calls    int
+	gotTag   string
+	gotLimit int
+}
+
+// Related records the call and answers from the canned fields.
+func (s *relatedMockService) Related(ctx context.Context, tag string, limit int) (*service.RelatedResult, error) {
+	s.calls++
+	s.gotTag, s.gotLimit = tag, limit
+	return s.related, s.err
+}
+
+// TestGetRelatedTagsHandler_PayloadBytes pins the wire bytes of the
+// get_related_tags handler: it marshals the service's answer as is, each
+// call reaching the service exactly once with the tag as typed and the limit
+// (10 unless given). The ranking, the lift field and the degraded shape are
+// the service's work; the handler adds, drops and retries nothing.
+func TestGetRelatedTagsHandler_PayloadBytes(t *testing.T) {
+	lift := func(v float64) *float64 { return &v }
+	tests := []struct {
+		name        string
+		svc         *relatedMockService
+		args        map[string]any
+		want        string
+		wantLimit   int
+		wantIsError bool
+	}{
+		{
+			// The degraded shape (no whole-site count): the pre-lift bytes.
+			name: "answer without lift keeps the pre-lift bytes",
+			svc: &relatedMockService{related: &service.RelatedResult{Related: []service.RelatedTag{
+				{Tag: "aqua_hair", Category: 0, PostCount: 179981, Similarity: 0.45, Frequency: 0.11},
+			}}},
+			args:      map[string]any{"tag": "blue hair"},
+			want:      `{"related":[{"tag":"aqua_hair","category":0,"post_count":179981,"similarity":0.45,"frequency":0.11}]}`,
+			wantLimit: 10,
+		},
+		{
+			name: "lift rides each entry after the historical fields",
+			svc: &relatedMockService{related: &service.RelatedResult{Related: []service.RelatedTag{
+				{Tag: "arm_behind_head", Category: 0, PostCount: 20123, Similarity: 0.25, Frequency: 0.25, Lift: lift(14.77)},
+				{Tag: "1girl", Category: 0, PostCount: 8800000, Similarity: 0.9, Frequency: 0.7, Lift: lift(0.8)},
+			}}},
+			args:      map[string]any{"tag": "arm_up", "limit": 2},
+			want:      `{"related":[{"tag":"arm_behind_head","category":0,"post_count":20123,"similarity":0.25,"frequency":0.25,"lift":14.77},{"tag":"1girl","category":0,"post_count":8800000,"similarity":0.9,"frequency":0.7,"lift":0.8}]}`,
+			wantLimit: 2,
+		},
+		{
+			name:      "empty answer is a bare empty array",
+			svc:       &relatedMockService{related: &service.RelatedResult{Related: []service.RelatedTag{}}},
+			args:      map[string]any{"tag": "not_a_real_tag_xyz"},
+			want:      `{"related":[]}`,
+			wantLimit: 10,
+		},
+		{
+			// A plain service error (here: an HTML body where the related
+			// list was expected) keeps the tool's own code, unmarked: only
+			// the upstream marker switches to the uniform result. json.Marshal
+			// escapes the '<' of the cause, which is part of the bytes.
+			name:      "unmarked error is the plain related_failed result",
+			svc:       &relatedMockService{err: errors.New("failed to parse related tags: invalid character '<' looking for beginning of value")},
+			args:      map[string]any{"tag": "blue_hair"},
+			want:      `{"error":"related_failed","message":"failed to parse related tags: invalid character '\u003c' looking for beginning of value"}`,
+			wantLimit: 10,
+		},
+		{
+			name:        "outage is the uniform marked result",
+			svc:         &relatedMockService{err: &upstreamMockError{}},
+			args:        map[string]any{"tag": "blue_hair"},
+			want:        `{"error":"upstream_unavailable","message":"Danbooru is not answering right now: danbooru 503 (Downbooru). All tools of this server are affected; retry later."}`,
+			wantLimit:   10,
+			wantIsError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, text := callText(t, inProcessClient(t, tt.svc), "get_related_tags", tt.args)
+			if text != tt.want {
+				t.Errorf("payload:\n got: %s\nwant: %s", text, tt.want)
+			}
+			if res.IsError != tt.wantIsError {
+				t.Errorf("IsError = %v, want %v", res.IsError, tt.wantIsError)
+			}
+			if !tt.wantIsError && strings.Contains(text, "upstream_unavailable") {
+				t.Errorf("a successful answer must never be marked upstream_unavailable, got: %s", text)
+			}
+			if tt.svc.calls != 1 {
+				t.Errorf("the handler must call the service exactly once (no retry), got %d", tt.svc.calls)
+			}
+			if tt.svc.gotTag != tt.args["tag"] {
+				t.Errorf("tag must reach the service as typed, got %q", tt.svc.gotTag)
+			}
+			if tt.svc.gotLimit != tt.wantLimit {
+				t.Errorf("limit reaching the service = %d, want %d", tt.svc.gotLimit, tt.wantLimit)
+			}
+		})
+	}
+}
+
+// TestGetRelatedTagsHandler_LimitIsForwarded pins that an explicit limit
+// reaches the service untouched: the handler does not clamp it or replace it
+// with the default — not an explicit 0 (no limit) and not 500, the whole
+// candidate pool the service asks Danbooru for, which a caller asking for
+// all of it must receive. The service applies the limit after its ranking.
+func TestGetRelatedTagsHandler_LimitIsForwarded(t *testing.T) {
+	for _, limit := range []int{0, 3, 500} {
+		svc := &relatedMockService{related: &service.RelatedResult{Related: []service.RelatedTag{}}}
+
+		res, text := callText(t, inProcessClient(t, svc), "get_related_tags", map[string]any{"tag": "arm_up", "limit": limit})
+		if want := `{"related":[]}`; text != want {
+			t.Errorf("limit %d: payload:\n got: %s\nwant: %s", limit, text, want)
+		}
+		if res.IsError {
+			t.Errorf("limit %d: an empty answer is not an error, got: %+v", limit, res)
+		}
+		if svc.gotLimit != limit {
+			t.Errorf("limit reaching the service = %d, want %d", svc.gotLimit, limit)
+		}
+	}
+}
+
+// TestGetRelatedTagsHandler_EmptyTagIsRejectedBeforeTheService pins the
+// handler's own required-argument check: an absent tag is the plain
+// related_failed result and costs no service call.
+func TestGetRelatedTagsHandler_EmptyTagIsRejectedBeforeTheService(t *testing.T) {
+	svc := &relatedMockService{}
+
+	res, text := callText(t, inProcessClient(t, svc), "get_related_tags", map[string]any{})
+	if want := `{"error":"related_failed","message":"tag parameter is required"}`; text != want {
+		t.Errorf("payload:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError {
+		t.Errorf("a validation error must not be flagged at the protocol level, got: %+v", res)
+	}
+	if svc.calls != 0 {
+		t.Errorf("the rejection must happen before the service, got %d call(s)", svc.calls)
+	}
+}
+
+// TestGetRelatedTagsTool_DescriptionNamesLiftOnce pins R5: lift costs
+// exactly one clause of the get_related_tags description, like count_only
+// and possible_tags on search_posts — every MCP client injects that text
+// into each session.
+func TestGetRelatedTagsTool_DescriptionNamesLiftOnce(t *testing.T) {
+	const want = "Get co-occurring tags for a given tag (meta-category tags excluded), ranked by lift (tag-specific companions first, low-overlap entries last)"
+	if GetRelatedTagsTool.Description != want {
+		t.Errorf("description:\n got: %s\nwant: %s", GetRelatedTagsTool.Description, want)
+	}
+	if got := strings.Count(GetRelatedTagsTool.Description, "lift"); got != 1 {
+		t.Errorf("get_related_tags description must mention lift exactly once, got %d: %s", got, GetRelatedTagsTool.Description)
+	}
+}

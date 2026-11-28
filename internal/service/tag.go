@@ -6,9 +6,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"danbooru-tag-mcp/internal/vocab"
 )
@@ -21,13 +24,15 @@ type Tag struct {
 }
 
 // RelatedTag is one co-occurring tag from /related_tag.json, with the
-// similarity metrics Danbooru reports for the pair.
+// similarity metrics Danbooru reports for the pair and, whenever the
+// whole-site post count is available, the tag's lift.
 type RelatedTag struct {
-	Tag        string  `json:"tag"`
-	Category   int     `json:"category"`   // 0=general, 1=artist, 3=copyright, 4=character, 5=meta
-	PostCount  int     `json:"post_count"` // total posts carrying this related tag
-	Similarity float64 `json:"similarity"` // cosine similarity to the query tag (0-1)
-	Frequency  float64 `json:"frequency"`  // share of query-tag posts that also carry this tag (0-1)
+	Tag        string   `json:"tag"`
+	Category   int      `json:"category"`       // 0=general, 1=artist, 3=copyright, 4=character, 5=meta
+	PostCount  int      `json:"post_count"`     // total posts carrying this related tag
+	Similarity float64  `json:"similarity"`     // cosine similarity to the query tag (0-1)
+	Frequency  float64  `json:"frequency"`      // share of query-tag posts that also carry this tag (0-1)
+	Lift       *float64 `json:"lift,omitempty"` // frequency x site-wide post count / post_count, 2 decimals; see relatedLift
 }
 
 // TagAlias maps a user-typed alias (antecedent) to the canonical Danbooru tag
@@ -126,7 +131,9 @@ type SearchResult struct {
 	WD14Hits []vocab.Hit `json:"wd14_hits,omitempty"`
 }
 
-// RelatedResult is get_related_tags' payload: the co-occurring tags.
+// RelatedResult is get_related_tags' payload: the co-occurring tags, ranked
+// by lift. Related is always non-nil, so an empty answer marshals as []
+// rather than null.
 type RelatedResult struct {
 	Related []RelatedTag `json:"related"`
 }
@@ -158,9 +165,21 @@ type NotFoundError struct {
 
 func (e *NotFoundError) Error() string { return "tag not found: " + e.Name }
 
+// TagService turns the raw Danbooru JSON bodies a TagFetcher returns into
+// the tools' payloads, enriching names with the local WD14 vocabularies. It
+// is safe for concurrent use (mcp-go runs tool calls on concurrent workers):
+// its only state that changes after construction is the whole-site count
+// memo, guarded by siteMu.
 type TagService struct {
 	fetcher TagFetcher
 	vocab   *vocab.Store // nil disables WD14 enrichment
+
+	// The whole-site post count every lift of get_related_tags divides by,
+	// memoized per process (see sitePostCount). siteMu is held across the
+	// request, so concurrent callers share one fetch instead of each sending
+	// their own.
+	siteMu    sync.Mutex
+	sitePosts int // memoized whole-site post count; 0 = nothing memoized
 }
 
 func NewTagService(fetcher TagFetcher, vd *vocab.Store) *TagService {
@@ -305,8 +324,11 @@ type danbooruRelatedEntry struct {
 	Frequency  float64            `json:"frequency"`
 }
 
+// danbooruRelatedResponse is the top level of /related_tag.json. PostCount is
+// the query tag's own post count (0 when the tag is not found).
 type danbooruRelatedResponse struct {
 	Query       string                 `json:"query"`
+	PostCount   int                    `json:"post_count"`
 	RelatedTags []danbooruRelatedEntry `json:"related_tags"`
 }
 
@@ -314,6 +336,32 @@ type danbooruRelatedResponse struct {
 // commentary, ...) as returned by tags.json / related_tag.json.
 const danbooruCategoryMeta = 5
 
+// Lift-ranking knobs for get_related_tags.
+const (
+	// relatedSupportFloor is the minimum support (posts behind an entry) for
+	// the entry to be ranked by lift; below it the entry is sunk to the end
+	// of the answer in upstream order instead of dropped. Live data shows
+	// 14-17-post companions of mid-size tags are real, while 1-2-post overlaps
+	// of tiny tags are not evidence. The same number get_tag_profile keeps as
+	// its minimum pair count (profileMinPairCount).
+	relatedSupportFloor = 5
+
+	// relatedSampleCap is the number of query-tag posts Danbooru estimates
+	// an entry's frequency from, so an entry's support is
+	// frequency x min(query posts, relatedSampleCap): the exact joint count
+	// while the query tag has at most this many posts.
+	relatedSampleCap = 5000
+)
+
+// Related answers get_related_tags: the tags co-occurring with tag, ranked
+// by lift. The query tag itself and meta-category entries are removed first.
+//
+// Lift (see relatedLift) needs the whole-site post count, requested once per
+// process (sitePostCount) and only once there is something to rank. While it
+// is unavailable the answer degrades to exactly the pre-lift payload:
+// upstream order, no lift key. limit (max entries; 0 or less keeps all) is
+// applied after the ranking, so it keeps the top-lift entries rather than
+// the most frequent ones.
 func (s *TagService) Related(ctx context.Context, tag string, limit int) (*RelatedResult, error) {
 	cleanTag := normalizeTag(tag)
 	res, err := s.fetcher.FetchRelated(ctx, cleanTag)
@@ -326,19 +374,20 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) (*Relat
 		return nil, fmt.Errorf("failed to parse related tags: %w", err)
 	}
 
-	var results []RelatedTag
+	// Non-nil from the start, so an empty answer marshals as [] not null.
+	candidates := make([]RelatedTag, 0, len(resp.RelatedTags))
 	for _, entry := range resp.RelatedTags {
 		// The API lists the query tag itself first (similarity 1.0); skip it
 		// so the limit is spent on actual co-occurring tags.
 		if entry.Tag.Name == resp.Query {
 			continue
 		}
-		// Meta tags co-occur with nearly every upload and would fill the
-		// top-N with prompt-irrelevant noise; drop them.
+		// Meta tags (highres, absurdres, ...) co-occur with nearly every
+		// upload and are prompt-irrelevant noise; drop them.
 		if entry.Tag.Category == danbooruCategoryMeta {
 			continue
 		}
-		results = append(results, RelatedTag{
+		candidates = append(candidates, RelatedTag{
 			Tag:        entry.Tag.Name,
 			Category:   entry.Tag.Category,
 			PostCount:  entry.Tag.PostCount,
@@ -346,11 +395,106 @@ func (s *TagService) Related(ctx context.Context, tag string, limit int) (*Relat
 			Frequency:  entry.Frequency,
 		})
 	}
-
-	if limit > 0 && len(results) > limit {
-		results = results[:limit]
+	if len(candidates) == 0 {
+		// Nothing to rank, so the whole-site count is not requested.
+		return &RelatedResult{Related: candidates}, nil
 	}
-	return &RelatedResult{Related: results}, nil
+
+	// A failed count never fails the call: the candidates go out unranked.
+	if sitePosts, ok := s.sitePostCount(ctx); ok {
+		candidates = rankRelatedByLift(candidates, resp.PostCount, sitePosts)
+	}
+
+	if limit > 0 && len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	return &RelatedResult{Related: candidates}, nil
+}
+
+// sitePostCount returns the whole-site post count (the N of the lift
+// formula) and whether it is available. The count is requested at most once
+// per process: siteMu is held across the request, so concurrent callers wait
+// for the one in flight instead of each sending their own, and a success is
+// memoized. Only a positive integer is a success. A request error of any
+// class, an unparsable body and a non-positive value all answer
+// (0, false) and are not memoized, so the next call tries again: a transient
+// failure at startup never disables lift ranking for the life of the
+// process. The memo lives in memory only; nothing is written to disk.
+func (s *TagService) sitePostCount(ctx context.Context) (int, bool) {
+	s.siteMu.Lock()
+	defer s.siteMu.Unlock()
+	if s.sitePosts > 0 {
+		return s.sitePosts, true
+	}
+	res, err := s.fetcher.FetchPostCount(ctx, "")
+	if err != nil {
+		return 0, false
+	}
+	total, err := parsePostCount(res)
+	if err != nil || total <= 0 {
+		return 0, false
+	}
+	s.sitePosts = total
+	return total, true
+}
+
+// relatedLift computes lift(B|A) = frequency x N / B, rounded to two
+// decimals: how many times more often the tag co-occurs with the query tag
+// than its share of the site predicts. 1 means "as often as chance", near
+// which corpus constants such as 1girl and solo sit, while tag-specific
+// companions (arm_up -> arm_behind_head) reach far above. nil when the lift
+// cannot be computed — a 0-post or 0-frequency entry, which cannot occur
+// with today's upstream logic and is guarded defensively — or when there is
+// no site count.
+func relatedLift(frequency float64, postCount, sitePosts int) *float64 {
+	if postCount <= 0 || frequency <= 0 || sitePosts <= 0 {
+		return nil
+	}
+	lift := math.Round(frequency*float64(sitePosts)/float64(postCount)*100) / 100
+	return &lift
+}
+
+// relatedLiftHigher reports whether a ranks before b: by lift descending,
+// with an entry that has no lift after every entry that has one.
+func relatedLiftHigher(a, b RelatedTag) bool {
+	switch {
+	case a.Lift == nil:
+		return false
+	case b.Lift == nil:
+		return true
+	default:
+		return *a.Lift > *b.Lift
+	}
+}
+
+// rankRelatedByLift attaches its lift to every candidate and orders them.
+// candidates arrive in upstream order (frequency descending) with the query
+// tag and meta entries already removed; queryPosts is the query tag's own
+// post count (A) and sitePosts the whole-site count (N). The result is a new
+// slice; candidates is left untouched.
+//
+// Entries whose support (frequency x min(A, relatedSampleCap)) reaches
+// relatedSupportFloor come first, by lift descending. The sort is stable, so
+// equal lifts keep upstream frequency order, the better-supported estimate
+// first. The rest follow in upstream order: sunk, never dropped. A missing
+// or zero A makes every support 0, which leaves the whole list in upstream
+// order with lift attached — the safe degradation.
+func rankRelatedByLift(candidates []RelatedTag, queryPosts, sitePosts int) []RelatedTag {
+	sample := math.Min(float64(queryPosts), relatedSampleCap)
+	ranked := make([]RelatedTag, 0, len(candidates))
+	sunk := make([]RelatedTag, 0)
+	for _, c := range candidates {
+		c.Lift = relatedLift(c.Frequency, c.PostCount, sitePosts)
+		if c.Frequency*sample >= relatedSupportFloor {
+			ranked = append(ranked, c)
+		} else {
+			sunk = append(sunk, c)
+		}
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		return relatedLiftHigher(ranked[i], ranked[j])
+	})
+	return append(ranked, sunk...)
 }
 
 // Alias resolves a user-typed alias to its canonical Danbooru tag via

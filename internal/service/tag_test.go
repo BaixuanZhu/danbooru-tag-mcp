@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"danbooru-tag-mcp/internal/vocab"
 )
@@ -20,6 +24,9 @@ type mockFetcher struct {
 	wikiResp    []byte
 	postsResp   []byte
 	countResp   []byte // raw /counts/posts.json body
+
+	relatedCalls int   // number of FetchRelated invocations
+	relatedErr   error // returned by FetchRelated instead of a body
 
 	aliasCalls int   // number of FetchAlias invocations
 	aliasErr   error // returned by FetchAlias instead of a body
@@ -59,6 +66,10 @@ func (m *mockFetcher) FetchTagsByNames(ctx context.Context, names []string) ([]b
 }
 
 func (m *mockFetcher) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
+	m.relatedCalls++
+	if m.relatedErr != nil {
+		return nil, m.relatedErr
+	}
 	return m.relatedResp, nil
 }
 
@@ -326,6 +337,829 @@ func TestRelated_TruncatesToLimit(t *testing.T) {
 	}
 	if res.Related[0].Tag != "1girl" || res.Related[1].Tag != "looking_at_viewer" {
 		t.Errorf("unexpected content: %+v", res.Related)
+	}
+}
+
+// relatedEntry renders one related_tags entry of a mock /related_tag.json
+// body in the upstream shape (the nested tag row plus the two metrics the
+// service reads), so a fixture stays one line per entry.
+func relatedEntry(name string, postCount, category int, cosine, frequency float64) string {
+	return fmt.Sprintf(`{"tag":{"name":%q,"post_count":%d,"category":%d},"cosine_similarity":%s,"frequency":%s}`,
+		name, postCount, category,
+		strconv.FormatFloat(cosine, 'g', -1, 64), strconv.FormatFloat(frequency, 'g', -1, 64))
+}
+
+// relatedBody renders a mock /related_tag.json body: the query, the query
+// tag's own post count (the key is absent when queryPosts is 0) and the
+// entries in the order given, which the tests write in upstream order
+// (frequency descending).
+func relatedBody(query string, queryPosts int, entries ...string) []byte {
+	postCount := ""
+	if queryPosts > 0 {
+		postCount = fmt.Sprintf(`"post_count":%d,`, queryPosts)
+	}
+	return []byte(fmt.Sprintf(`{"query":%q,%s"tag":null,"related_tags":[%s],"wiki_page_tags":[]}`,
+		query, postCount, strings.Join(entries, ",")))
+}
+
+// marshalRelated returns the wire bytes of a related answer.
+func marshalRelated(t *testing.T, res *RelatedResult) string {
+	t.Helper()
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatalf("marshal related result: %v", err)
+	}
+	return string(raw)
+}
+
+// relatedNames lists the tag names of a related answer in answer order.
+func relatedNames(res *RelatedResult) []string {
+	names := make([]string, 0, len(res.Related))
+	for _, r := range res.Related {
+		names = append(names, r.Tag)
+	}
+	return names
+}
+
+// relatedLifts renders a related answer for failure messages: one
+// "tag:lift" per entry, "-" where an entry carries no lift.
+func relatedLifts(res *RelatedResult) []string {
+	out := make([]string, 0, len(res.Related))
+	for _, r := range res.Related {
+		lift := "-"
+		if r.Lift != nil {
+			lift = strconv.FormatFloat(*r.Lift, 'g', -1, 64)
+		}
+		out = append(out, r.Tag+":"+lift)
+	}
+	return out
+}
+
+// TestRelated_PayloadBytesWithoutSiteCount pins the wire bytes of a
+// non-empty answer when the whole-site count is unavailable (here: the count
+// request fails): exactly the pre-lift payload, upstream order and the five
+// historical fields, each keeping its name, type and position. The fixture
+// leads with the query tag and mixes a meta entry in, so the exact bytes
+// also prove both exclusions.
+func TestRelated_PayloadBytesWithoutSiteCount(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 10000,
+			relatedEntry("arm_up", 10000, 0, 1, 1),
+			relatedEntry("1girl", 8800000, 0, 0.9, 0.7),
+			relatedEntry("highres", 9000000, 5, 0.8, 0.55),
+			relatedEntry("arm_behind_head", 20000, 0, 0.5, 0.25),
+			relatedEntry("holding_sword", 40000, 0, 0.4, 0.15),
+		),
+		countErr: &upstreamMarkedError{},
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "arm_up", 10)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := `{"related":[` +
+		`{"tag":"1girl","category":0,"post_count":8800000,"similarity":0.9,"frequency":0.7},` +
+		`{"tag":"arm_behind_head","category":0,"post_count":20000,"similarity":0.5,"frequency":0.25},` +
+		`{"tag":"holding_sword","category":0,"post_count":40000,"similarity":0.4,"frequency":0.15}` +
+		`]}`
+	if got := marshalRelated(t, res); got != want {
+		t.Errorf("payload:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestRelated_FetchFailurePropagatesWithoutSiteCount pins the failure path of
+// the related request: the error reaches the caller unchanged (the handler
+// turns a marked one into the uniform upstream_unavailable result, a parse
+// error into the plain related_failed result), nothing is answered, and the
+// whole-site count is never requested.
+func TestRelated_FetchFailurePropagatesWithoutSiteCount(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+		err  error
+	}{
+		{"upstream-marked request failure", nil, &upstreamMarkedError{}},
+		{"unparsable body", []byte(`<html>Downbooru</html>`), nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockFetcher{
+				relatedResp: tt.body,
+				relatedErr:  tt.err,
+				countResp:   []byte(`{"counts":{"posts":10000000}}`),
+			}
+			svc := NewTagService(mock, nil)
+
+			res, err := svc.Related(context.Background(), "arm_up", 10)
+			if res != nil {
+				t.Errorf("a failed related request must answer nothing, got %+v", res)
+			}
+			switch {
+			case tt.err != nil && err != tt.err:
+				t.Errorf("the request error must reach the caller unchanged, got %v", err)
+			case tt.err == nil && (err == nil || !strings.Contains(err.Error(), "failed to parse related tags")):
+				t.Errorf("expected the related parse error, got %v", err)
+			}
+			if mock.relatedCalls != 1 {
+				t.Errorf("expected exactly one related request, got %d", mock.relatedCalls)
+			}
+			if mock.countCalls != 0 {
+				t.Errorf("a failed related request must not ask for the whole-site count, got %d request(s)", mock.countCalls)
+			}
+		})
+	}
+}
+
+// liftRankingEntries is the hand-built related_tags list of the lift tests,
+// in upstream order (frequency descending), for a query tag with 10000
+// posts on a site of 10,000,000 posts (the mocks set those counts). Every
+// content tag clears the support floor (frequency x 5000 >= 250), so all of
+// them are ranked. The trailing comments give
+// lift = frequency x N / post_count before and after rounding.
+var liftRankingEntries = []string{
+	relatedEntry("arm_up", 10000, 0, 1, 1),               // the query tag: excluded
+	relatedEntry("1girl", 8800000, 0, 0.9, 0.7),          // 7000000 / 8800000 = 0.795 -> 0.8
+	relatedEntry("solo", 6000000, 0, 0.8, 0.6),           // 6000000 / 6000000 = 1
+	relatedEntry("highres", 9000000, 5, 0.8, 0.55),       // meta category: excluded
+	relatedEntry("tie_lower_freq", 4990000, 0, 0.7, 0.5), // 5000000 / 4990000 = 1.002 -> 1
+	relatedEntry("arm_behind_head", 20000, 0, 0.5, 0.25), // 2500000 / 20000 = 125
+	relatedEntry("holding_sword", 40000, 0, 0.4, 0.15),   // 1500000 / 40000 = 37.5
+	relatedEntry("waving", 50000, 0, 0.3, 0.12),          // 1200000 / 50000 = 24
+	relatedEntry("bkub", 30000, 1, 0.2, 0.09),            // 900000 / 30000 = 30 (an artist: kept)
+}
+
+// liftRankedOrder is liftRankingEntries the way the lift ranking orders
+// them: the answer every lift test expects while the whole-site count is
+// available.
+var liftRankedOrder = []string{
+	"arm_behind_head", "holding_sword", "bkub", "waving", "solo", "tie_lower_freq", "1girl",
+}
+
+// liftUpstreamPayload is liftRankingEntries as the pre-lift payload: the
+// upstream order, the five historical fields, no lift key. It is the answer
+// every lift test expects while the whole-site count is unavailable.
+const liftUpstreamPayload = `{"related":[` +
+	`{"tag":"1girl","category":0,"post_count":8800000,"similarity":0.9,"frequency":0.7},` +
+	`{"tag":"solo","category":0,"post_count":6000000,"similarity":0.8,"frequency":0.6},` +
+	`{"tag":"tie_lower_freq","category":0,"post_count":4990000,"similarity":0.7,"frequency":0.5},` +
+	`{"tag":"arm_behind_head","category":0,"post_count":20000,"similarity":0.5,"frequency":0.25},` +
+	`{"tag":"holding_sword","category":0,"post_count":40000,"similarity":0.4,"frequency":0.15},` +
+	`{"tag":"waving","category":0,"post_count":50000,"similarity":0.3,"frequency":0.12},` +
+	`{"tag":"bkub","category":1,"post_count":30000,"similarity":0.2,"frequency":0.09}` +
+	`]}`
+
+// liftRankedPayload is liftRankingEntries ranked by lift: liftRankedOrder,
+// each entry keeping its five historical fields in place with lift last. It
+// is the answer the lift tests expect while the whole-site count is
+// available and no limit cuts the list.
+const liftRankedPayload = `{"related":[` +
+	`{"tag":"arm_behind_head","category":0,"post_count":20000,"similarity":0.5,"frequency":0.25,"lift":125},` +
+	`{"tag":"holding_sword","category":0,"post_count":40000,"similarity":0.4,"frequency":0.15,"lift":37.5},` +
+	`{"tag":"bkub","category":1,"post_count":30000,"similarity":0.2,"frequency":0.09,"lift":30},` +
+	`{"tag":"waving","category":0,"post_count":50000,"similarity":0.3,"frequency":0.12,"lift":24},` +
+	`{"tag":"solo","category":0,"post_count":6000000,"similarity":0.8,"frequency":0.6,"lift":1},` +
+	`{"tag":"tie_lower_freq","category":0,"post_count":4990000,"similarity":0.7,"frequency":0.5,"lift":1},` +
+	`{"tag":"1girl","category":0,"post_count":8800000,"similarity":0.9,"frequency":0.7,"lift":0.8}` +
+	`]}`
+
+// TestRelated_LiftMathAndRanking pins the lift formula and the ranking it
+// drives on liftRankingEntries (query tag 10000 posts, site 10,000,000).
+// lift = frequency x N / post_count, rounded to two decimals, descending.
+// tie_lower_freq shares solo's rounded lift of 1 although it is the higher
+// unrounded value (1.002): its frequency is lower, so the stable sort keeps
+// it after solo. limit is applied after the ranking — a limit of 3 keeps the
+// three top-lift entries, which sit at upstream positions 6, 7 and 9 — and
+// the query tag and the meta entry stay excluded while the artist entry is
+// kept.
+func TestRelated_LiftMathAndRanking(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 10000, liftRankingEntries...),
+		countResp:   []byte(`{"counts":{"posts":10000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "arm_up", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := relatedNames(res); !slices.Equal(got, liftRankedOrder) {
+		t.Errorf("ranked order:\n got: %v\nwant: %v", got, liftRankedOrder)
+	}
+	wantLift := map[string]float64{
+		"arm_behind_head": 125, "holding_sword": 37.5,
+		"bkub": 30, "waving": 24, "solo": 1, "tie_lower_freq": 1, "1girl": 0.8,
+	}
+	for _, r := range res.Related {
+		if r.Lift == nil {
+			t.Errorf("%s: expected a lift, got none", r.Tag)
+			continue
+		}
+		if *r.Lift != wantLift[r.Tag] {
+			t.Errorf("%s: lift = %v, want %v", r.Tag, *r.Lift, wantLift[r.Tag])
+		}
+		if r.Category == danbooruCategoryMeta {
+			t.Errorf("%s: a meta entry must stay excluded", r.Tag)
+		}
+	}
+	for _, excluded := range []string{"arm_up", "highres"} {
+		if slices.Contains(relatedNames(res), excluded) {
+			t.Errorf("%s: the query tag and meta entries must stay excluded", excluded)
+		}
+	}
+	if got := marshalRelated(t, res); got != liftRankedPayload {
+		t.Errorf("payload (the five historical fields keep name, type and position; lift is last):\n got: %s\nwant: %s", got, liftRankedPayload)
+	}
+
+	// The limit cuts the ranked list, not the upstream one: truncating first
+	// would keep the three most frequent entries instead.
+	limited, err := svc.Related(context.Background(), "arm_up", 3)
+	if err != nil {
+		t.Fatalf("limited call: unexpected error: %v", err)
+	}
+	if got, want := relatedNames(limited), liftRankedOrder[:3]; !slices.Equal(got, want) {
+		t.Errorf("limit 3 must keep the three top-lift entries:\n got: %v\nwant: %v", got, want)
+	}
+	if mock.countCalls != 1 {
+		t.Errorf("the second call must answer from the memoized whole-site count, got %d request(s)", mock.countCalls)
+	}
+}
+
+// TestRelated_NonPositiveLimitKeepsAll pins the meaning of limit at its lower
+// end, which the lift ranking keeps: 0 or less is no limit, so every
+// candidate is answered — ranked while the whole-site count is available,
+// in Danbooru's order while it is not — as it was before the ranking.
+func TestRelated_NonPositiveLimitKeepsAll(t *testing.T) {
+	tests := []struct {
+		name      string
+		countErr  error
+		wantBytes string
+	}{
+		{"whole-site count available", nil, liftRankedPayload},
+		{"whole-site count unavailable", &upstreamMarkedError{}, liftUpstreamPayload},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, limit := range []int{0, -1} {
+				mock := &mockFetcher{
+					relatedResp: relatedBody("arm_up", 10000, liftRankingEntries...),
+					countErr:    tt.countErr,
+					countResp:   []byte(`{"counts":{"posts":10000000}}`),
+				}
+				svc := NewTagService(mock, nil)
+
+				res, err := svc.Related(context.Background(), "arm_up", limit)
+				if err != nil {
+					t.Fatalf("limit %d: unexpected error: %v", limit, err)
+				}
+				if got := marshalRelated(t, res); got != tt.wantBytes {
+					t.Errorf("limit %d must keep every entry:\n got: %s\nwant: %s", limit, got, tt.wantBytes)
+				}
+			}
+		})
+	}
+}
+
+// TestRelatedLift_FormulaRoundingAndGuards table-tests the pure lift helper.
+// The value is frequency x N / post_count rounded to two decimals: the
+// hundredths digit survives (14.77 is not 14.8, a lift of 0.01 is not 0) and
+// a third digit does not (12.3456 is 12.35, rounded, not cut to 12.34). The
+// answer is nil — no lift key on the wire — whenever the formula cannot be
+// evaluated: a 0-post entry (division by zero), a 0-frequency entry (a lift
+// of 0 would sort below real entries) or no site count.
+func TestRelatedLift_FormulaRoundingAndGuards(t *testing.T) {
+	lift := func(v float64) *float64 { return &v }
+	const site = 10000000
+	tests := []struct {
+		name      string
+		frequency float64
+		posts     int
+		sitePosts int
+		want      *float64 // nil = no lift
+	}{
+		{"whole number", 0.25, 20000, site, lift(125)},
+		{"keeps the hundredths digit", 0.1477, 100000, site, lift(14.77)},
+		{"hundredths digit next to a nine", 0.1499, 100000, site, lift(14.99)},
+		{"third decimal digit is rounded away", 0.123456, 100000, site, lift(12.35)},
+		{"below one", 0.7, 8800000, site, lift(0.8)},
+		{"small lift is not flattened to zero", 0.000001, 1000, site, lift(0.01)},
+		{"0-post entry has no lift", 0.2, 0, site, nil},
+		{"negative post count has no lift", 0.2, -5, site, nil},
+		{"0-frequency entry has no lift", 0, 1000, site, nil},
+		{"no site count", 0.5, 1000, 0, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := relatedLift(tt.frequency, tt.posts, tt.sitePosts)
+			switch {
+			case tt.want == nil && got != nil:
+				t.Errorf("relatedLift(%v, %d, %d) = %v, want no lift", tt.frequency, tt.posts, tt.sitePosts, *got)
+			case tt.want != nil && got == nil:
+				t.Errorf("relatedLift(%v, %d, %d) = no lift, want %v", tt.frequency, tt.posts, tt.sitePosts, *tt.want)
+			case tt.want != nil && *got != *tt.want:
+				t.Errorf("relatedLift(%v, %d, %d) = %v, want %v", tt.frequency, tt.posts, tt.sitePosts, *got, *tt.want)
+			}
+		})
+	}
+}
+
+// TestRelated_SiteCountFetchedOnce pins the whole-site count memo (R2): the
+// count is requested for the first answer that has entries, with empty tags
+// (the whole site), and never again in the process — the related request
+// itself stays live on every call.
+func TestRelated_SiteCountFetchedOnce(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 10000, liftRankingEntries...),
+		countResp:   []byte(`{"counts":{"posts":10000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	for call := 1; call <= 2; call++ {
+		res, err := svc.Related(context.Background(), "arm_up", 10)
+		if err != nil {
+			t.Fatalf("call %d: unexpected error: %v", call, err)
+		}
+		if len(res.Related) == 0 || res.Related[0].Tag != "arm_behind_head" || res.Related[0].Lift == nil {
+			t.Fatalf("call %d: expected a ranked answer carrying lift, got %+v", call, res.Related)
+		}
+	}
+	if mock.countCalls != 1 {
+		t.Errorf("the whole-site count must be requested once per process, got %d request(s)", mock.countCalls)
+	}
+	if mock.lastCountArg != "" {
+		t.Errorf("the whole-site count must be requested with empty tags, got %q", mock.lastCountArg)
+	}
+	if mock.relatedCalls != 2 {
+		t.Errorf("every call must make its own related request, got %d", mock.relatedCalls)
+	}
+}
+
+// TestRelated_SiteCountFailureDegradesAndRetries pins R3 and the failure
+// matrix: when the whole-site count cannot be had, the call still answers,
+// in exactly the pre-lift shape (upstream order, no lift key), and every
+// failure class behaves the same way. A failure is never memoized: the next
+// call requests the count again, and a count that then succeeds turns the
+// lift on.
+func TestRelated_SiteCountFailureDegradesAndRetries(t *testing.T) {
+	tests := []struct {
+		name      string
+		countErr  error
+		countResp []byte
+	}{
+		{"upstream-marked request failure", &upstreamMarkedError{}, nil},
+		{"unmarked request failure (definitive 4xx)", errors.New("danbooru 404: not found"), nil},
+		{"caller cancellation", context.Canceled, nil},
+		{"empty body", nil, nil},
+		{"unparsable body", nil, []byte(`<html>Downbooru</html>`)},
+		{"timed-out count (null)", nil, []byte(`{"counts":{"posts":null}}`)},
+		{"zero count", nil, []byte(`{"counts":{"posts":0}}`)},
+		{"negative count", nil, []byte(`{"counts":{"posts":-5}}`)},
+		{"not an integer", nil, []byte(`{"counts":{"posts":12.5}}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockFetcher{
+				relatedResp: relatedBody("arm_up", 10000, liftRankingEntries...),
+				countErr:    tt.countErr,
+				countResp:   tt.countResp,
+			}
+			svc := NewTagService(mock, nil)
+
+			res, err := svc.Related(context.Background(), "arm_up", 100)
+			if err != nil {
+				t.Fatalf("a failed whole-site count must never fail the call, got: %v", err)
+			}
+			if got := marshalRelated(t, res); got != liftUpstreamPayload {
+				t.Errorf("degraded payload (upstream order, no lift):\n got: %s\nwant: %s", got, liftUpstreamPayload)
+			}
+			if mock.countCalls != 1 {
+				t.Errorf("the call must try the whole-site count once, got %d request(s)", mock.countCalls)
+			}
+
+			// The failure was not memoized: the next call asks again.
+			mock.countErr, mock.countResp = nil, []byte(`{"counts":{"posts":10000000}}`)
+			res, err = svc.Related(context.Background(), "arm_up", 100)
+			if err != nil {
+				t.Fatalf("retry call: unexpected error: %v", err)
+			}
+			if mock.countCalls != 2 {
+				t.Errorf("a failed whole-site count must be requested again on the next call, got %d request(s) in total", mock.countCalls)
+			}
+			if got := relatedNames(res); !slices.Equal(got, liftRankedOrder) || res.Related[0].Lift == nil {
+				t.Errorf("a count that succeeds on retry must turn the lift ranking on, got %v", relatedLifts(res))
+			}
+		})
+	}
+}
+
+// TestRelated_EmptyResultSkipsSiteCount pins the empty answer: when nothing
+// is left after the exclusions (a tag Danbooru does not know, or one whose
+// only company is itself and meta tags), the answer is the bare
+// {"related":[]} — an empty list, never null — and the whole-site count is
+// not requested for it.
+func TestRelated_EmptyResultSkipsSiteCount(t *testing.T) {
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{"not-found shape", []byte(`{"query":"not_a_real_tag_xyz","post_count":0,"tag":null,"related_tags":[],"wiki_page_tags":[]}`)},
+		{"only the query tag and a meta entry", relatedBody("arm_up", 10000,
+			relatedEntry("arm_up", 10000, 0, 1, 1),
+			relatedEntry("highres", 9000000, 5, 0.8, 0.55),
+		)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockFetcher{relatedResp: tt.body, countResp: []byte(`{"counts":{"posts":10000000}}`)}
+			svc := NewTagService(mock, nil)
+
+			res, err := svc.Related(context.Background(), "arm_up", 10)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if res == nil {
+				t.Fatal("an empty answer is a valid answer, got nil")
+			}
+			if got := marshalRelated(t, res); got != `{"related":[]}` {
+				t.Errorf("empty answer:\n got: %s\nwant: {\"related\":[]}", got)
+			}
+			if mock.countCalls != 0 {
+				t.Errorf("an empty answer must not request the whole-site count, got %d request(s)", mock.countCalls)
+			}
+		})
+	}
+}
+
+// TestRelated_SupportFloorSinksLowOverlapEntries pins the support floor: an
+// entry backed by fewer than 5 posts (support = frequency x min(query
+// posts, 5000); exact here, the query tag has 40 posts) is not trusted to
+// rank, however high its lift. Such entries are sunk after every ranked one
+// — in upstream order among themselves, not in lift order — and never
+// dropped: they still carry their lift and a larger limit still reaches
+// them. An entry sitting exactly on the floor is ranked.
+func TestRelated_SupportFloorSinksLowOverlapEntries(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: relatedBody("warming_hands", 40,
+			relatedEntry("warming_hands", 40, 0, 1, 1),                       // the query tag: excluded
+			relatedEntry("kerosene_heater", 400, 0, 0.4, 0.4),                // support 16, lift 1000
+			relatedEntry("breathing_on_another's_hands", 700, 0, 0.35, 0.35), // support 14, lift 500
+			relatedEntry("breathing_on_hands", 3000, 0, 0.3, 0.3),            // support 12, lift 100
+			relatedEntry("joint_five", 500, 0, 0.25, 0.125),                  // support 5 (the floor), lift 250
+			relatedEntry("rare_pose_a", 25, 0, 0.1, 0.1),                     // support 4, lift 4000: sunk
+			relatedEntry("rare_pose_b", 12, 0, 0.05, 0.075),                  // support 3, lift 6250: sunk
+			relatedEntry("rare_pose_c", 50, 0, 0.05, 0.05),                   // support 2, lift 1000: sunk
+		),
+		countResp: []byte(`{"counts":{"posts":1000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "warming_hands", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantOrder := []string{
+		"kerosene_heater", "breathing_on_another's_hands", "joint_five", "breathing_on_hands",
+		"rare_pose_a", "rare_pose_b", "rare_pose_c",
+	}
+	if got := relatedNames(res); !slices.Equal(got, wantOrder) {
+		t.Errorf("ranked entries first, below-floor entries after them in upstream order:\n got: %v\nwant: %v", got, wantOrder)
+	}
+	wantLift := map[string]float64{
+		"kerosene_heater": 1000, "breathing_on_another's_hands": 500, "joint_five": 250,
+		"breathing_on_hands": 100, "rare_pose_a": 4000, "rare_pose_b": 6250, "rare_pose_c": 1000,
+	}
+	for _, r := range res.Related {
+		if r.Lift == nil {
+			t.Errorf("%s: every entry carries its lift, sunk ones included, got none", r.Tag)
+			continue
+		}
+		if *r.Lift != wantLift[r.Tag] {
+			t.Errorf("%s: lift = %v, want %v", r.Tag, *r.Lift, wantLift[r.Tag])
+		}
+	}
+
+	// Sunk, not dropped: a smaller limit still reaches the sunk entries.
+	limited, err := svc.Related(context.Background(), "warming_hands", 5)
+	if err != nil {
+		t.Fatalf("limited call: unexpected error: %v", err)
+	}
+	if got, want := relatedNames(limited), wantOrder[:5]; !slices.Equal(got, want) {
+		t.Errorf("limit 5:\n got: %v\nwant: %v", got, want)
+	}
+}
+
+// TestRelated_SupportIsCappedAtTheSampleSize pins the min(A, 5000) of the
+// support: Danbooru estimates every frequency of a query tag with more than
+// 5000 posts from 5000 of them, so an entry's support is frequency x 5000,
+// never frequency x the query tag's real post count (20000 here).
+// on_cap_floor sits exactly on the floor (0.001 x 5000 = 5) and is ranked.
+// Measured against 20000 posts the two entries below it would clear the
+// floor too and, having the higher lifts, take the top: they must stay
+// sunk, in upstream order, and still carry their lift.
+func TestRelated_SupportIsCappedAtTheSampleSize(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 20000,
+			relatedEntry("arm_up", 20000, 0, 1, 1),                      // the query tag: excluded
+			relatedEntry("ranked_low_lift", 10000, 0, 0.01, 0.002),      // support 10, lift 0.2
+			relatedEntry("on_cap_floor", 100, 0, 0.005, 0.001),          // support 5 (the floor), lift 10
+			relatedEntry("just_below_cap_floor", 30, 0, 0.0045, 0.0009), // support 4.5, lift 30: sunk
+			relatedEntry("below_cap_floor", 50, 0, 0.004, 0.0008),       // support 4, lift 16: sunk
+		),
+		countResp: []byte(`{"counts":{"posts":1000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "arm_up", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := `{"related":[` +
+		`{"tag":"on_cap_floor","category":0,"post_count":100,"similarity":0.005,"frequency":0.001,"lift":10},` +
+		`{"tag":"ranked_low_lift","category":0,"post_count":10000,"similarity":0.01,"frequency":0.002,"lift":0.2},` +
+		`{"tag":"just_below_cap_floor","category":0,"post_count":30,"similarity":0.0045,"frequency":0.0009,"lift":30},` +
+		`{"tag":"below_cap_floor","category":0,"post_count":50,"similarity":0.004,"frequency":0.0008,"lift":16}` +
+		`]}`
+	if got := marshalRelated(t, res); got != want {
+		t.Errorf("support is frequency x min(query posts, 5000):\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestRelated_ZeroPostCountKeepsUpstreamOrder pins the safe degradation when
+// the query tag's own count cannot support a ranking: a missing or zero
+// top-level post_count makes every support 0, so no entry reaches the floor
+// and the list stays in upstream order. The whole-site count is still had,
+// so every entry carries its lift. A query tag too small for any entry to
+// reach the floor (4 posts) answers the same way.
+func TestRelated_ZeroPostCountKeepsUpstreamOrder(t *testing.T) {
+	entries := []string{
+		relatedEntry("arm_up", 0, 0, 1, 1),                   // the query tag: excluded
+		relatedEntry("1girl", 8800000, 0, 0.9, 0.7),          // lift 0.8
+		relatedEntry("solo", 6000000, 0, 0.8, 0.6),           // lift 1
+		relatedEntry("arm_behind_head", 20000, 0, 0.5, 0.25), // lift 125: the highest, must not float up
+	}
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{"post_count key absent", []byte(fmt.Sprintf(`{"query":"arm_up","tag":null,"related_tags":[%s]}`, strings.Join(entries, ",")))},
+		{"post_count is zero", relatedBody("arm_up", 0, entries...)},
+		{"query tag too small for the floor", relatedBody("arm_up", 4, entries...)},
+	}
+	wantOrder := []string{"1girl", "solo", "arm_behind_head"}
+	wantLift := []float64{0.8, 1, 125}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := &mockFetcher{relatedResp: tt.body, countResp: []byte(`{"counts":{"posts":10000000}}`)}
+			svc := NewTagService(mock, nil)
+
+			res, err := svc.Related(context.Background(), "arm_up", 100)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got := relatedNames(res); !slices.Equal(got, wantOrder) {
+				t.Errorf("no re-ranking without a usable query count:\n got: %v\nwant: %v", got, wantOrder)
+			}
+			if mock.countCalls != 1 {
+				t.Errorf("the whole-site count is still requested, got %d request(s)", mock.countCalls)
+			}
+			for i, r := range res.Related {
+				if r.Lift == nil || *r.Lift != wantLift[i] {
+					t.Errorf("%s: lift = %v, want %v (attached, only the ranking is off)", r.Tag, r.Lift, wantLift[i])
+				}
+			}
+		})
+	}
+}
+
+// TestRelated_UncomputableLiftIsOmitted pins the defensive rule for entries
+// lift cannot be computed for: a 0-post or 0-frequency entry carries no lift
+// key rather than a wrong number. Neither occurs with today's upstream
+// logic. A 0-post entry that is well supported stays in the ranked group,
+// after every entry that has a lift; a 0-frequency entry is below the floor
+// like any other.
+func TestRelated_UncomputableLiftIsOmitted(t *testing.T) {
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 1000,
+			relatedEntry("arm_up", 1000, 0, 1, 1),     // the query tag: excluded
+			relatedEntry("live_a", 1000, 0, 0.5, 0.5), // lift 500
+			relatedEntry("dead_tag", 0, 0, 0.3, 0.2),  // 0 posts: no lift; support 200
+			relatedEntry("live_b", 2000, 0, 0.2, 0.1), // lift 50
+			relatedEntry("zero_freq", 500, 0, 0, 0),   // 0 frequency: no lift; support 0
+		),
+		countResp: []byte(`{"counts":{"posts":1000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "arm_up", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := `{"related":[` +
+		`{"tag":"live_a","category":0,"post_count":1000,"similarity":0.5,"frequency":0.5,"lift":500},` +
+		`{"tag":"live_b","category":0,"post_count":2000,"similarity":0.2,"frequency":0.1,"lift":50},` +
+		`{"tag":"dead_tag","category":0,"post_count":0,"similarity":0.3,"frequency":0.2},` +
+		`{"tag":"zero_freq","category":0,"post_count":500,"similarity":0,"frequency":0}` +
+		`]}`
+	if got := marshalRelated(t, res); got != want {
+		t.Errorf("payload:\n got: %s\nwant: %s", got, want)
+	}
+}
+
+// TestRelated_LiftTieBlockKeepsUpstreamOrder pins the answer for a long
+// block of equal lifts: 40 entries share one lift (100) and strictly
+// decrease in frequency, so upstream order and expected answer are both
+// tie_00, tie_01, ... An all-equal block is already sorted, and Go's
+// unstable sort leaves a sorted slice untouched, so this case cannot tell a
+// stable sort from an unstable one; the alternating case below can.
+func TestRelated_LiftTieBlockKeepsUpstreamOrder(t *testing.T) {
+	const tied = 40
+	// post_count = frequency x 100000 keeps lift = frequency x 10000000 /
+	// post_count at 100 for every entry.
+	entries := make([]string, 0, tied+1)
+	want := make([]string, 0, tied)
+	entries = append(entries, relatedEntry("arm_up", 10000, 0, 1, 1)) // the query tag: excluded
+	for i := 0; i < tied; i++ {
+		postCount := 50000 - 500*i
+		name := fmt.Sprintf("tie_%02d", i)
+		entries = append(entries, relatedEntry(name, postCount, 0, 0.1, float64(postCount)/100000))
+		want = append(want, name)
+	}
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 10000, entries...),
+		countResp:   []byte(`{"counts":{"posts":10000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "arm_up", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := relatedNames(res); !slices.Equal(got, want) {
+		t.Errorf("equal lifts keep upstream (frequency) order:\n got: %v\nwant: %v", got, want)
+	}
+	for _, r := range res.Related {
+		if r.Lift == nil || *r.Lift != 100 {
+			t.Errorf("every entry of the block carries lift 100, got %v", relatedLifts(res))
+			break
+		}
+	}
+}
+
+// TestRelated_EqualLiftsKeepUpstreamOrderAfterSwaps pins the stable sort on
+// an input an unstable sort scrambles: 80 entries whose lifts alternate
+// between 10 and 3 upstream, so sorting has to move every other entry and
+// must still keep each lift group in upstream order. (The all-equal block
+// above is already sorted, so an unstable sort never touches it; verified
+// by mutation: sort.Slice fails here and passes there.)
+func TestRelated_EqualLiftsKeepUpstreamOrderAfterSwaps(t *testing.T) {
+	const (
+		entries = 80
+		site    = 10000000
+		base    = 20000 // post counts base+i: every entry stays far above the support floor
+	)
+	upstream := make([]string, 1, entries+1)
+	upstream[0] = relatedEntry("arm_up", 10000, 0, 1, 1) // the query tag: excluded
+	var want []string
+	for _, parity := range []int{0, 1} { // answer order: the lift-10 group, then lift-3
+		for i := parity; i < entries; i += 2 {
+			want = append(want, fmt.Sprintf("alt_%02d", i))
+		}
+	}
+	for i := 0; i < entries; i++ {
+		lift, posts := 3.0, base+i
+		if i%2 == 0 {
+			lift = 10
+		}
+		upstream = append(upstream, relatedEntry(fmt.Sprintf("alt_%02d", i), posts, 0, 0.1, lift*float64(posts)/site))
+	}
+	mock := &mockFetcher{
+		relatedResp: relatedBody("arm_up", 10000, upstream...),
+		countResp:   []byte(`{"counts":{"posts":10000000}}`),
+	}
+	svc := NewTagService(mock, nil)
+
+	res, err := svc.Related(context.Background(), "arm_up", 100)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := relatedNames(res); !slices.Equal(got, want) {
+		t.Errorf("equal lifts keep upstream order even when the sort moves entries:\n got: %v\nwant: %v", got, want)
+	}
+	for i, r := range res.Related {
+		wantLift := 3.0
+		if i < entries/2 {
+			wantLift = 10
+		}
+		if r.Lift == nil || *r.Lift != wantLift {
+			t.Errorf("position %d (%s): lift = %v, want %v", i, r.Tag, r.Lift, wantLift)
+		}
+	}
+}
+
+// countedCountFetcher wraps the mock for the test that calls Related from
+// several goroutines at once (the plain mock's counters are not
+// synchronized). It counts its own calls, records how many count requests
+// were in flight at the same time, and holds each one open for hold, so
+// concurrent callers pile up behind the memo.
+type countedCountFetcher struct {
+	*mockFetcher
+
+	hold time.Duration
+
+	mu          sync.Mutex
+	seenRelated int
+	seenCount   int
+	inFlight    int
+	maxInFlight int
+}
+
+// FetchRelated counts the call under the lock and answers from the canned body.
+func (f *countedCountFetcher) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
+	f.mu.Lock()
+	f.seenRelated++
+	f.mu.Unlock()
+	return f.mockFetcher.relatedResp, f.mockFetcher.relatedErr
+}
+
+// FetchPostCount counts the call, tracks the in-flight requests, holds the
+// request open for hold, then answers from the canned body.
+func (f *countedCountFetcher) FetchPostCount(ctx context.Context, tags string) ([]byte, error) {
+	f.mu.Lock()
+	f.seenCount++
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+	time.Sleep(f.hold)
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
+	return f.mockFetcher.countResp, f.mockFetcher.countErr
+}
+
+// counts returns how many related and count requests were made, and the
+// largest number of count requests that ran at the same time.
+func (f *countedCountFetcher) counts() (related, count, maxInFlight int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.seenRelated, f.seenCount, f.maxInFlight
+}
+
+// TestRelated_ConcurrentCallsFetchSiteCountOnce pins the memo under
+// concurrency (mcp-go runs tool calls on concurrent workers): the mutex is
+// held across the whole-site count request, so callers arriving while it is
+// in flight wait for it instead of sending their own. Every caller gets the
+// complete ranked answer, exactly one count request is made, and no two
+// count requests ever overlap.
+func TestRelated_ConcurrentCallsFetchSiteCountOnce(t *testing.T) {
+	const callers = 8
+	mock := &countedCountFetcher{
+		mockFetcher: &mockFetcher{
+			relatedResp: relatedBody("arm_up", 10000, liftRankingEntries...),
+			countResp:   []byte(`{"counts":{"posts":10000000}}`),
+		},
+		hold: 20 * time.Millisecond,
+	}
+	svc := NewTagService(mock, nil)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	results := make([]*RelatedResult, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			results[i], errs[i] = svc.Related(context.Background(), "arm_up", 10)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("caller %d: unexpected error: %v", i, err)
+		}
+	}
+	for i, res := range results {
+		if res == nil {
+			continue
+		}
+		if got := relatedNames(res); !slices.Equal(got, liftRankedOrder) || slices.ContainsFunc(res.Related, func(r RelatedTag) bool { return r.Lift == nil }) {
+			t.Errorf("caller %d: every concurrent answer must be the complete ranked list, got %v", i, relatedLifts(res))
+		}
+	}
+	related, count, maxInFlight := mock.counts()
+	if related != callers {
+		t.Errorf("every caller must make its own related request, got %d", related)
+	}
+	if count != 1 {
+		t.Errorf("the whole-site count must be requested once, however many callers race for it, got %d", count)
+	}
+	if maxInFlight != 1 {
+		t.Errorf("count requests must never overlap (the memo holds its mutex across the request), saw %d in flight", maxInFlight)
 	}
 }
 

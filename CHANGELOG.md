@@ -32,6 +32,21 @@ when tagging.
   call returns an error rather than `0`, which would read as "no such
   posts".
 
+### Changed
+
+- `get_related_tags` now ranks its entries by lift and gives each one a
+  `lift` field: how many times more often the tag co-occurs with the query
+  tag than its share of all posts predicts (`frequency x site-wide posts /
+  post_count`). Danbooru's own order is plain frequency, which puts corpus
+  constants such as `1girl` and `solo` on top and hides the tag-specific
+  companions; by lift they come first. Entries backed by fewer than five
+  sampled posts keep Danbooru's order at the end instead of being ranked,
+  `limit` is applied after the ranking, and the request to Danbooru grows
+  from 100 to 500 candidate entries. The site-wide post count the formula
+  divides by is fetched once per process; while it is unavailable the answer
+  is exactly the previous one: Danbooru's order, no `lift`. An empty answer
+  is now `{"related":[]}` instead of `{"related":null}`.
+
 ### Fixed
 
 - `get_tag_profile` no longer rejects valid Danbooru names that contain a

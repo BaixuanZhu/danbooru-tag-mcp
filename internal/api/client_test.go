@@ -602,6 +602,42 @@ func TestFetchAlias_BuildsCorrectURL(t *testing.T) {
 	}
 }
 
+// TestFetchRelated_BuildsCorrectURL pins the related request: GET
+// /related_tag.json for the tag as typed, asking for the whole candidate
+// pool (limit=500) instead of the default 100 entries, because the service
+// ranks the entries by lift and the high-lift companions sit far below the
+// frequency ranks the default page reaches. The whole query is compared,
+// which pins "query and limit and nothing else". Credentials are stripped
+// first: when the shell carries DANBOORU_LOGIN / DANBOORU_API_KEY, NewClient
+// injects them, and the comparison would fail and print them.
+func TestFetchRelated_BuildsCorrectURL(t *testing.T) {
+	var gotPath, gotMethod, gotQuery string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotMethod = r.URL.Path, r.Method
+		q := r.URL.Query()
+		q.Del("login")
+		q.Del("api_key")
+		gotQuery = q.Encode()
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"query":"arm_up","post_count":317377,"tag":null,"related_tags":[],"wiki_page_tags":[]}`))
+	}))
+	defer srv.Close()
+
+	cli := newTestClient(srv.URL)
+	if _, err := cli.FetchRelated(context.Background(), "arm_up"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if gotPath != "/related_tag.json" {
+		t.Errorf("expected /related_tag.json, got %q", gotPath)
+	}
+	if gotMethod != http.MethodGet {
+		t.Errorf("expected GET, got %s", gotMethod)
+	}
+	if want := "limit=500&query=arm_up"; gotQuery != want {
+		t.Errorf("query = %q, want %q", gotQuery, want)
+	}
+}
+
 func TestFetchWiki_BuildsCorrectURL(t *testing.T) {
 	cases := []struct {
 		name                 string
@@ -1168,5 +1204,123 @@ func TestChain_CountModeReachesTheClient(t *testing.T) {
 
 	if n := atomic.LoadInt32(&postsHits); n != 0 {
 		t.Errorf("count mode must never list posts, got %d /posts.json requests", n)
+	}
+}
+
+// TestChain_RelatedLiftReachesTheClient runs the whole api -> service ->
+// tools chain for get_related_tags against one local server that answers
+// /related_tag.json and /counts/posts.json from switchable knobs. The
+// related request asks for the whole candidate pool (limit=500) and is
+// answered ranked by lift, the caller's limit cutting the ranked list. While
+// the whole-site count cannot be had (a 503, retried first) the call still
+// succeeds with exactly the pre-lift payload, unmarked, and the next call
+// asks for the count again. An outage on the related request itself is the
+// uniform marked upstream_unavailable result once the retries are spent, and
+// never costs a count request.
+func TestChain_RelatedLiftReachesTheClient(t *testing.T) {
+	var mu sync.Mutex // guards the knobs between calls
+	relatedStatus, relatedContentType, relatedBody := http.StatusOK, "application/json",
+		`{"query":"arm_up","post_count":10000,"tag":null,"related_tags":[`+
+			`{"tag":{"name":"arm_up","post_count":10000,"category":0},"cosine_similarity":1,"frequency":1},`+
+			`{"tag":{"name":"1girl","post_count":8800000,"category":0},"cosine_similarity":0.9,"frequency":0.7},`+
+			`{"tag":{"name":"highres","post_count":9000000,"category":5},"cosine_similarity":0.8,"frequency":0.55},`+
+			`{"tag":{"name":"arm_behind_head","post_count":20000,"category":0},"cosine_similarity":0.5,"frequency":0.25}`+
+			`],"wiki_page_tags":[]}`
+	countStatus, countContentType, countBody := http.StatusServiceUnavailable, "text/html",
+		`<html><head><title>Downbooru</title></head></html>`
+	var relatedHits, countHits int32
+	var relatedQuery string
+	cli := newChainClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/related_tag.json":
+			atomic.AddInt32(&relatedHits, 1)
+			// The whole query is recorded and later compared, which pins
+			// "query and limit and nothing else". Credentials are stripped
+			// first: the comparison would fail and print them when the shell
+			// carries DANBOORU_LOGIN / DANBOORU_API_KEY.
+			q := r.URL.Query()
+			q.Del("login")
+			q.Del("api_key")
+			relatedQuery = q.Encode()
+			w.Header().Set("Content-Type", relatedContentType)
+			w.WriteHeader(relatedStatus)
+			w.Write([]byte(relatedBody))
+		case "/counts/posts.json":
+			atomic.AddInt32(&countHits, 1)
+			w.Header().Set("Content-Type", countContentType)
+			w.WriteHeader(countStatus)
+			w.Write([]byte(countBody))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	serveRelated := func(status int, contentType, body string) {
+		mu.Lock()
+		defer mu.Unlock()
+		relatedStatus, relatedContentType, relatedBody = status, contentType, body
+	}
+	serveCount := func(status int, contentType, body string) {
+		mu.Lock()
+		defer mu.Unlock()
+		countStatus, countContentType, countBody = status, contentType, body
+	}
+	// limit 1: the ranking shows in which single entry survives it.
+	args := map[string]any{"tag": "arm_up", "limit": 1}
+
+	// The whole-site count is down: the call still answers, and the answer is
+	// exactly the pre-lift payload for that limit — the most frequent entry,
+	// no lift key — as a plain result, never as an outage.
+	res, text := callToolText(t, cli, "get_related_tags", args)
+	if want := `{"related":[{"tag":"1girl","category":0,"post_count":8800000,"similarity":0.9,"frequency":0.7}]}`; text != want {
+		t.Errorf("whole-site count down:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError || strings.Contains(text, "upstream_unavailable") {
+		t.Errorf("a failed whole-site count must degrade, not fail (IsError %v): %s", res.IsError, text)
+	}
+	if got := atomic.LoadInt32(&countHits); got != 1+maxRetries {
+		t.Errorf("a 5xx on the counts request must be retried before the answer degrades, expected %d attempts, got %d", 1+maxRetries, got)
+	}
+	if got := atomic.LoadInt32(&relatedHits); got != 1 {
+		t.Errorf("one call must make one related request, got %d", got)
+	}
+	if want := "limit=500&query=arm_up"; relatedQuery != want {
+		t.Errorf("related query = %q, want %q", relatedQuery, want)
+	}
+
+	// The whole-site count is back: requested again (nothing was memoized),
+	// and the single entry the limit keeps is the top-lift one, not the most
+	// frequent one.
+	serveCount(http.StatusOK, "application/json", `{"counts":{"posts":10000000}}`)
+	before := atomic.LoadInt32(&countHits)
+	res, text = callToolText(t, cli, "get_related_tags", args)
+	if want := `{"related":[{"tag":"arm_behind_head","category":0,"post_count":20000,"similarity":0.5,"frequency":0.25,"lift":125}]}`; text != want {
+		t.Errorf("whole-site count back:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError {
+		t.Errorf("a ranked answer must not be flagged at the protocol level, got: %+v", res)
+	}
+	if got := atomic.LoadInt32(&countHits) - before; got != 1 {
+		t.Errorf("a failed whole-site count must be requested again on the next call, got %d", got)
+	}
+
+	// An outage on the related request itself: retried, then the uniform
+	// marked result. The count is memoized by now and is not asked for.
+	serveRelated(http.StatusServiceUnavailable, "text/html", `<html><head><title>Downbooru</title></head></html>`)
+	relatedBefore, countBefore := atomic.LoadInt32(&relatedHits), atomic.LoadInt32(&countHits)
+	res, text = callToolText(t, cli, "get_related_tags", args)
+	if !res.IsError {
+		t.Errorf("the outage must be flagged at the protocol level, got: %+v", res)
+	}
+	if want := `{"error":"upstream_unavailable","message":"Danbooru is not answering right now: danbooru 503 (Downbooru). All tools of this server are affected; retry later."}`; text != want {
+		t.Errorf("outage:\n got: %s\nwant: %s", text, want)
+	}
+	if got := atomic.LoadInt32(&relatedHits) - relatedBefore; got != 1+maxRetries {
+		t.Errorf("a 5xx must be retried before the marked result, expected %d attempts, got %d", 1+maxRetries, got)
+	}
+	if got := atomic.LoadInt32(&countHits) - countBefore; got != 0 {
+		t.Errorf("a failed related request must not ask for the whole-site count, got %d", got)
 	}
 }

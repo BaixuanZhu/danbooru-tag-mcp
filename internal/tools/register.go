@@ -148,7 +148,7 @@ var (
 	)
 
 	GetRelatedTagsTool = mcp.NewTool("get_related_tags",
-		mcp.WithDescription("Get co-occurring tags for a given tag (meta-category tags excluded)"),
+		mcp.WithDescription("Get co-occurring tags for a given tag (meta-category tags excluded), ranked by lift (tag-specific companions first, low-overlap entries last)"),
 		mcp.WithString("tag",
 			mcp.Required(),
 			mcp.Description("tag to find co-occurring tags for"),

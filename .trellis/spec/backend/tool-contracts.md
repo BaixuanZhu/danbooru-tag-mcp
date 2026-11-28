@@ -98,3 +98,91 @@ if err != nil {
     return nil, err // failResult: unmarked text, or upstream_unavailable only for a marked error
 }
 ```
+
+---
+
+## Scenario: get_related_tags lift ranking
+
+### 1. Scope / Trigger
+
+- Cross-layer contract (task 11-28-related-tags-lift, 2026-11-28): a new
+  response field, a changed entry order, a larger upstream request, and a
+  per-process memo shared by concurrent tool calls.
+
+### 2. Signatures
+
+- Tool: `get_related_tags(tag, limit? = 10)`; the schema is unchanged and
+  the description gains one clause.
+- api: `FetchRelated(ctx, tag)` -> `GET /related_tag.json?query=<tag>&limit=500`
+  (`relatedPoolSize`); `FetchPostCount(ctx, "")` supplies the whole-site
+  count.
+- service: `RelatedTag.Lift *float64` (`json:"lift,omitempty"`),
+  `danbooruRelatedResponse.PostCount`, `sitePostCount(ctx) (int, bool)`,
+  `relatedLift(frequency, postCount, sitePosts) *float64`,
+  `rankRelatedByLift(candidates, queryPosts, sitePosts) []RelatedTag`,
+  `relatedSupportFloor = 5`, `relatedSampleCap = 5000`.
+
+### 3. Contracts
+
+- `lift(B|A) = frequency * N / B`, rounded to two decimals (`frequency` is
+  Danbooru's own estimate from up to 5000 sampled posts of A).
+- `support = frequency * min(A, 5000)`; entries with `support >= 5` are
+  ranked by lift descending with a stable sort (upstream frequency order
+  breaks ties); the rest follow in upstream order, never dropped; `limit`
+  is applied after the ranking.
+- `lift` is attached to every candidate whenever N is available; an entry
+  with `post_count == 0` or `frequency == 0` carries none.
+- N is memoized in memory only, success only, with the mutex held across the
+  request (concurrent callers share one fetch).
+
+### 4. Validation & Error Matrix
+
+| Condition | Behavior |
+|---|---|
+| related request fails after retries | uniform `upstream_unavailable`; no N request |
+| not-found tag (no candidates) | `{"related":[]}`; no N request |
+| N request fails (any class), unparsable body, explicit null, or a value <= 0 | Danbooru's order, no `lift` key; N is requested again on the next call |
+| top-level `post_count` missing or 0 | every support is 0: upstream order, `lift` attached |
+
+### 5. Good / Base / Bad Cases
+
+- Good: for `arm_up` the first entry is a tag-specific pose companion
+  (lift about 14.8 in the 2026-11-28 probe), not `1girl`.
+- Base: `limit=3` returns the three highest-lift supported entries.
+- Bad: the N request answers 503 -> the pre-lift payload, field for field;
+  the next call recovers on its own.
+
+### 6. Tests Required
+
+- `TestRelated_LiftMathAndRanking`, `TestRelatedLift_FormulaRoundingAndGuards`
+  (two decimals and the nil guards), `_SupportFloorSinksLowOverlapEntries`,
+  `_SupportIsCappedAtTheSampleSize`, `_ZeroPostCountKeepsUpstreamOrder`,
+  `_UncomputableLiftIsOmitted`, `_EqualLiftsKeepUpstreamOrderAfterSwaps`
+  (the stable sort), `_NonPositiveLimitKeepsAll`, `_SiteCountFetchedOnce`,
+  `_SiteCountFailureDegradesAndRetries`, `_EmptyResultSkipsSiteCount`,
+  `_PayloadBytesWithoutSiteCount`, `_ConcurrentCallsFetchSiteCountOnce`
+  (run under the race detector); api `TestFetchRelated_BuildsCorrectURL` and
+  the real-chain `TestChain_RelatedLiftReachesTheClient`; tools
+  `TestGetRelatedTagsHandler_PayloadBytes`, `TestGetRelatedTagsTool_DescriptionNamesLiftOnce`;
+  integration check 26.
+- A mutation battery (through `go test -overlay`, never on the tree) must
+  stay at zero survivors: unstable sort, no support floor, no rounding, no
+  memo, sunk ranked first, formula inverted, failure memoized, mutex not
+  held across the fetch, empty answer requesting N, limit before ranking,
+  empty answer as `null`, a missing or moved `min(A, 5000)` cap, rounding to
+  one or three decimals, and a `FetchRelated` that bypasses `Client.Get`.
+
+### 7. Wrong vs Correct
+
+Wrong: a sort that does not promise stability loses the tie-break.
+
+```go
+sort.Slice(ranked, func(i, j int) bool { return relatedLiftHigher(ranked[i], ranked[j]) })
+```
+
+Correct: stability is part of the contract, and it is pinned on an input an
+unstable sort scrambles.
+
+```go
+sort.SliceStable(ranked, func(i, j int) bool { return relatedLiftHigher(ranked[i], ranked[j]) })
+```

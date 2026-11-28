@@ -455,10 +455,20 @@ func (c *Client) FetchTagsByNames(ctx context.Context, names []string) ([]byte, 
 	return c.Get(ctx, "/tags.json", q)
 }
 
-// FetchRelated fetches the co-occurrence table for one tag.
+// relatedPoolSize is how many related entries FetchRelated asks Danbooru for:
+// the whole candidate pool. The endpoint's default page of 100 stops well
+// above the high-lift companions the service ranks by lift (for arm_up they
+// sit at frequency ranks 13-90 of a 500-entry pool, verified live), so a
+// smaller pool would cap what the ranking can surface. About 190 KB for the
+// largest tags.
+const relatedPoolSize = 500
+
+// FetchRelated fetches the co-occurrence table for one tag: the whole
+// candidate pool (limit=500), not the endpoint's default page of 100.
 func (c *Client) FetchRelated(ctx context.Context, tag string) ([]byte, error) {
 	q := make(url.Values)
 	q.Set("query", tag)
+	q.Set("limit", strconv.Itoa(relatedPoolSize))
 	return c.Get(ctx, "/related_tag.json", q)
 }
 

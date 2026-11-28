@@ -193,7 +193,7 @@ See [plugins/danbooru-tag-mcp/README.md](plugins/danbooru-tag-mcp/README.md).
 | `search_tags` | Search tags by keyword, ordered by post count |
 | `get_tag_info` | Exact info for one tag, with a WD14 verdict on the name |
 | `get_tags_info` | The same for up to 20 names in one request |
-| `get_related_tags` | Tags that co-occur with a given tag |
+| `get_related_tags` | Tags that co-occur with a given tag, ranked by lift |
 | `get_tag_alias` | Resolve an alias or misspelling to its canonical tag |
 | `get_tag_wiki` | A tag's wiki page as structured fields |
 | `search_posts` | Posts matching a tag combination, with their tag lists |
@@ -232,7 +232,13 @@ carrying its `wd14` verdict).
 
 `tag` (required) · `limit` (10)
 
-Meta-category tags like `highres` are filtered out as noise.
+Meta-category tags like `highres` are filtered out as noise. Entries are
+ranked by `lift` (`frequency` x site-wide posts / `post_count`: how much
+more often the tag co-occurs with `tag` than its share of all posts
+predicts), so tag-specific companions come before corpus constants such as
+`1girl`. Entries backed by fewer than 5 sampled posts keep Danbooru's
+frequency order at the end. If the site-wide post count is unavailable, the
+whole answer falls back to that frequency order without `lift`.
 
 #### `get_tag_alias`
 

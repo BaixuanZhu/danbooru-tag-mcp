@@ -76,7 +76,10 @@ mode, where writing to stdout is allowed.
 **Retry + error shrink + upstream marking (reliability boundary,
 test-enforced, do not break)**: every tool answers from live Danbooru — the
 response cache (0.6.0) was removed in 0.7.0, so there is no stale-serve
-fallback and no `refresh`/`stale`/`cached_at` anywhere. `Client.Get` is a
+fallback and no `refresh`/`stale`/`cached_at` anywhere. The one in-process
+exception is the whole-site post count that `get_related_tags` memoizes as
+the divisor of lift (see Lift ranking below): a number, never a response.
+`Client.Get` is a
 straight line: rate-limit wait, credential injection, retry loop.
 Concurrency contract: `c.mu` guards only the rate-limit accounting while
 sleeps and retries run unlocked. Retries: up to 2 retries on 5xx, network
@@ -176,7 +179,8 @@ request — and a metatag-looking token (`isMetatagToken`) is never joined
 `TestSearchPosts_SpaceSplit*`).
 `Related` drops both the query tag itself and
 meta-category (5) entries, because meta tags like `highres` co-occur with
-everything and drown out content tags. Category ids are 0=general, 1=artist,
+everything and drown out content tags; what remains is ranked by lift (next
+paragraph). Category ids are 0=general, 1=artist,
 3=copyright, 4=character, 5=meta (Danbooru's actual API numbering — verified
 live, do not "fix" to the 0-4 continuous scheme). `Search` takes a numeric
 category id (-1 = no filter); the API rejects category names (verified live)
@@ -185,6 +189,42 @@ also takes `minPosts` (local post-count filter applied after the fetch,
 default 0 keeps all and may return fewer than `limit`; a filtered-to-empty
 result still counts as no-live-result for the wd14 fallback). These
 behaviors are pinned by unit tests and the integration script.
+
+**Lift ranking (get_related_tags, test-enforced, do not break)**: after the
+exclusions, `Related` ranks the candidates by `lift = frequency x N /
+post_count` (two decimals; N = whole-site post count, A = the related
+response's top-level `post_count`, the query tag's own count). Danbooru's
+order is plain frequency, which puts corpus constants such as `1girl` and
+`solo` on top of every big tag (live: arm_up's tag-specific companions sit
+at frequency ranks 13-90). The candidate pool is `relatedPoolSize = 500`
+entries (`FetchRelated` sends `limit=500`; the endpoint's default page of
+100 would cap the ranking's recall). Support floor: `support = frequency x
+min(A, 5000)`; entries with support >= 5 (`relatedSupportFloor`, the number
+`profileMinPairCount` also uses) are ranked by lift with a STABLE sort, so
+upstream frequency order breaks ties; the rest follow in upstream order,
+sunk and never dropped. `limit` is applied AFTER the ranking. `Lift
+*float64` (`omitempty`) is attached to every candidate whenever N is
+available, sunk ones included; an entry with `post_count == 0` or
+`frequency == 0` gets none, and a missing or zero A makes every support 0
+(upstream order, `lift` attached). N is memoized per process on `TagService`
+(`sitePostCount`: the mutex is held across the one request, so concurrent
+tool calls share it; success only — a request error of any class, an
+unparsable body or an explicit null count is requested again next call).
+While N is unavailable the answer is exactly the pre-lift payload: upstream
+order, no `lift`. No candidates means no N request and `{"related":[]}`
+(it used to be `null`). No `order` parameter and no category filter: both
+were rejected as context cost. Pinned by `TestRelated_LiftMathAndRanking`,
+`TestRelatedLift_FormulaRoundingAndGuards` (two decimals; the nil guards),
+`_SiteCountFetchedOnce`, `_SiteCountFailureDegradesAndRetries`,
+`_EmptyResultSkipsSiteCount`, `_SupportFloorSinksLowOverlapEntries`,
+`_SupportIsCappedAtTheSampleSize`, `_ZeroPostCountKeepsUpstreamOrder`,
+`_UncomputableLiftIsOmitted`, `_PayloadBytesWithoutSiteCount`,
+`_NonPositiveLimitKeepsAll`, `_ConcurrentCallsFetchSiteCountOnce` and
+`_EqualLiftsKeepUpstreamOrderAfterSwaps` (a stable sort can only be pinned
+on an input that an unstable sort scrambles: an all-equal block is already
+sorted, so `sort.Slice` leaves it untouched); the real api -> service ->
+tools chain in `TestChain_RelatedLiftReachesTheClient`; integration check
+26.
 
 **Wiki structured extraction (get_tag_wiki, test-enforced, do not break)**:
 the raw DText `body` is REMOVED from the response (breaking change, user

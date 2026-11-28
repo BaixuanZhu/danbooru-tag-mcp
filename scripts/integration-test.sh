@@ -48,7 +48,7 @@ unset DANBOORU_LOGIN DANBOORU_API_KEY
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 25 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 26 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -79,6 +79,7 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue hair order:random"}}}'
   req '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue xyzzy"}}}'
   req '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue_hair","count_only":true}}}'
+  req '{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"get_related_tags","arguments":{"tag":"arm_up","limit":10}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -371,6 +372,32 @@ check(r25.get('query') == 'blue_hair'
       and r25['total'] > 0
       and abs(r25['total'] - tag.get('post_count', -1)) <= 10,
       'search_posts: count_only answers {query,total} matching the tag post_count')
+
+# 26. get_related_tags ranks by lift. For a tag this size the first 10
+#     entries all clear the support floor, so they must be sorted by lift;
+#     the order must also follow frequency / post_count, which is the lift
+#     formula without its site-wide factor (rounding may tie neighbours, so
+#     only a strict drop of lift has to match a drop of the ratio). Lift
+#     pushes corpus constants such as 1girl off the top, and meta tags stay
+#     excluded.
+rel26 = payload(26).get('related')
+if not isinstance(rel26, list) or not rel26:
+    check(False, 'get_related_tags: returns a non-empty list')
+else:
+    lifts26 = [e.get('lift') for e in rel26]
+    check(all(isinstance(x, (int, float)) for x in lifts26)
+          and lifts26 == sorted(lifts26, reverse=True)
+          and all(e.get('category') != 5 for e in rel26),
+          'get_related_tags: every entry carries lift, sorted descending, meta excluded')
+    ratios26 = [e['frequency'] / e['post_count'] for e in rel26]
+    check(all(ratios26[i] >= ratios26[i + 1] for i in range(len(rel26) - 1)
+               if lifts26[i] > lifts26[i + 1]),
+          'get_related_tags: order follows frequency / post_count')
+    # A corpus constant such as 1girl sits near 1 (as often as chance);
+    # arm_up's tag-specific companions measured 4-15 on 2026-11-28.
+    check(rel26[0].get('tag') != '1girl' and isinstance(rel26[0].get('lift'), (int, float))
+          and rel26[0]['lift'] >= 3,
+          'get_related_tags: a tag-specific companion (lift >= 3) takes the top')
 
 print()
 if failures:

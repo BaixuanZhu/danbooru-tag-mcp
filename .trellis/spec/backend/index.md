@@ -18,7 +18,7 @@ This directory contains guidelines for backend development. Fill in each file wi
 | [Database Guidelines](./database-guidelines.md) | ORM patterns, queries, migrations | To fill |
 | [Error Handling](./error-handling.md) | Error types, handling strategies | Partial (common mistakes) |
 | [Resilience](./resilience.md) | Retry, error shrink, upstream-unavailable contracts | Filled |
-| [Tool Contracts](./tool-contracts.md) | Executable request/response contracts of the MCP tools, one scenario per cross-layer behavior | Filled (count mode) |
+| [Tool Contracts](./tool-contracts.md) | Executable request/response contracts of the MCP tools, one scenario per cross-layer behavior | Filled (count mode, lift ranking) |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Logging Guidelines](./logging-guidelines.md) | Structured logging, log levels | To fill |
 
