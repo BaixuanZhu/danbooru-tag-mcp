@@ -32,8 +32,10 @@ MCP client config:
 
 Environment variables:
   DANBOORU_LOGIN / DANBOORU_API_KEY   Danbooru API credentials. With both set
-                                      requests are authenticated; otherwise
-                                      the client is anonymous.
+                                      requests are authenticated and
+                                      search_posts tries up to 6 tags directly
+                                      (anonymous: 2); otherwise the client is
+                                      anonymous.
   DANBOORU_REQ_GAP_MS                 Minimum spacing between requests in ms.
                                       Default 1500 anonymous, 500 with
                                       credentials. 0 = no gap; an invalid

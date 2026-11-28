@@ -19,12 +19,13 @@
 # Usage:
 #   bash scripts/integration-test.sh [exe]
 #   Default exe: dist/amd64/danbooru-tag-mcp.exe (build it first: make build).
-#   stdin hold-open time is tunable via DANBOORU_MCP_IT_SLEEP (default 60s).
+#   stdin hold-open time is tunable via DANBOORU_MCP_IT_SLEEP (default 120s:
+#   the multi-tag scans cost several requests each).
 
 set -euo pipefail
 
 EXE="${1:-dist/amd64/danbooru-tag-mcp.exe}"
-SLEEP="${DANBOORU_MCP_IT_SLEEP:-60}"
+SLEEP="${DANBOORU_MCP_IT_SLEEP:-120}"
 
 if [ ! -f "$EXE" ]; then
   echo "[integration] exe not found: $EXE (build it first: make build)" >&2
@@ -48,7 +49,7 @@ unset DANBOORU_LOGIN DANBOORU_API_KEY
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 26 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 31 requests)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -80,6 +81,11 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue xyzzy"}}}'
   req '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue_hair","count_only":true}}}'
   req '{"jsonrpc":"2.0","id":26,"method":"tools/call","params":{"name":"get_related_tags","arguments":{"tag":"arm_up","limit":10}}}'
+  req '{"jsonrpc":"2.0","id":27,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl arm_up sword","limit":10}}}'
+  req '{"jsonrpc":"2.0","id":28,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl arm_up sword order:score","limit":3}}}'
+  req '{"jsonrpc":"2.0","id":29,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"firefly_(honkai:_star_rail) honkai:_star_rail 1girl","limit":5}}}'
+  req '{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl arm_up sword","count_only":true}}}'
+  req '{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue hair one two three four five","limit":3}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -205,12 +211,31 @@ check(bool(posts) and all(p.get('rating') == 'e' for p in posts)
       and all(isinstance(p.get('tags', {}).get('general'), list)
               and len(p['tags']['general']) > 0 for p in posts),
       'search_posts: caller rating metatag honored + categorized tag list per post')
+# Every posts request asks Danbooru for the light field set, so pin that the
+# consumed fields still arrive: the id/number/url fields and all five tag
+# categories of every post.
+check(bool(posts) and all(k in p for p in posts for k in
+                          ('id', 'rating', 'score', 'fav_count', 'preview_file_url', 'large_file_url'))
+      and all(set(p.get('tags', {})) == {'copyright', 'artist', 'character', 'general', 'meta'}
+              for p in posts),
+      'search_posts: light post payload still carries every consumed field')
 
-# 9. tag-count pre-validation (rejected locally, no network round trip)
-err = payload(9)
-check(err.get('error') == 'post_search_failed'
-      and 'too many content tags' in err.get('message', ''),
-      'search_posts: over-limit query rejected locally')
+def tagset(post):
+    return set(t for group in (post.get('tags') or {}).values() for t in group)
+
+# 9. search_posts with three content tags. Anonymous Danbooru allows two, so
+#    the server answers with a local scan: the two rarest tags go upstream
+#    and the third is applied from each post's own tag list. Every returned
+#    post must carry all three tags, the answer names the query that went
+#    upstream, and it is complete.
+r9 = payload(9)
+posts9 = r9.get('posts')
+check(isinstance(posts9, list) and bool(posts9)
+      and all({'1girl', 'blue_hair', 'long_hair'} <= tagset(p) for p in posts9)
+      and r9.get('upstream_query') == 'blue_hair long_hair'
+      and r9.get('complete') is True
+      and isinstance(r9.get('scanned'), int) and r9['scanned'] >= len(posts9),
+      'search_posts: 3-tag query answered by a complete local scan')
 
 # 10. get_tag_info on a tagger-era name: gold_footwear exists only in the
 #     pinned WD14 vocabularies; Danbooru keeps it as a 0-post placeholder
@@ -346,14 +371,16 @@ r22 = payload(22)
 check(r22.get('posts') == [] and r22.get('possible_tags') == ['blue_hair'],
       'search_posts: empty answer names the joined tag in possible_tags')
 
-# 23. The same hint on the local over-limit error (no network round trip):
-#     "blue hair order:random" counts 3 content tokens, one over the
-#     anonymous cap, although blue_hair order:random is a legal query.
-err23 = payload(23)
-check(err23.get('error') == 'post_search_failed'
-      and 'too many content tags' in err23.get('message', '')
-      and "'blue hair' may be one tag: blue_hair" in err23.get('message', ''),
-      'search_posts: over-limit error names the joined tag')
+# 23. The same hint on a split answer: "blue hair order:random" is two
+#     0-post tokens (verified live) plus a metatag that counts as a term, so
+#     the scan sends one token (blue, 0 posts) with order:random, gets
+#     nothing back and names the vocabulary-backed join instead of a bare
+#     empty array.
+r23 = payload(23)
+check(r23.get('posts') == [] and r23.get('possible_tags') == ['blue_hair']
+      and r23.get('upstream_query') == 'blue order:random'
+      and r23.get('complete') is True,
+      'search_posts: empty scan answer names the joined tag')
 
 # 24. A genuinely dead query stays bare: no possible_tags key.
 r24 = payload(24)
@@ -398,6 +425,59 @@ else:
     check(rel26[0].get('tag') != '1girl' and isinstance(rel26[0].get('lift'), (int, float))
           and rel26[0]['lift'] >= 3,
           'get_related_tags: a tag-specific companion (lift >= 3) takes the top')
+
+# 27. A second 3-tag scan: every post carries all three tags, the two
+#     rarest (arm_up, sword) went upstream, and the answer is complete.
+r27 = payload(27)
+posts27 = r27.get('posts')
+check(isinstance(posts27, list) and bool(posts27)
+      and all({'1girl', 'arm_up', 'sword'} <= tagset(p) for p in posts27)
+      and r27.get('upstream_query') == 'arm_up sword'
+      and r27.get('complete') is True,
+      'search_posts: 3-tag scan is complete and carries all three tags')
+
+# 28. Three tags plus a metatag that counts as a term: order:score uses one
+#     of the two terms an anonymous query may have, so the scan sends ONE
+#     tag (the rarest, arm_up) with order:score and applies the other two
+#     locally. Before the multi-tag change the same query was a Danbooru
+#     422. complete may be false: five pages of the top-scored arm_up posts
+#     need not hold three posts with both other tags.
+r28 = payload(28)
+posts28 = r28.get('posts')
+check(isinstance(posts28, list)
+      and r28.get('upstream_query') == 'arm_up order:score'
+      and isinstance(r28.get('scanned'), int) and r28['scanned'] >= 1
+      and r28.get('complete') in (True, False)
+      and all({'1girl', 'arm_up', 'sword'} <= tagset(p) for p in posts28),
+      'search_posts: a counting metatag shrinks the scan to one tag')
+
+# 29. Colon-bearing names are content tags: both resolve through the batch
+#     lookup and the rarest pair goes upstream under its canonical names.
+r29 = payload(29)
+posts29 = r29.get('posts')
+check(isinstance(posts29, list) and bool(posts29)
+      and all({'firefly_(honkai:_star_rail)', 'honkai:_star_rail', '1girl'} <= tagset(p) for p in posts29)
+      and r29.get('upstream_query') == 'firefly_(honkai:_star_rail) honkai:_star_rail',
+      'search_posts: colon-bearing tags are scanned as content tags')
+
+# 30. Count mode over a scan reports the matches found, how many posts were
+#     scanned and whether that is the whole answer; the scan is bounded at
+#     5 pages of 200 posts. The pair listing holds more than that, so the
+#     count is normally a lower bound (complete false).
+r30 = payload(30)
+check(isinstance(r30.get('total'), int) and r30['total'] >= 1
+      and isinstance(r30.get('scanned'), int) and 1 <= r30['scanned'] <= 1000
+      and r30.get('complete') in (True, False)
+      and r30.get('query') == '1girl arm_up sword',
+      'search_posts: count over a scan reports total, scanned and complete')
+
+# 31. More than six content tags are refused locally, and the over-limit
+#     error still names a space-split pair (no network round trip).
+err31 = payload(31)
+check(err31.get('error') == 'post_search_failed'
+      and 'too many content tags: 7 (max 6' in err31.get('message', '')
+      and "'blue hair' may be one tag: blue_hair" in err31.get('message', ''),
+      'search_posts: 7 content tags refused locally with the joined-tag hint')
 
 print()
 if failures:

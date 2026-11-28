@@ -26,10 +26,16 @@ wiring (`DANBOORU_REQ_GAP_MS`) are involved.
 ```go
 // internal/app — the leaf sentinel both api and tools depend on
 var ErrUpstreamUnavailable = errors.New("danbooru unavailable")
+// second sentinel: a classified 422 refusal that may trigger a fallback
+var ErrTagLimitExceeded = errors.New("danbooru tag limit exceeded")
 
 // internal/api
 type upstreamError struct{ err error } // Is(app.ErrUpstreamUnavailable) == true
+// wraps a 422 whose body carries "TagLimitError"; Error() is the unchanged
+// shrunken text, Is matches ONLY app.ErrTagLimitExceeded
+type tagLimitError struct{ err error }
 // Get(ctx, path, params) ([]byte, error); the eight Fetch* likewise
+// FetchPosts(ctx, tags, limit, page) sends only=<light fields> on every call
 // doWithRetry(ctx, reqURL) ([]byte, error)
 
 // internal/tools
@@ -77,6 +83,7 @@ func failResult(err error, code string) (*mcp.CallToolResult, error)
 | retries exhausted on a transient class | error wrapped in `*upstreamError`; tools return the uniform marked result |
 | ctx canceled | abort immediately: no retry, plain error, NOT marked |
 | definitive 4xx (401/403/404/422) | shrunken error after one attempt; NOT marked |
+| 422 whose body carries `TagLimitError` | wrapped in `*tagLimitError` (text unchanged); service may fall back to the local scan via `errors.Is(err, app.ErrTagLimitExceeded)` only — any other consumer sees the plain error |
 | validation / parse error (service layer) | tool's own code, plain text result; NOT marked |
 | HTML error body | error carries status + `<title>` only |
 | non-HTML error body | truncated to 300 bytes |

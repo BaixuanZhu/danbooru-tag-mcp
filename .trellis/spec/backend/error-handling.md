@@ -63,6 +63,13 @@ definitive answer from a reachable upstream.
 `app.ErrUpstreamUnavailable` — it descends from the old `transientError`
 sentinel that gated the removed stale fallback) and gate every fallback or
 result-mapping branch on `errors.Is` / `errors.As`, never on `err != nil`.
+The rule covers refusals that trigger a fallback as well: a 422 whose body
+carries `TagLimitError` is wrapped in `*tagLimitError` (`Error()` is the
+unchanged shrunken text, `Is` matches only
+`app.ErrTagLimitExceeded`), and only `errors.Is(err,
+app.ErrTagLimitExceeded)` may switch `SearchPosts` / `CountPosts` to the
+local scan (`TestSearchPosts_TagLimitFallback` pins that another 422, an
+outage and a cancellation come back untouched).
 
 **Prevention**: any new fallback or masking path must answer "which error
 classes may trigger me?" before review. See
@@ -148,13 +155,16 @@ single-token input is `isSingleTagName`'s rule, not the predicate's.
 When a wrong verdict rejects input or counts a token against a limit, use
 the known-key predicate; a colon token whose key is not listed is a content
 tag unless Danbooru says otherwise. Keep the two lists apart: query
-classification wants the search keys only. `isMetatagToken` in `tag.go` is
-deliberately broader (any colon) and `search_posts` uses it for the tag
-count, the diff subtraction and the space-split candidate detection; for
-the count, exempting a token is the safe side, so it differs from
-`isDanbooruMetatag` on purpose. The guard is a clear-error path, not the
-injection barrier — profile sample queries are built from resolved row
-names, never from caller text.
+classification wants the search keys only. Every `search_posts` token
+classification — the term count, the `diff` subtraction and the space-split
+candidate detection — goes through `isDanbooruMetatag` (the old any-colon
+`isMetatagToken` was removed with the multi-tag scan: it miscounted real
+tags such as `honkai:_star_rail`, and a token it wrongly called a metatag
+would silently skip a local filter); the scan settles a colon token by its
+batch row instead of the list alone, so a metatag missing from the list
+passes through (merely unfiltered, never wrongly filtered). The profile
+guard is a clear-error path, not the injection barrier — profile sample
+queries are built from resolved row names, never from caller text.
 
 Pinned by `TestIsDanbooruMetatag_OnlyKnownKeysMatch`,
 `TestIsDanbooruEditMetatag_OnlyEditKeysMatch`, the list guards

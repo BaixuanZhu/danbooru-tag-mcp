@@ -153,6 +153,45 @@ func TestMetatagKeyLists_MatchUpstreamSnapshot(t *testing.T) {
 	}
 }
 
+func TestUnlimitedMetatagKeys_AreUniqueLowercase(t *testing.T) {
+	assertCleanKeyList(t, unlimitedMetatagKeyList, unlimitedMetatagKeys)
+}
+
+// TestUnlimitedMetatagKeys_AreSearchMetatags keeps the third list inside the
+// first: the unlimited list can only exempt metatags Danbooru's post search
+// knows, so a key the search list lacks is a transcription error — it would
+// exempt nothing and signal a key spelled wrong on one side or the other.
+func TestUnlimitedMetatagKeys_AreSearchMetatags(t *testing.T) {
+	for key := range unlimitedMetatagKeys {
+		if !danbooruMetatagKeys[key] {
+			t.Errorf("key %q is not a post-search metatag; the unlimited list only exempts search metatags", key)
+		}
+	}
+}
+
+// TestUnlimitedMetatagKeyList_MatchUpstreamSnapshot pins the list to the size
+// of PostQuery::UNLIMITED_METATAGS at master as read on 2026-11-28, the way
+// the two other key lists are pinned, so an accidentally dropped line fails
+// here instead of silently making a free metatag count. A deliberate update
+// changes the count in the same change.
+func TestUnlimitedMetatagKeyList_MatchUpstreamSnapshot(t *testing.T) {
+	if got := len(unlimitedMetatagKeys); got != 25 {
+		t.Errorf("unlimited metatag list: expected 25 keys (upstream snapshot 2026-11-28), got %d", got)
+	}
+}
+
+// TestUnlimitedMetatagKeyList_IsTheUpstreamText pins the transcription word
+// for word. The count alone would let a misspelled key through, and a
+// misspelled key here silently turns a free metatag into a counting one.
+func TestUnlimitedMetatagKeyList_IsTheUpstreamText(t *testing.T) {
+	const upstream = "status rating limit is id date age filesize filetype parent child " +
+		"md5 width height duration mpixels ratio score upvote downvotes " +
+		"favcount embedded tagcount pixiv_id pixiv"
+	if got := strings.Join(strings.Fields(unlimitedMetatagKeyList), " "); got != upstream {
+		t.Errorf("unlimited metatag list:\n got: %s\nwant: %s", got, upstream)
+	}
+}
+
 func TestIsSingleTagName_RejectsMultiTokenAndMetatag(t *testing.T) {
 	tests := []struct {
 		raw  string

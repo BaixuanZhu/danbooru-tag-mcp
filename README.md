@@ -267,9 +267,22 @@ No rating filter by default; add a `rating:g/s/q/e` metatag to narrow. Each
 post carries `score`, `fav_count`, `large_file_url` and `tags` split by
 category: `copyright` / `artist` / `character` / `general` / `meta`.
 
+Up to 6 content tags per query. Danbooru itself answers only 2 tags
+anonymously (3 with credentials), so a longer query is answered by a local
+scan: the rarest tags go upstream as one listing request and the rest are
+checked against each post's own tag list, which reproduces the query
+exactly, in Danbooru's order. Split answers add `upstream_query` (the
+query actually sent), `scanned` (posts examined) and `complete` — `false`
+means a prefix, or a lower-bound count. Metatags that consume Danbooru's
+term budget (`order:` counts, `rating:` is free) shrink the upstream part
+to one tag; `random:`, wildcards and `~` OR tokens cannot be evaluated
+locally and refuse the query with a clear error.
+
 With `count_only: true` the call answers `{"query": <tags>, "total": <count>}`
 (how many posts match) instead of listing posts; `limit` and `tags_mode` do
-not apply, and the count is always live.
+not apply, and the count is always live. A count that needs the scan adds
+the same `scanned`/`complete` fields, and `total` is a lower bound until
+`complete` is true.
 
 When no posts come back and two adjacent tokens join into a WD14 vocabulary
 name (`blue hair` -> `blue_hair`), the response adds `possible_tags` with the

@@ -5,6 +5,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"danbooru-tag-mcp/internal/app"
 	"danbooru-tag-mcp/internal/vocab"
 )
 
@@ -92,7 +94,9 @@ type TagFetcher interface {
 	FetchRelated(ctx context.Context, tag string) ([]byte, error)
 	FetchAlias(ctx context.Context, name string) ([]byte, error)
 	FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error)
-	FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error)
+	// FetchPosts fetches one page of raw /posts.json bodies for tags; page
+	// numbers the pages from 1.
+	FetchPosts(ctx context.Context, tags string, limit, page int) ([]byte, error)
 	// FetchPostCount fetches the raw /counts/posts.json body for tags; an
 	// empty tags counts every post on the site.
 	FetchPostCount(ctx context.Context, tags string) ([]byte, error)
@@ -152,9 +156,27 @@ type WikiResult struct {
 // PostsResult is search_posts' payload: the matched posts plus the optional
 // space-split diagnostic. Posts is always non-nil so an empty answer
 // marshals as [] rather than null.
+//
+// The three scan fields appear only on a split answer — a query Danbooru
+// would not take as-is, answered by scanning a wider listing and filtering it
+// locally — so a direct answer stays byte-identical to the shape it had
+// before they existed.
 type PostsResult struct {
 	Posts        []Post   `json:"posts"`
 	PossibleTags []string `json:"possible_tags,omitempty"` // vocabulary names two adjacent query tokens form; only on an empty answer
+
+	// UpstreamQuery is the query the scan actually sent upstream: the pair's
+	// canonical names, then the metatags and pass-through tokens in their
+	// original order, as one string.
+	UpstreamQuery string `json:"upstream_query,omitempty"`
+	// Scanned is the number of distinct posts the scan examined (omitted when
+	// the upstream listing was empty).
+	Scanned int `json:"scanned,omitempty"`
+	// Complete is nil unless the query was split: true when the posts are the
+	// whole answer (the limit's worth of matches was collected, or the listing
+	// ended), false when they are a true prefix of it. A pointer, so an
+	// omitted field and false stay distinct.
+	Complete *bool `json:"complete,omitempty"`
 }
 
 // NotFoundError reports that current Danbooru carries no exact match for
@@ -169,10 +191,17 @@ func (e *NotFoundError) Error() string { return "tag not found: " + e.Name }
 // the tools' payloads, enriching names with the local WD14 vocabularies. It
 // is safe for concurrent use (mcp-go runs tool calls on concurrent workers):
 // its only state that changes after construction is the whole-site count
-// memo, guarded by siteMu.
+// memo, guarded by siteMu. Everything a search_posts scan needs is computed
+// per call; nothing is cached between calls.
 type TagService struct {
 	fetcher TagFetcher
 	vocab   *vocab.Store // nil disables WD14 enrichment
+
+	// tagLimit is the number of terms (content tokens plus counting metatags)
+	// Danbooru answers as-is for this client's account; fixed after
+	// construction (see WithUpstreamTagLimit). At or below it a query goes out
+	// verbatim; above it, the local scan answers it.
+	tagLimit int
 
 	// The whole-site post count every lift of get_related_tags divides by,
 	// memoized per process (see sitePostCount). siteMu is held across the
@@ -182,8 +211,33 @@ type TagService struct {
 	sitePosts int // memoized whole-site post count; 0 = nothing memoized
 }
 
-func NewTagService(fetcher TagFetcher, vd *vocab.Store) *TagService {
-	return &TagService{fetcher: fetcher, vocab: vd}
+// Option configures a TagService at construction; see NewTagService.
+type Option func(*TagService)
+
+// WithUpstreamTagLimit sets how many terms Danbooru answers as-is for the
+// client's account. The default is the anonymous limit (2); a credentialed
+// account gets a higher one because the limit follows its level (logged-in
+// below Gold 3, Gold and above unlimited — verified live 2026-11-28). Only an
+// account configured above the anonymous limit gets the tag-limit fallback
+// from a refused direct query to the local scan (see SearchPosts). A value
+// below 1 keeps the default.
+func WithUpstreamTagLimit(n int) Option {
+	return func(s *TagService) {
+		if n >= 1 {
+			s.tagLimit = n
+		}
+	}
+}
+
+// NewTagService builds a TagService over fetcher, enriching names with the
+// WD14 vocabularies of vd (nil disables that). With no option the service
+// assumes an anonymous account: Danbooru answers two terms as-is.
+func NewTagService(fetcher TagFetcher, vd *vocab.Store, opts ...Option) *TagService {
+	s := &TagService{fetcher: fetcher, vocab: vd, tagLimit: anonymousTagLimit}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 func normalizeTag(s string) string {
@@ -866,10 +920,6 @@ func extractLinkedTags(body string) []string {
 	return tags
 }
 
-// maxContentTags caps content tags per post search: free/anonymous Danbooru
-// accounts allow 2 tags per query (Gold unlocks 6).
-const maxContentTags = 2
-
 // maxPossibleTags caps the space-split candidates one search_posts answer
 // names: the diagnostic points at the likely cause, it is not a suggestion
 // list.
@@ -878,33 +928,6 @@ const maxPossibleTags = 3
 // maxPostLimit caps posts per search_posts call: a post carries ~44 tags on
 // average (verified live), so 20 posts bound the payload at roughly 20 KB.
 const maxPostLimit = 20
-
-// isMetatagToken reports whether one space-separated query field is a
-// metatag (contains ':': rating:g, order:random, status:deleted, ...)
-// rather than a literal tag name.
-//
-// Deliberately broader than isDanbooruMetatag (known keys only), and it
-// stays that way: here the verdict exempts a token from the 2-tag cap, and
-// exempting is the safe side: an unlisted metatag must never be counted as
-// a content tag. The two predicates differ on purpose.
-func isMetatagToken(field string) bool {
-	return strings.Contains(field, ":")
-}
-
-// countContentTags counts fields that count toward Danbooru's per-account
-// tag limit: content tags (no ':') plus order: metatags. Other metatags
-// (rating:, status:, id:, ...) are exempt — verified empirically against
-// danbooru.donmai.us, which 422s on "a b order:count" but not on
-// "a b status:any" for anonymous accounts.
-func countContentTags(tags string) int {
-	count := 0
-	for _, field := range strings.Fields(tags) {
-		if !isMetatagToken(field) || strings.HasPrefix(field, "order:") {
-			count++
-		}
-	}
-	return count
-}
 
 // danbooruPost is the subset of /posts.json entries the service consumes;
 // the tag_string_* fields are space-separated tag names grouped by category.
@@ -959,6 +982,44 @@ func (t PostTags) minus(exclude map[string]bool) PostTags {
 	return t
 }
 
+// parsePosts decodes one /posts.json body. A scan decodes up to
+// maxScanPages of them; the direct path exactly one.
+func parsePosts(res []byte) ([]danbooruPost, error) {
+	var posts []danbooruPost
+	if err := json.Unmarshal(res, &posts); err != nil {
+		return nil, fmt.Errorf("failed to parse posts: %w", err)
+	}
+	return posts, nil
+}
+
+// shapePosts projects raw posts into the response shape under a tags mode:
+// full keeps every per-post category list, none omits the tag lists, diff
+// keeps only the tags not in exclude (the query's own content tags). The
+// result is never nil, so an empty answer marshals as [] rather than null.
+// Direct answers and scan answers share this one projection.
+func shapePosts(raw []danbooruPost, mode string, exclude map[string]bool) []Post {
+	posts := make([]Post, 0, len(raw))
+	for _, p := range raw {
+		post := Post{
+			ID:           p.ID,
+			Rating:       p.Rating,
+			Score:        p.Score,
+			FavCount:     p.FavCount,
+			PreviewURL:   p.PreviewFileURL,
+			LargeFileURL: p.LargeFileURL,
+		}
+		if mode != tagsModeNone {
+			pt := parsePostTags(p)
+			if mode == tagsModeDiff {
+				pt = pt.minus(exclude)
+			}
+			post.Tags = &pt
+		}
+		posts = append(posts, post)
+	}
+	return posts
+}
+
 // Tags-list modes for SearchPosts (validated pre-flight, empty = full).
 const (
 	tagsModeFull = "full" // every per-post category list, the historical shape
@@ -970,17 +1031,17 @@ const (
 var tagsModes = map[string]bool{tagsModeFull: true, tagsModeNone: true, tagsModeDiff: true}
 
 // queryContentTags returns the lowercase content-tag names of a posts query:
-// space-split tokens that are not metatags (any ':' token — rating:g,
-// order:random, status:deleted — never names a literal tag, so diff mode
-// excludes them from subtraction). This is the same metatag predicate
-// countContentTags applies, minus its order: special case: order: counts
-// toward the 2-tag cap but is not a subtractable name.
-func queryContentTags(query string) map[string]bool {
+// every token that is not a known metatag, as typed and lowercased. A known
+// metatag (rating:g, order:random, status:deleted) never names a literal tag,
+// so diff mode leaves it out of the subtraction; a colon-bearing tag name
+// such as firefly_(honkai:_star_rail) is a content tag and is subtracted
+// (parsePostQuery tells the two apart by the key list, not by the colon).
+// An exclusion keeps its '-', so it never matches a tag — the same as before
+// the classification became exact.
+func queryContentTags(q *postQuery) map[string]bool {
 	out := make(map[string]bool)
-	for _, tok := range strings.Fields(query) {
-		if !isMetatagToken(tok) {
-			out[strings.ToLower(tok)] = true
-		}
+	for _, tok := range q.contentTokens() {
+		out[strings.ToLower(tok.raw)] = true
 	}
 	return out
 }
@@ -997,8 +1058,10 @@ type tagPairCandidate struct {
 // query is split on whitespace because that is Danbooru's multi-tag syntax,
 // so a space inside one tag name ("blue hair" meaning blue_hair) becomes two
 // near-empty tokens and an empty answer with no hint. A candidate is a pair
-// of adjacent tokens, neither metatag-looking (the tag count's predicate,
-// isMetatagToken), whose lowercase underscore join the store carries.
+// of adjacent tokens, neither a known metatag (isDanbooruMetatag — the exact
+// key-list predicate, so a colon-bearing name such as
+// "kafka_(honkai: star_rail)" is a genuine space-split suspect), whose
+// lowercase underscore join the store carries.
 // Candidates keep query order, are deduped by the joined name and capped at
 // maxPossibleTags; a nil store yields none. Local computation, no request —
 // and deliberately no check that the tokens really have no posts, which
@@ -1009,7 +1072,7 @@ func tagPairCandidates(query string, store *vocab.Store) []tagPairCandidate {
 	var out []tagPairCandidate
 	for i := 0; i+1 < len(tokens); i++ {
 		a, b := tokens[i], tokens[i+1]
-		if isMetatagToken(a) || isMetatagToken(b) {
+		if isDanbooruMetatag(a) || isDanbooruMetatag(b) {
 			continue
 		}
 		joined := strings.ToLower(a) + "_" + strings.ToLower(b)
@@ -1043,28 +1106,56 @@ func tagPairHint(candidates []tagPairCandidate) string {
 	return b.String()
 }
 
-// checkPostQuery validates a posts query against Danbooru's per-account tag
-// limit before any request and returns it trimmed, exactly as it is sent.
-// SearchPosts and CountPosts share this one function so the two modes cannot
-// drift: the limit is the same on /posts.json and /counts/posts.json
-// (verified live: three content tags answer 422 on both), so an over-limit
-// query fails locally with the same message, space-split hint included.
-func (s *TagService) checkPostQuery(tags string) (string, error) {
-	query := strings.TrimSpace(tags)
-	if n := countContentTags(query); n > maxContentTags {
-		return "", fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query%s",
-			n, maxContentTags, tagPairHint(tagPairCandidates(query, s.vocab)))
+// checkPostQuery parses a posts query and enforces the local tag cap before
+// any request. SearchPosts and CountPosts share this one function so the two
+// modes cannot drift: the cap is the same on both, and an over-limit query
+// fails locally with the same message, space-split hint included. The parsed
+// query comes back for the routing that follows: direct, or the scan.
+func (s *TagService) checkPostQuery(tags string) (*postQuery, error) {
+	q := parsePostQuery(tags)
+	if err := capViolation(q, tagPairHint(tagPairCandidates(q.raw, s.vocab))); err != nil {
+		return nil, err
 	}
-	return query, nil
+	return q, nil
+}
+
+// directAttempt runs one direct query — the tags verbatim, in one request —
+// and reports whether Danbooru refused it for its tag limit, in which case
+// the caller may fall back to the scan. The fallback is classified
+// (errors.Is against app.ErrTagLimitExceeded), never "some error happened",
+// and exists only for an account configured above the anonymous limit: that
+// account's real limit depends on its level and may be lower than the
+// configured one, while for the anonymous limit the number is exact. Every
+// other error — another 422, a cancellation, a marked upstream failure — is
+// returned as is, and so is a tag-limit refusal when no fallback applies.
+func (s *TagService) directAttempt(ctx context.Context, q *postQuery, fetch func() error) (bool, error) {
+	err := fetch()
+	if err == nil {
+		return false, nil
+	}
+	if s.tagLimit > anonymousTagLimit && errors.Is(err, app.ErrTagLimitExceeded) {
+		return true, nil
+	}
+	return false, err
 }
 
 // SearchPosts sends the tags out verbatim: no layer injects a rating
 // filter. The caller pins rating:<x> when they want one (rating: metatags
-// are exempt from the tag-count limit), so an unfiltered query describes
-// the tag's whole population — the same whole-population rule
-// get_tag_profile samples by. tagsMode reshapes only the response: full
-// (default, the historical shape) keeps every per-post category list, none
-// omits the tag lists, diff keeps only tags not already in the query.
+// cost no term), so an unfiltered query describes the tag's whole population
+// — the same whole-population rule get_tag_profile samples by. tagsMode
+// reshapes only the response: full (default, the historical shape) keeps
+// every per-post category list, none omits the tag lists, diff keeps only
+// tags not already in the query.
+//
+// A query is routed by its term count (postQuery.terms: content tokens plus
+// counting metatags). At or below the account's tag limit it is DIRECT: one
+// request with the query as typed, and the historical payload. Above it the
+// local scan answers it (searchPostsByScan) and the payload gains
+// upstream_query, scanned and complete. With a tag limit above the anonymous
+// one the direct attempt is tried first and a tag-limit refusal falls back
+// to the scan (directAttempt); an anonymous client never sends more than two
+// terms as-is, which Danbooru would only refuse. Metatags are never
+// injected or rewritten, and nothing is cached between calls.
 //
 // A space inside one tag name is the multi-tag syntax, so "blue hair" asks
 // Danbooru for two near-empty tokens and comes back empty. That dead end is
@@ -1075,7 +1166,7 @@ func (s *TagService) checkPostQuery(tags string) (string, error) {
 // decides. Both diagnostics are local, cost no request, and are omitted
 // when there is no candidate, so every other payload stays byte-identical.
 func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*PostsResult, error) {
-	query, err := s.checkPostQuery(tags)
+	q, err := s.checkPostQuery(tags)
 	if err != nil {
 		return nil, err
 	}
@@ -1090,41 +1181,31 @@ func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, ta
 		return nil, fmt.Errorf("invalid tags mode %q: use full, none or diff", tagsMode)
 	}
 
-	res, err := s.fetcher.FetchPosts(ctx, query, limit)
+	if q.terms() > s.tagLimit {
+		return s.searchPostsByScan(ctx, q, limit, mode)
+	}
+	var res []byte
+	refused, err := s.directAttempt(ctx, q, func() error {
+		var err error
+		res, err = s.fetcher.FetchPosts(ctx, q.raw, limit, 1)
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
+	if refused {
+		return s.searchPostsByScan(ctx, q, limit, mode)
+	}
 
-	var rawPosts []danbooruPost
-	if err := json.Unmarshal(res, &rawPosts); err != nil {
-		return nil, fmt.Errorf("failed to parse posts: %w", err)
+	rawPosts, err := parsePosts(res)
+	if err != nil {
+		return nil, err
 	}
-	var exclude map[string]bool
-	if mode == tagsModeDiff {
-		exclude = queryContentTags(query)
-	}
-	result := &PostsResult{Posts: make([]Post, 0, len(rawPosts))}
-	for _, p := range rawPosts {
-		post := Post{
-			ID:           p.ID,
-			Rating:       p.Rating,
-			Score:        p.Score,
-			FavCount:     p.FavCount,
-			PreviewURL:   p.PreviewFileURL,
-			LargeFileURL: p.LargeFileURL,
-		}
-		if mode != tagsModeNone {
-			pt := parsePostTags(p)
-			if mode == tagsModeDiff {
-				pt = pt.minus(exclude)
-			}
-			post.Tags = &pt
-		}
-		result.Posts = append(result.Posts, post)
-	}
+	// Only diff mode reads the exclusions; the other modes ignore them.
+	result := &PostsResult{Posts: shapePosts(rawPosts, mode, queryContentTags(q))}
 	if len(result.Posts) == 0 {
 		// Local lookup, run only on the empty answer it explains.
-		for _, c := range tagPairCandidates(query, s.vocab) {
+		for _, c := range tagPairCandidates(q.raw, s.vocab) {
 			result.PossibleTags = append(result.PossibleTags, c.Joins)
 		}
 	}

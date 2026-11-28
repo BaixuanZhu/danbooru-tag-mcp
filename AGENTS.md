@@ -118,18 +118,67 @@ a rating filter** — neither the api layer's `FetchPosts`
 (`TestFetchPosts_DoesNotAddRatingFilter`) nor the service layer's
 `SearchPosts` (`TestSearchPosts_NoRatingInjection` asserts the query goes
 out verbatim). Rating choice belongs to the caller: a `rating:g/s/q/e`
-metatag narrows a query and is exempt from the tag-count limit, so opting
-in costs nothing toward the 2-tag cap. History: v0.1.0–0.2.x defaulted
+metatag narrows a query and is exempt from Danbooru's term count (`rating:`
+is in `PostQuery::UNLIMITED_METATAGS`), so opting in costs nothing toward
+the term budget. History: v0.1.0–0.2.x defaulted
 `SearchPosts` to `rating:explicit` as an R-18-allowed product statement;
 dropped in 0.3.0 because a default filter biases research queries toward a
 ~5% subpopulation (arm_up is 95% g/s/q — verified live) and contradicted
 `get_tag_profile`'s whole-population sample; "uncensored, unfiltered"
 expresses the product stance without picking a rating for the caller. The
 `search_posts` tool description documents the g/s/q/e ladder so MCP clients
-know the opt-in syntax. `SearchPosts` still pre-validates the tag count
-locally (max 2; content tags and `order:` metatags count, `rating:`/
-`status:`/`id:` style metatags are exempt — verified empirically) so
-over-limit queries fail with a clear error instead of a Danbooru 422.
+know the opt-in syntax. Queries are pre-parsed locally (`checkPostQuery`):
+up to `MaxQueryTags = 6` content tags are accepted, and a query beyond the
+configured term budget is answered by the multi-tag scan (next paragraph)
+instead of failing with a Danbooru 422.
+
+**Multi-tag scan boundary (search_posts beyond the term budget,
+test-enforced, do not break)**: the configured limit is Danbooru's own term
+budget, not a fixed 2 — anonymous `2` (`anonymousTagLimit`), credentialed
+`MaxQueryTags` (`main` passes `WithUpstreamTagLimit` from
+`Client.Authenticated()`). `terms()` counts non-metatag tokens plus
+counting metatags (keys OUTSIDE `unlimitedMetatagKeyList`, the 25-key
+transcription of `PostQuery::UNLIMITED_METATAGS` — `rating:`/`status:`/
+`id:` are free; `order:`/`user:`/`pool:` count) and decides direct versus
+scan. Within the limit the query goes out verbatim and the answer is
+byte-identical to the pre-scan shape; beyond it `planScan` + `scan`
+(`internal/service/scan.go`) answer it: one batch `lookupTags` over ALL
+content tokens (positives, unresolved colon tokens and exclusions alike —
+a colon token with a Danbooru row is a content tag under its canonical
+name, without one it passes through and is never a local filter), the
+`k = min(2, tagLimit - countingMetatags)` rarest positives go upstream as
+one listing (query order breaks rarity ties; metatags and pass-through
+tokens ride verbatim), and the remaining positives/negatives are filtered
+locally against each post's five `tag_string_*` fields — which reproduces
+the query exactly, in Danbooru's order. Pages are `limit=200`, at most 5,
+id-deduped; the scan stops at `limit` matches, a short page or the page
+cap and reports `complete` (a pointer, so absent means "not split", false
+means a prefix or a lower-bound count) plus `scanned` (distinct posts) and
+`upstream_query` — split answers only, never on direct ones. A
+credentialed direct attempt refused with the tag-limit 422 falls back to
+the scan, classified ONLY via `errors.Is(err, app.ErrTagLimitExceeded)`
+(the api layer wraps a 422 whose body carries `TagLimitError` in
+`*tagLimitError`; the error TEXT is unchanged); any other error is
+returned untouched, and a scan page refused the same way narrows ONCE (the
+less rare tag drops and becomes a local filter; a second refusal returns
+the plain error). A local-filter token whose row shows 0 posts is
+alias-resolved once (`resolveRenamedTo`) and filtered under its current
+name — posts list tags under the current name and renamed antecedents keep
+0-post rows. Tokens a local scan cannot evaluate are refused with a clear
+local error when a scan is needed: wildcards `*`, OR `~`, and `random:`
+(it caps the listing at N, so a short page would not mean the listing
+ended); more than 6 content tags are refused locally before any request.
+Count mode (`CountPosts`) shares the routing and runs the same scan
+without the `limit` stop; `total` is exact only when `complete` is true,
+otherwise a lower bound. Known boundary: pass-through colon tokens also
+ride the upstream query and consume one of its terms, so with `k = 1` such
+a query can surface Danbooru's raw 422 (with `k = 2` the narrowing absorbs
+it) — the error is honest, Danbooru refuses the same query directly.
+Pinned by `TestParsePostQuery_*`, `TestScan_*`,
+`TestSearchPosts_DirectPathByteIdentical`, `TestSearchPosts_TagLimitFallback`,
+`TestCountPosts_OverScan`, `TestSearchPostsHandler_ScanFieldsRideThePayload`
+and the real api -> service -> tools chain in
+`internal/api/tag_limit_chain_test.go`; integration checks 9, 23 and 27-31.
 
 **Post count mode (search_posts `count_only`, test-enforced, do not break)**:
 `count_only: true` switches `search_posts` from listing to counting: one
@@ -174,7 +223,11 @@ candidates (local `tagPairCandidates`, query order, deduped, max 3;
 omitted otherwise, so every other payload stays byte-identical), and the
 local too-many-tags error gains one `; '<pair>' may be one tag: <name>`
 segment per candidate. Facts only — no retry, no query rewrite, no extra
-request — and a metatag-looking token (`isMetatagToken`) is never joined
+request — and a token the exact predicate `isDanbooruMetatag` classifies
+as a metatag is never joined, while colon-bearing tag names now are
+(`kafka_(honkai: star_rail)` names `kafka_(honkai:_star_rail)`; the old
+any-colon `isMetatagToken` is gone — the posts path classifies tokens with
+the key lists, see the scan boundary paragraph)
 (`TestSearchPostsHandler_PayloadBytesUnchanged`,
 `TestSearchPosts_SpaceSplit*`).
 `Related` drops both the query tag itself and

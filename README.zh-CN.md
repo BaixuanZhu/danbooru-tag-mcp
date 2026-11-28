@@ -178,7 +178,7 @@ iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/in
 
 `tag`（必填）· `limit`（10）
 
-`highres` 这类 meta 分类标签会作为噪声过滤掉。
+`highres` 这类 meta 分类标签会作为噪声过滤掉。条目按 `lift` 排名（`frequency` × 全站帖子数 / `post_count`：该标签与查询标签共现的频率高出其全站占比多少倍），因此标签专属的搭档会排在 `1girl` 这类语料常量之前。样本帖子数不足 5 的条目保持 Danbooru 的频率顺序、沉到末尾。全站帖子数不可用时，整个回答退回该频率顺序、不带 `lift`。
 
 #### `get_tag_alias`
 
@@ -194,9 +194,15 @@ iwr -useb "https://raw.githubusercontent.com/BaixuanZhu/danbooru-tag-mcp/main/in
 
 #### `search_posts`
 
-`tags`（必填，空格分隔）· `limit`（5，最多 20）· `tags_mode`（默认 `full`；`none` 去掉每帖的标签列表，`diff` 只保留查询之外的标签）
+`tags`（必填，空格分隔）· `limit`（5，最多 20）· `tags_mode`（默认 `full`；`none` 去掉每帖的标签列表，`diff` 只保留查询之外的标签）· `count_only`（false）
 
 默认不加分级过滤；要收窄就加 `rating:g/s/q/e` 元标签。每篇帖子带 `score`、`fav_count`、`large_file_url`，以及按分类拆开的 `tags`：`copyright` / `artist` / `character` / `general` / `meta`。
+
+每次查询最多 6 个内容标签。Danbooru 本身匿名只接受 2 个（登录后 3 个），更长的查询由本地扫描回答：最稀有的标签作为一次列表请求发给上游，其余标签逐帖对照帖子自己的标签列表核对——结果与查询完全一致，顺序也与 Danbooru 相同。拆分回答会多出 `upstream_query`（实际发送的查询）、`scanned`（检查过的帖子数）与 `complete`——`false` 表示只是前缀，或计数模式下是下界。消耗 Danbooru 词条预算的元标签（`order:` 计入，`rating:` 免费）会把上游部分缩到一个标签；`random:`、通配符和 `~` OR 标记无法在本地求值，会以清晰的错误拒绝查询。
+
+`count_only: true` 时调用改为回答 `{"query": <tags>, "total": <count>}`（匹配的帖子数）而不列出帖子；`limit` 与 `tags_mode` 不生效，计数始终实时。需要扫描的计数会带上同样的 `scanned`/`complete` 字段，`complete` 为 true 之前 `total` 只是下界。
+
+当没有帖子返回且相邻两个 token 能拼成 WD14 词表里的名称（`blue hair` -> `blue_hair`）时，返回里会多出 `possible_tags` 候选（最多 3 个）；超限错误也带同样的提示。服务器不会重试查询。
 
 #### `get_tag_profile`
 

@@ -149,6 +149,11 @@ type upstreamMockError struct{}
 func (e *upstreamMockError) Error() string        { return "danbooru 503 (Downbooru)" }
 func (e *upstreamMockError) Is(target error) bool { return target == app.ErrUpstreamUnavailable }
 
+// tooManyTagsMessage is the exact text of the local cap error for seven
+// content tokens, as the real service produces it (the handler forwards it
+// verbatim).
+const tooManyTagsMessage = "too many content tags: 7 (max 6); drop tags or split the query"
+
 // brokenService is a mock TagService whose every request-bearing method
 // fails with the upstream-marked error, simulating a Danbooru outage.
 type brokenService struct{}
@@ -320,7 +325,11 @@ func checkListModeBytes(t *testing.T, extraArgs map[string]any) {
 		PreviewURL:   "https://cdn.donmai.us/preview/x.jpg",
 		LargeFileURL: "https://cdn.donmai.us/large/x.jpg",
 	}
-	overLimit := errors.New("too many content tags: 3 (max 2, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query")
+	// The real service appends a hint to this message only for a query that
+	// names a candidate, so the query is one that names none: the fixture
+	// mirrors a combination the chain produces (seven tokens, one over the
+	// cap of 6).
+	overLimit := errors.New(tooManyTagsMessage)
 
 	tests := []struct {
 		name string
@@ -341,12 +350,9 @@ func checkListModeBytes(t *testing.T, extraArgs map[string]any) {
 			want: `{"posts":[]}`,
 		},
 		{
-			// The real service appends a hint to this message only for a
-			// query that names a candidate, so the query is one that names
-			// none: the fixture mirrors a combination the chain produces.
 			name: "over-limit query is the plain validation result",
 			svc:  &postsMockService{err: overLimit},
-			args: map[string]any{"tags": "1girl blue_hair long_hair"},
+			args: map[string]any{"tags": "t1 t2 t3 t4 t5 t6 t7"},
 			want: `{"error":"post_search_failed","message":"` + overLimit.Error() + `"}`,
 		},
 	}
@@ -391,7 +397,6 @@ func checkListModeBytes(t *testing.T, extraArgs map[string]any) {
 // keep failResult's mapping: a timed-out count and an over-limit query are
 // the plain post_search_failed result, an outage the uniform marked result.
 func TestSearchPostsHandler_CountModePayloadBytes(t *testing.T) {
-	overLimit := errors.New("too many content tags: 3 (max 2, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query")
 	count := &service.PostCount{Query: "blue_hair", Total: 317377}
 
 	tests := []struct {
@@ -423,9 +428,9 @@ func TestSearchPostsHandler_CountModePayloadBytes(t *testing.T) {
 		},
 		{
 			name: "over-limit query is the plain validation result",
-			svc:  &postsMockService{countErr: overLimit},
-			args: map[string]any{"tags": "1girl blue_hair long_hair", "count_only": true},
-			want: `{"error":"post_search_failed","message":"` + overLimit.Error() + `"}`,
+			svc:  &postsMockService{countErr: errors.New(tooManyTagsMessage)},
+			args: map[string]any{"tags": "t1 t2 t3 t4 t5 t6 t7", "count_only": true},
+			want: `{"error":"post_search_failed","message":"` + tooManyTagsMessage + `"}`,
 		},
 		{
 			// SearchPosts answers fine here, so the marked result can only
@@ -615,6 +620,161 @@ func TestSearchPostsHandler_PossibleTagsRideThePayload(t *testing.T) {
 func TestSearchPostsTool_DescriptionNamesPossibleTagsOnce(t *testing.T) {
 	if got := strings.Count(SearchPostsTool.Description, "possible_tags"); got != 1 {
 		t.Errorf("search_posts description must mention possible_tags exactly once, got %d: %s", got, SearchPostsTool.Description)
+	}
+}
+
+// searchPostsDescription is the search_posts description, pinned word for
+// word: every MCP client injects it into each session, so it is context cost
+// and may only change deliberately. Against the pre-scan text the cap
+// sentence is rewritten and grows by two clauses (R10): what happens beyond
+// Danbooru's own term limit, and the fields a split answer adds.
+const searchPostsDescription = "Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 6 content tags per query (Danbooru itself takes 2 terms anonymously; order:, user: and pool: count, rating: doesn't): beyond that the two rarest tags go upstream and the rest are filtered locally, and such answers add scanned and complete (false = a prefix, or a lower-bound count) plus upstream_query in list mode. Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta). tags_mode=none drops tag lists; diff keeps only tags not already in the query. count_only=true answers {query,total} from the post count instead of listing posts. On an empty result, possible_tags lists WD14 vocab names formed by joining two adjacent query tokens ('blue hair' -> blue_hair) without retrying the query"
+
+// TestSearchPostsTool_DescriptionIsPinned pins the whole description.
+func TestSearchPostsTool_DescriptionIsPinned(t *testing.T) {
+	if SearchPostsTool.Description != searchPostsDescription {
+		t.Errorf("description:\n got: %s\nwant: %s", SearchPostsTool.Description, searchPostsDescription)
+	}
+}
+
+// TestSearchPostsTool_DescriptionNamesScanFieldsOnce pins that the scan
+// costs the description exactly one mention per field, like count_only and
+// possible_tags, and that the old anonymous cap is gone: the text must say
+// 6, and neither the 2-tag rule nor the outdated "Gold unlocks 6" may
+// return.
+func TestSearchPostsTool_DescriptionNamesScanFieldsOnce(t *testing.T) {
+	for _, field := range []string{"upstream_query", "scanned", "complete"} {
+		if got := strings.Count(SearchPostsTool.Description, field); got != 1 {
+			t.Errorf("search_posts description must mention %s exactly once, got %d: %s", field, got, SearchPostsTool.Description)
+		}
+	}
+	if !strings.Contains(SearchPostsTool.Description, "Max 6 content tags per query") {
+		t.Errorf("search_posts description must name the cap of 6, got: %s", SearchPostsTool.Description)
+	}
+	for _, stale := range []string{"Max 2 content tags", "Gold unlocks", "max 2"} {
+		if strings.Contains(SearchPostsTool.Description, stale) {
+			t.Errorf("search_posts description still says %q, got: %s", stale, SearchPostsTool.Description)
+		}
+	}
+}
+
+// tagLimitMockError stands in for the api layer's tag-limit classification
+// the way upstreamMockError stands in for its upstream marker: Error() is
+// the shrunken 422 text, Is matches only the app.ErrTagLimitExceeded
+// sentinel.
+type tagLimitMockError struct{}
+
+func (e *tagLimitMockError) Error() string {
+	return `danbooru 422: {"success":false,"error":"PostQuery::TagLimitError","message":"You cannot search for more than 2 tags at a time."}`
+}
+func (e *tagLimitMockError) Is(target error) bool { return target == app.ErrTagLimitExceeded }
+
+// TestSearchPostsHandler_ScanFieldsRideThePayload pins the handler side of a
+// split answer: it marshals the service's result as is — posts, then
+// possible_tags when present, then upstream_query, scanned and complete —
+// adds, drops and retries nothing, and keeps the error mapping. A local
+// refusal of the scan, and a tag-limit 422 the service could not fall back
+// from, are the plain post_search_failed result: never flagged at the
+// protocol level, never marked upstream_unavailable. An outage during the
+// scan is the uniform marked result. Count mode marshals scanned and
+// complete the same way, and a lower-bound count keeps its total of 0.
+func TestSearchPostsHandler_ScanFieldsRideThePayload(t *testing.T) {
+	yes, no := true, false
+	post := service.Post{ID: 1, Rating: "g"}
+	const query = "1girl arm_up sword"
+	tests := []struct {
+		name        string
+		svc         *postsMockService
+		args        map[string]any
+		want        string
+		wantIsError bool
+		listCalls   int
+		countCalls  int
+	}{
+		{
+			name:      "complete split answer",
+			svc:       &postsMockService{posts: &service.PostsResult{Posts: []service.Post{post}, UpstreamQuery: "arm_up sword", Scanned: 3, Complete: &yes}},
+			args:      map[string]any{"tags": query},
+			want:      `{"posts":[{"id":1,"rating":"g","score":0,"fav_count":0,"preview_file_url":"","large_file_url":""}],"upstream_query":"arm_up sword","scanned":3,"complete":true}`,
+			listCalls: 1,
+		},
+		{
+			name:      "incomplete split answer says false, not absent",
+			svc:       &postsMockService{posts: &service.PostsResult{Posts: []service.Post{post}, UpstreamQuery: "arm_up sword", Scanned: 1000, Complete: &no}},
+			args:      map[string]any{"tags": query},
+			want:      `{"posts":[{"id":1,"rating":"g","score":0,"fav_count":0,"preview_file_url":"","large_file_url":""}],"upstream_query":"arm_up sword","scanned":1000,"complete":false}`,
+			listCalls: 1,
+		},
+		{
+			// scanned is omitted when nothing was scanned; the key's absence
+			// is the service's omitempty, not a dropped field.
+			name:      "empty split answer keeps possible_tags",
+			svc:       &postsMockService{posts: &service.PostsResult{Posts: []service.Post{}, PossibleTags: []string{"blue_hair"}, UpstreamQuery: "blue order:random", Complete: &yes}},
+			args:      map[string]any{"tags": "blue hair order:random"},
+			want:      `{"posts":[],"possible_tags":["blue_hair"],"upstream_query":"blue order:random","complete":true}`,
+			listCalls: 1,
+		},
+		{
+			name:       "count over a scan",
+			svc:        &postsMockService{count: &service.PostCount{Query: query, Total: 3, Scanned: 5, Complete: &yes}},
+			args:       map[string]any{"tags": query, "count_only": true},
+			want:       `{"query":"` + query + `","total":3,"scanned":5,"complete":true}`,
+			countCalls: 1,
+		},
+		{
+			name:       "a lower-bound count keeps its total, 0 included",
+			svc:        &postsMockService{count: &service.PostCount{Query: query, Total: 0, Scanned: 1000, Complete: &no}},
+			args:       map[string]any{"tags": query, "count_only": true},
+			want:       `{"query":"` + query + `","total":0,"scanned":1000,"complete":false}`,
+			countCalls: 1,
+		},
+		{
+			name:      "a local refusal of the scan is the plain validation result",
+			svc:       &postsMockService{err: errors.New("cannot split the query: '1girl*' carries a wildcard (*) or OR (~) that only Danbooru can evaluate; drop it, or use fewer tags so Danbooru answers the query directly")},
+			args:      map[string]any{"tags": "arm_up sword 1girl*"},
+			want:      `{"error":"post_search_failed","message":"cannot split the query: '1girl*' carries a wildcard (*) or OR (~) that only Danbooru can evaluate; drop it, or use fewer tags so Danbooru answers the query directly"}`,
+			listCalls: 1,
+		},
+		{
+			name:      "a tag-limit 422 the service could not fall back from stays the plain result",
+			svc:       &postsMockService{err: &tagLimitMockError{}},
+			args:      map[string]any{"tags": query},
+			want:      `{"error":"post_search_failed","message":"danbooru 422: {\"success\":false,\"error\":\"PostQuery::TagLimitError\",\"message\":\"You cannot search for more than 2 tags at a time.\"}"}`,
+			listCalls: 1,
+		},
+		{
+			name:        "an outage during the scan is the uniform marked result",
+			svc:         &postsMockService{err: &upstreamMockError{}},
+			args:        map[string]any{"tags": query},
+			want:        `{"error":"upstream_unavailable","message":"Danbooru is not answering right now: danbooru 503 (Downbooru). All tools of this server are affected; retry later."}`,
+			wantIsError: true,
+			listCalls:   1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, text := callText(t, inProcessClient(t, tt.svc), "search_posts", tt.args)
+			if text != tt.want {
+				t.Errorf("payload:\n got: %s\nwant: %s", text, tt.want)
+			}
+			if res.IsError != tt.wantIsError {
+				t.Errorf("IsError = %v, want %v", res.IsError, tt.wantIsError)
+			}
+			if !tt.wantIsError && strings.Contains(text, "upstream_unavailable") {
+				t.Errorf("a non-outage result must never be marked upstream_unavailable, got: %s", text)
+			}
+			if tt.svc.calls != tt.listCalls || tt.svc.countCalls != tt.countCalls {
+				t.Errorf("the handler must call the service exactly as often as the mode needs (no retry), got %d SearchPosts and %d CountPosts call(s)",
+					tt.svc.calls, tt.svc.countCalls)
+			}
+			// Each mode's recorder must hold the tags as typed.
+			if got := tt.svc.gotTags; tt.listCalls == 1 && got != tt.args["tags"] {
+				t.Errorf("tags must reach SearchPosts as typed, got %q", got)
+			}
+			if got := tt.svc.gotCountTags; tt.countCalls == 1 && got != tt.args["tags"] {
+				t.Errorf("tags must reach CountPosts as typed, got %q", got)
+			}
+		})
 	}
 }
 

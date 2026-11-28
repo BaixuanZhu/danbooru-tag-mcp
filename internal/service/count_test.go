@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -102,12 +103,12 @@ func TestCountPosts_NoRatingInjection(t *testing.T) {
 }
 
 // TestCountPosts_SharesTheTagCapWithSearchPosts pins that count mode applies
-// the post search's local tag-count rule and nothing else. Danbooru enforces
-// the same 2-content-tag limit on /counts/posts.json (verified live: three
-// content tags answer 422 on both endpoints), so every query must get the
-// same verdict from both modes — the identical message, space-split hint
-// included — before any request. Metatags are not rejected: the endpoint
-// honors rating:, status: and negation (verified live).
+// the post search's local validation and nothing else. Both modes share the
+// 6-tag cap: an over-limit query gets the identical message from both,
+// space-split hint included, before any request of any kind. Metatags are
+// not rejected — the endpoint honors rating:, status: and negation (verified
+// live) — and a query within the direct limit reaches the count endpoint
+// verbatim, once.
 func TestCountPosts_SharesTheTagCapWithSearchPosts(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -117,16 +118,18 @@ func TestCountPosts_SharesTheTagCapWithSearchPosts(t *testing.T) {
 	}{
 		{name: "single tag", query: "arm_up"},
 		{name: "two content tags", query: "arm_up holding_weapon"},
-		{name: "exempt metatags do not count", query: "1girl blue_hair status:any"},
+		{name: "free metatags do not count", query: "1girl blue_hair status:any"},
+		{name: "a counting metatag takes a term", query: "arm_up order:count"},
+		{name: "an unknown-key colon token is a content token", query: "arm_up foo:bar"},
 		{name: "metatag-only query", query: "rating:g"},
 		{name: "negation", query: "arm_up -sword"},
-		{name: "order: counts toward the cap", query: "1girl blue_hair order:count", reject: overLimitMessage},
-		{name: "three content tags", query: "1girl blue_hair long_hair", reject: overLimitMessage},
+		{name: "seven content tags", query: "1girl blue_hair long_hair solo smile sword aqua_eyes", reject: tooManyTagsMessage(7)},
+		{name: "eight content tags and a metatag, which does not count", query: "t1 t2 t3 t4 t5 t6 t7 t8 order:count", reject: tooManyTagsMessage(8)},
 		{
-			name:   "space-split pair keeps its hint",
-			query:  "blue hair order:random",
+			name:   "space-split pairs keep their hint",
+			query:  "blue hair long hair blue eyes red eyes",
 			store:  vocab.Default(),
-			reject: overLimitMessage + "; 'blue hair' may be one tag: blue_hair",
+			reject: overLimitMessage + "; 'blue hair' may be one tag: blue_hair; 'long hair' may be one tag: long_hair; 'blue eyes' may be one tag: blue_eyes",
 		},
 	}
 	for _, tt := range tests {
@@ -157,8 +160,74 @@ func TestCountPosts_SharesTheTagCapWithSearchPosts(t *testing.T) {
 			if countErr.Error() != tt.reject || postsErr.Error() != tt.reject {
 				t.Errorf("both modes must reject with the identical message:\ncount: %s\nposts: %s\nwant:  %s", countErr, postsErr, tt.reject)
 			}
-			if countMock.countCalls != 0 || postsMock.postsCalls != 0 {
-				t.Errorf("an over-limit query must be rejected before any request, got count %d, posts %d", countMock.countCalls, postsMock.postsCalls)
+			if countMock.countCalls != 0 || postsMock.postsCalls != 0 || countMock.lastNamesArg != nil || postsMock.lastNamesArg != nil {
+				t.Errorf("an over-limit query must be rejected before any request, got count %d, posts %d, lookups %v and %v",
+					countMock.countCalls, postsMock.postsCalls, countMock.lastNamesArg, postsMock.lastNamesArg)
+			}
+		})
+	}
+}
+
+// TestCountPosts_SharesTheRoutingWithSearchPosts pins that both modes route a
+// query the same way past the cap. Above the account's direct limit, count
+// mode runs the same scan as list mode — one lookup for the same names, the
+// same upstream query, the same pages — and counts what list mode would
+// return. And every local refusal of the scan (a wildcard, a random:
+// metatag, the term budget, no tag to send) is the same unmarked message from
+// both modes, before any request.
+func TestCountPosts_SharesTheRoutingWithSearchPosts(t *testing.T) {
+	for _, query := range []string{"1girl arm_up sword", "arm_up sword order:score", "blue hair order:random", "1girl arm_up -sword"} {
+		t.Run("scan "+query, func(t *testing.T) {
+			listFetcher := newScanFetcher(scanRows, page(exampleListing))
+			list, err := NewTagService(listFetcher, nil).SearchPosts(context.Background(), query, 5, "")
+			if err != nil {
+				t.Fatalf("list mode: unexpected error: %v", err)
+			}
+			countFetcher := newScanFetcher(scanRows, page(exampleListing))
+			count, err := NewTagService(countFetcher, nil).CountPosts(context.Background(), query)
+			if err != nil {
+				t.Fatalf("count mode: unexpected error: %v", err)
+			}
+
+			_, listNames, listCalls, _ := listFetcher.log()
+			_, countNames, countCalls, _ := countFetcher.log()
+			if !slices.Equal(countNames, listNames) || !slices.Equal(countCalls, listCalls) {
+				t.Errorf("both modes must scan alike:\nlist:  %v %v\ncount: %v %v", listNames, listCalls, countNames, countCalls)
+			}
+			if count.Total != len(list.Posts) {
+				t.Errorf("the count must be what list mode returned: total = %d, posts = %d", count.Total, len(list.Posts))
+			}
+			if count.Complete == nil || *count.Complete != *list.Complete {
+				t.Errorf("both modes must agree on completeness: count %v, list %v", count.Complete, list.Complete)
+			}
+			if count.Query != query {
+				t.Errorf("query = %q, want the query as typed", count.Query)
+			}
+			if countFetcher.mockFetcher.countCalls != 0 {
+				t.Errorf("a scanned count must not ask /counts/posts.json, got %d request(s)", countFetcher.mockFetcher.countCalls)
+			}
+		})
+	}
+
+	for _, query := range []string{"arm_up sword 1girl*", "1girl arm_up sword random:20", "arm_up sword order:score user:albert", "-sword -1girl -solo"} {
+		t.Run("refuse "+query, func(t *testing.T) {
+			listFetcher := newScanFetcher(scanRows, page(exampleListing))
+			listFetcher.mockFetcher.countResp = []byte(`{"counts":{"posts":1}}`)
+			svc := NewTagService(listFetcher, nil)
+			_, listErr := svc.SearchPosts(context.Background(), query, 5, "")
+			_, countErr := svc.CountPosts(context.Background(), query)
+			if listErr == nil || countErr == nil {
+				t.Fatalf("both modes must refuse the query, got list: %v, count: %v", listErr, countErr)
+			}
+			if listErr.Error() != countErr.Error() {
+				t.Errorf("both modes must refuse with the identical message:\nlist:  %s\ncount: %s", listErr, countErr)
+			}
+			if errors.Is(listErr, app.ErrUpstreamUnavailable) || errors.Is(countErr, app.ErrUpstreamUnavailable) {
+				t.Errorf("a local refusal must not carry the upstream marker, got list: %v, count: %v", listErr, countErr)
+			}
+			assertRequests(t, listFetcher, 0, nil)
+			if listFetcher.mockFetcher.countCalls != 0 {
+				t.Errorf("the refusal must cost no request, got %d count request(s)", listFetcher.mockFetcher.countCalls)
 			}
 		})
 	}

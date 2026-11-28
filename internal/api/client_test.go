@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -684,12 +685,233 @@ func TestFetchPosts_DoesNotAddRatingFilter(t *testing.T) {
 	defer srv.Close()
 
 	cli := newTestClient(srv.URL)
-	_, err := cli.FetchPosts(context.Background(), "1girl blue_hair", 5)
+	_, err := cli.FetchPosts(context.Background(), "1girl blue_hair", 5, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if strings.Contains(gotTags, "rating:") {
 		t.Errorf("api layer must NOT inject rating filter, got tags: %s", gotTags)
+	}
+}
+
+// TestFetchPosts_AlwaysSendsOnlyFieldsAndPageOnlyAboveOne pins the wire shape
+// of every posts request: the tags as typed, the limit when positive, only=
+// naming exactly the fields the service consumes (never absent), and page
+// only when above 1 — so a direct query, a profile sample and the first scan
+// page cost no page parameter. The whole query is compared, which pins "these
+// parameters and nothing else".
+func TestFetchPosts_AlwaysSendsOnlyFieldsAndPageOnlyAboveOne(t *testing.T) {
+	// url.Values.Encode percent-encodes the commas of only=; Danbooru reads
+	// the decoded list (verified live 2026-11-28).
+	const only = "id%2Crating%2Cscore%2Cfav_count%2Cpreview_file_url%2Clarge_file_url" +
+		"%2Ctag_string_copyright%2Ctag_string_artist%2Ctag_string_character%2Ctag_string_general%2Ctag_string_meta"
+	tests := []struct {
+		name      string
+		limit     int
+		page      int
+		wantQuery string
+	}{
+		{"first page sends no page parameter", 5, 1, "limit=5&only=" + only + "&tags=1girl+blue_hair"},
+		{"page zero also means the first page", 5, 0, "limit=5&only=" + only + "&tags=1girl+blue_hair"},
+		{"later pages are numbered", 200, 3, "limit=200&only=" + only + "&page=3&tags=1girl+blue_hair"},
+		{"non-positive limit omits the parameter", 0, 2, "only=" + only + "&page=2&tags=1girl+blue_hair"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath, gotMethod, gotQuery, gotOnly string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotMethod = r.URL.Path, r.Method
+				// Credentials are stripped first: when the shell carries
+				// DANBOORU_LOGIN / DANBOORU_API_KEY, NewClient injects them,
+				// and the comparison would fail and print them.
+				q := r.URL.Query()
+				q.Del("login")
+				q.Del("api_key")
+				gotQuery = q.Encode()
+				gotOnly = r.URL.Query().Get("only")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`[]`))
+			}))
+			defer srv.Close()
+
+			cli := newTestClient(srv.URL)
+			if _, err := cli.FetchPosts(context.Background(), "1girl blue_hair", tt.limit, tt.page); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotPath != "/posts.json" || gotMethod != http.MethodGet {
+				t.Errorf("expected GET /posts.json, got %s %q", gotMethod, gotPath)
+			}
+			if gotQuery != tt.wantQuery {
+				t.Errorf("query:\n got: %s\nwant: %s", gotQuery, tt.wantQuery)
+			}
+			if want := strings.Split(postListFields, ","); !slices.Equal(strings.Split(gotOnly, ","), want) {
+				t.Errorf("only = %q, want exactly the consumed fields %v", gotOnly, want)
+			}
+		})
+	}
+}
+
+// tagLimitBody is the live body of Danbooru's tag-limit 422 (anonymous,
+// 2026-11-28).
+const tagLimitBody = `{"success":false,"error":"PostQuery::TagLimitError","message":"You cannot search for more than 2 tags at a time."}`
+
+// tagLimitText is tagLimitBody behind the api layer's shrunken-error prefix:
+// the text a tool returned for this 422 before the classification existed,
+// and the text it must keep returning.
+const tagLimitText = `danbooru 422: ` + tagLimitBody
+
+// TestGet_TagLimitClassification pins which responses are Danbooru's tag-limit
+// refusal: a 422 whose body names TagLimitError, read from the whole body so
+// the verdict survives the 300-byte shrink of the error text. Such a response
+// comes back after one attempt, with its text unchanged, matching
+// app.ErrTagLimitExceeded and never the upstream marker. Every other answer
+// keeps its class: another 422 is a plain error, the same body under another
+// status is not a tag-limit refusal, and a 5xx or 429 still takes the
+// upstream path — retried, then marked upstream, whatever its body says.
+func TestGet_TagLimitClassification(t *testing.T) {
+	// The class name sits past the bytes the error text keeps, so only the
+	// whole-body read can see it.
+	buriedTagLimitBody := `{"success":false,"error":"` + strings.Repeat("x", 400) + `TagLimitError","message":"too many tags"}`
+
+	tests := []struct {
+		name        string
+		status      int
+		contentType string
+		body        string
+		wantCalls   int
+		wantTag     bool
+		wantUpstrm  bool
+	}{
+		{"live tag-limit 422", http.StatusUnprocessableEntity, "application/json", tagLimitBody, 1, true, false},
+		{"class name past the 300-byte shrink", http.StatusUnprocessableEntity, "application/json", buriedTagLimitBody, 1, true, false},
+		{"another 422 is a plain error", http.StatusUnprocessableEntity, "application/json", `{"error":"query rejected"}`, 1, false, false},
+		{"empty 422 body", http.StatusUnprocessableEntity, "application/json", ``, 1, false, false},
+		{"same body, status 400", http.StatusBadRequest, "application/json", tagLimitBody, 1, false, false},
+		{"same body, status 404", http.StatusNotFound, "application/json", tagLimitBody, 1, false, false},
+		{"same body, status 500: upstream path", http.StatusInternalServerError, "application/json", tagLimitBody, 1 + maxRetries, false, true},
+		{"same body, status 429: upstream path", http.StatusTooManyRequests, "application/json", tagLimitBody, 1 + maxRetries, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var hits int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&hits, 1)
+				w.Header().Set("Content-Type", tt.contentType)
+				w.WriteHeader(tt.status)
+				w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			// Three requests, one per entry point that reaches /posts.json or
+			// /counts/posts.json with a caller's query; each pays the attempt
+			// count of its class.
+			const entryPoints = 3
+			before := atomic.LoadInt32(&hits)
+			for name, call := range map[string]func() error{
+				"Get": func() error {
+					_, err := newFastTestClient(srv.URL).Get(context.Background(), "/posts.json", nil)
+					return err
+				},
+				"FetchPosts": func() error {
+					_, err := newFastTestClient(srv.URL).FetchPosts(context.Background(), "1girl arm_up sword", 5, 1)
+					return err
+				},
+				"FetchPostCount": func() error {
+					_, err := newFastTestClient(srv.URL).FetchPostCount(context.Background(), "1girl arm_up sword")
+					return err
+				},
+			} {
+				err := call()
+				if err == nil {
+					t.Fatalf("%s: expected the non-2xx to surface", name)
+				}
+				if got := errors.Is(err, app.ErrTagLimitExceeded); got != tt.wantTag {
+					t.Errorf("%s: tag-limit classification = %v, want %v (err: %v)", name, got, tt.wantTag, err)
+				}
+				if got := errors.Is(err, app.ErrUpstreamUnavailable); got != tt.wantUpstrm {
+					t.Errorf("%s: upstream marker = %v, want %v (err: %v)", name, got, tt.wantUpstrm, err)
+				}
+			}
+			if got := int(atomic.LoadInt32(&hits) - before); got != entryPoints*tt.wantCalls {
+				t.Errorf("expected %d attempts per request (%d requests), got %d", tt.wantCalls, entryPoints, got)
+			}
+		})
+	}
+}
+
+// TestGet_TagLimit422TextIsUnchanged pins the error text of the tag-limit 422
+// to the bytes the plain httpStatusError produced before the classification
+// existed: the tools layer keeps answering the ordinary post_search_failed
+// result for it, so the text is the whole contract an agent sees.
+func TestGet_TagLimit422TextIsUnchanged(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.Write([]byte(tagLimitBody))
+	}))
+	defer srv.Close()
+
+	_, err := newFastTestClient(srv.URL).FetchPosts(context.Background(), "1girl arm_up sword", 5, 1)
+	if err == nil {
+		t.Fatal("expected the tag-limit 422 to surface")
+	}
+	if err.Error() != tagLimitText {
+		t.Errorf("text:\n got: %s\nwant: %s", err, tagLimitText)
+	}
+	if want := httpStatusError(http.StatusUnprocessableEntity, "application/json", []byte(tagLimitBody)).Error(); err.Error() != want {
+		t.Errorf("the text must equal the unclassified shrunken error, got %q want %q", err, want)
+	}
+	if !errors.Is(err, app.ErrTagLimitExceeded) {
+		t.Errorf("expected the tag-limit classification, got: %v", err)
+	}
+	// The cause stays reachable through Unwrap: nothing else the error chain
+	// may be asked for is lost.
+	if errors.Is(err, context.Canceled) || errors.Is(err, app.ErrUpstreamUnavailable) {
+		t.Errorf("a tag-limit 422 is neither a cancellation nor an outage, got: %v", err)
+	}
+}
+
+// TestClient_AuthenticatedRequiresBothCredentials pins the one rule that
+// decides whether requests are credentialed: both values non-empty. It is the
+// same rule Get applies before injecting login/api_key, so the wire carries
+// the credentials exactly when Authenticated reports true — and carries
+// neither value when it reports false, even the one that is set.
+func TestClient_AuthenticatedRequiresBothCredentials(t *testing.T) {
+	tests := []struct {
+		name          string
+		login, key    string
+		authenticated bool
+	}{
+		{"both set", "probe_user", "probe_key", true},
+		{"login only", "probe_user", "", false},
+		{"api key only", "", "probe_key", false},
+		{"neither", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotLogin, gotKey string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotLogin, gotKey = r.URL.Query().Get("login"), r.URL.Query().Get("api_key")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`[]`))
+			}))
+			defer srv.Close()
+
+			cli := NewClient(WithBaseURL(srv.URL), WithReqGap(0), WithCredentials(tt.login, tt.key))
+			if got := cli.Authenticated(); got != tt.authenticated {
+				t.Fatalf("Authenticated() = %v, want %v", got, tt.authenticated)
+			}
+			if _, err := cli.Get(context.Background(), "/test", nil); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.authenticated {
+				if gotLogin != tt.login || gotKey != tt.key {
+					t.Errorf("an authenticated client must send both credentials, got login=%q key=%q", gotLogin, gotKey)
+				}
+			} else if gotLogin != "" || gotKey != "" {
+				t.Errorf("an unauthenticated client must send neither credential, got login=%q key=%q", gotLogin, gotKey)
+			}
+		})
 	}
 }
 

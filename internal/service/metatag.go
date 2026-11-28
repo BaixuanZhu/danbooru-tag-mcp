@@ -54,6 +54,22 @@ const danbooruEditMetatagKeyList = `artist copyright character general meta
 art copy char ch co gen
 newpool newfavgroup`
 
+// unlimitedMetatagKeyList mirrors PostQuery::UNLIMITED_METATAGS in
+// app/logical/post_query.rb of github.com/danbooru/danbooru (read
+// 2026-11-28: 25 keys): the post-search metatags that do NOT count toward
+// the account's tag limit. Upstream's term_count is tags + wildcards + every
+// metatag whose key is outside this list, so order:, user:, pool:, fav:,
+// search: and the *_count keys each cost a term while rating:, status: and
+// id: are free (verified live 2026-11-28: "arm_up sword order:score" and
+// "arm_up sword user:albert" answer 422 anonymously, "arm_up sword
+// status:any" and "arm_up sword favcount:>5" do not). The same count decides
+// whether search_posts sends a query as-is and how many tags its local scan
+// may send, so a wrong verdict here either sends a query Danbooru refuses or
+// refuses one it would answer. Every key is also in danbooruMetatagKeyList.
+const unlimitedMetatagKeyList = `status rating limit is id date age filesize filetype parent child
+md5 width height duration mpixels ratio score upvote downvotes
+favcount embedded tagcount pixiv_id pixiv`
+
 // keySet turns one space-separated key list into a lookup set.
 func keySet(list string) map[string]bool {
 	set := make(map[string]bool)
@@ -68,6 +84,9 @@ var danbooruMetatagKeys = keySet(danbooruMetatagKeyList)
 
 // danbooruEditMetatagKeys is danbooruEditMetatagKeyList as a lookup set.
 var danbooruEditMetatagKeys = keySet(danbooruEditMetatagKeyList)
+
+// unlimitedMetatagKeys is unlimitedMetatagKeyList as a lookup set.
+var unlimitedMetatagKeys = keySet(unlimitedMetatagKeyList)
 
 // metatagKey returns the lowercased text before name's first colon, after
 // skipping one leading '-' or '~'. found is false when name has no colon.

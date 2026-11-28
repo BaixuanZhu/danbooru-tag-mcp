@@ -21,7 +21,8 @@
   (`GET /counts/posts.json`; `tags` is set only when non-empty, so an empty
   value counts the whole site; always through `Client.Get`).
 - service:
-  `type PostCount struct { Query string `json:"query"`; Total int `json:"total"` }`,
+  `type PostCount struct { Query string `json:"query"`; Total int `json:"total"`;
+  Scanned int `json:"scanned,omitempty"`; Complete *bool `json:"complete,omitempty"` }`,
   `func (s *TagService) CountPosts(ctx, tags string) (*PostCount, error)`,
   `var ErrPostCountTimedOut = errors.New(...)`.
 - tools: `TagService.CountPosts`; the handler routes on
@@ -33,7 +34,10 @@
 - Request: `tags` as sent (trimmed) and verbatim. `limit` and `tags_mode`
   are neither read nor validated in count mode.
 - Response: `{"query":"<tags>","total":<n>}`, `query` first. Always live;
-  nothing is stored between calls.
+  nothing is stored between calls. A query beyond the term budget is
+  answered by the same scan as a listing (next scenario): the answer then
+  adds `scanned`/`complete`, and `total` is exact only when `complete` is
+  true, otherwise a lower bound.
 - Validation: the same local content-tag cap `SearchPosts` runs
   (`checkPostQuery`), identical text with the space-split hint, before any
   request.
@@ -46,11 +50,12 @@
 | Condition | Result |
 |---|---|
 | `tags` empty | `post_search_failed` "tags parameter is required" (handler, no request) |
-| over the content-tag cap | the shared local error, no request, unmarked |
+| over the content-tag cap (6) | the shared local error, no request, unmarked |
 | integer `counts.posts` | `{"query":...,"total":<n>}` |
 | explicit `{"counts":{"posts":null}}` (Danbooru's count timed out) | `ErrPostCountTimedOut` -> unmarked `post_search_failed`, message "danbooru could not count this query (count timed out); simplify the query or retry later"; never `0`, never `upstream_unavailable` |
 | `counts.posts` missing or not an integer (shape drift) | parse error "failed to parse post count: ..." quoting at most 32 bytes of the value; never reported as a timeout |
-| 422 (upstream tag limit) | shrunken unmarked error after one attempt |
+| 422 whose body is NOT a tag limit | shrunken unmarked error after one attempt |
+| credentialed direct count refused with the tag-limit 422 | scan fallback (same routing as `SearchPosts`): `total` over the scanned posts, `scanned`/`complete` present |
 | transport / 5xx / 429 on the counts request | uniform `upstream_unavailable` |
 
 ### 5. Good / Base / Bad Cases
@@ -69,15 +74,18 @@ Example values are from the anonymous probe of 2026-11-28.
 - api: `TestFetchPostCount_*` (URL with and without tags, 503 marked, 422
   unmarked after one attempt).
 - service: `TestCountPosts_*` (parsing, the three outcomes, verbatim tags,
-  validation before any request).
+  validation before any request), `TestCountPosts_OverScan` (exact when the
+  listing ends, lower bound otherwise) and
+  `_SharesTheRoutingWithSearchPosts`.
 - tools: `TestSearchPostsHandler_CountModePayloadBytes` and
   `TestSearchPostsHandler_PayloadBytesUnchanged` (list mode unchanged with
   `count_only` absent and `false`, pinned by
   `TestSearchPostsHandler_CountOnlyFalseKeepsListModeBytes`); the
   count-mode row of `TestHandlers_UpstreamFailureIsUniform`; the chain test
   `TestChain_CountModeReachesTheClient`.
-- Integration check 25: the count of `blue_hair` matches its tag row's
-  `post_count` within 10.
+- Integration checks 25 (the count of `blue_hair` matches its tag row's
+  `post_count` within 10) and 30 (a count over a scan reports `total`,
+  `scanned`, `complete`).
 
 ### 7. Wrong vs Correct
 
@@ -97,6 +105,130 @@ total, err := parsePostCount(res) // null -> ErrPostCountTimedOut; drift -> pars
 if err != nil {
     return nil, err // failResult: unmarked text, or upstream_unavailable only for a marked error
 }
+```
+
+---
+
+## Scenario: search_posts multi-tag scan
+
+### 1. Scope / Trigger
+
+- Cross-layer contract (task 11-28-search-posts-multi-tag, 2026-11-28):
+  queries beyond Danbooru's own term budget are answered exactly by a
+  local scan instead of failing, and split answers gain three fields.
+
+### 2. Signatures
+
+- Tool: `search_posts` schema unchanged; the description names the 6-tag
+  cap, the two-rarest-upstream behavior and the three fields (pinned
+  word-for-word by the registry test).
+- api: `FetchPosts(ctx, tags, limit, page)` — `only=<light fields>` on
+  EVERY posts request, `page` only when > 1; a 422 whose body carries
+  `TagLimitError` is wrapped in `*tagLimitError` (`Is` matches only
+  `app.ErrTagLimitExceeded`, text unchanged); `Authenticated()`.
+- service: `MaxQueryTags = 6`, `anonymousTagLimit = 2`,
+  `WithUpstreamTagLimit(n) Option`; `parsePostQuery` + `postQuery`
+  (`postquery.go`), `planScan` / `scan` / `scanPages` / `searchPostsByScan`
+  / `countPostsByScan` (`scan.go`); `PostsResult.UpstreamQuery` /
+  `.Scanned` / `.Complete`, `PostCount.Scanned` / `.Complete`.
+- app: `ErrTagLimitExceeded` (next to `ErrUpstreamUnavailable`).
+
+### 3. Contracts
+
+- `terms()` = non-metatag tokens + counting metatags (keys OUTSIDE the
+  25-key `unlimitedMetatagKeyList`, a transcription of
+  `PostQuery::UNLIMITED_METATAGS`) vs the configured limit decides direct
+  versus scan. Direct: query verbatim, payload byte-identical to the
+  pre-scan shape (pinned for 8 queries x 4 tags_modes).
+- Scan: ONE batch `lookupTags` over all content tokens (positives,
+  unresolved colon tokens, exclusions alike — a colon token WITH a row is
+  a content tag under its canonical name, without one it passes through);
+  the `k = min(2, tagLimit - countingMetatags)` rarest positives go
+  upstream as one listing (query order breaks rarity ties; metatags and
+  pass-through tokens ride verbatim into `upstream_query`); the remaining
+  positives/negatives are filtered locally against each post's five
+  `tag_string_*` sets (canonical lowercase names) — the answer reproduces
+  the query exactly, in Danbooru's order.
+- Pages: `limit=200`, at most 5, id-deduped; stop at `limit` matches / a
+  short page / the page cap; `scanned` counts distinct posts; `complete`
+  is a pointer, so absent means "not split" and false means a prefix (or a
+  lower-bound count in count mode). The three fields appear on split
+  answers only.
+- Fallback: only `errors.Is(err, app.ErrTagLimitExceeded)` switches a
+  direct attempt to the scan (and only when the configured limit exceeds
+  the anonymous 2) and narrows a refused scan page ONCE (the less rare tag
+  drops and becomes a local filter); any other error is returned
+  untouched.
+- Refusals before any request: more than 6 content tokens; `*` or `~`;
+  `random:` (it caps the listing, so a short page would not mean the
+  listing ended); counting metatags consuming the whole tag budget;
+  no positive tag at all.
+- A local-filter token whose row shows 0 posts is alias-resolved once
+  (`resolveRenamedTo`) and filtered under its current name (renamed
+  antecedents keep 0-post placeholder rows); pair members and pass-through
+  tokens are never alias-resolved.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behavior |
+|---|---|
+| > 6 content tokens | local `too many content tags: N (max 6); drop tags or split the query` + space-split hint; no request, both modes |
+| `*` / `~` token in a query needing a scan | local error naming the token; no request |
+| `random:` in a query needing a scan | local error naming it; no request |
+| counting metatags leave no tag budget (`k < 1`) | local error naming them; no request |
+| only exclusions and metatags (no positive tag) | local error; no request |
+| credentialed direct attempt -> tag-limit 422 | scan fallback; a refused page narrows once, a second refusal returns the plain error |
+| any other error (another 422, outage, cancellation) | returned untouched; cancellation never retries |
+
+### 5. Good / Base / Bad Cases
+
+- Good (anonymous): `1girl arm_up sword` -> upstream `arm_up sword`
+  (the two rarest), `1girl` filtered locally, `complete: true`.
+- Base: `1girl arm_up sword order:score` (3 terms) -> the scan sends ONE
+  tag (`arm_up order:score`), the rest filtered locally.
+- Bad: `random:100 1girl arm_up sword` -> the `random:` refusal, never a
+  cut-off answer reported as complete.
+
+### 6. Tests Required
+
+- parse: `TestParsePostQuery_*` (classification table, cap before any
+  request, wildcard refusal, term count over the whole 101-key list,
+  `TestUnlimitedMetatagKeyList_*` 25-key snapshot).
+- scan: `TestScan_PicksRarestPairAndCanonicalNames`,
+  `_ClassifiesColonTokensByRowPresence`, `_FiltersLocally`,
+  `_StopsAtLimitAndAtListingEnd`, `_PageCapReportsIncomplete`,
+  `_DedupesRandomPages`, `_BudgetShrinksWithCountingMetatags`,
+  `_RefusesWhenMetatagsUseTheBudget`, `_RefusesWithoutPositiveTag`,
+  `_NarrowsOnTagLimitRefusal`, `_RenamedLocalFilterUsesCurrentName`,
+  `_NoAliasLookupForPairMembersOrLiveFilters`,
+  `_UpstreamQueryIsPairThenVerbatimTokens`,
+  `_ConcurrentCallsKeepPerCallState` (race detector).
+- routing/chain: `TestSearchPosts_DirectPathByteIdentical`,
+  `TestSearchPosts_TagLimitFallback` (httptest + real service, anonymous
+  never-3-tag pin), `TestCountPosts_OverScan`,
+  `internal/api/tag_limit_chain_test.go` (real api -> service -> tools for
+  both routings), `TestSearchPostsHandler_ScanFieldsRideThePayload`
+  (false vs absent `complete`, no retry).
+- Integration checks 9, 23 and 27-31.
+
+### 7. Wrong vs Correct
+
+Wrong: routing or falling back on `err != nil`, or string-matching the 422
+message.
+
+```go
+if err != nil {
+    return s.searchPostsByScan(ctx, q) // an outage would also trigger a scan
+}
+```
+
+Correct: only the classified sentinel may trigger the fallback.
+
+```go
+if errors.Is(err, app.ErrTagLimitExceeded) {
+    return s.searchPostsByScan(ctx, q)
+}
+return nil, err
 ```
 
 ---

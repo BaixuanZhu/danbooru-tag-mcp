@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -98,6 +99,16 @@ func NewClient(opts ...Option) *Client {
 	return c
 }
 
+// Authenticated reports whether this client's requests carry credentials:
+// both the login and the api key must be non-empty, the same rule Get
+// applies before injecting login/api_key, kept in one place. Danbooru's tag
+// limit follows the account (anonymous 2 terms, logged-in 3, Gold and above
+// unlimited — verified live 2026-11-28), so main reads this to pick the
+// service's direct tag limit.
+func (c *Client) Authenticated() bool {
+	return c.login != "" && c.apiKey != ""
+}
+
 // resolveReqGap picks the default request gap tier: DANBOORU_REQ_GAP_MS
 // when set and parseable (0 valid), else 500ms when both credentials are
 // present, else the anonymous 1500ms. Invalid or negative values warn once
@@ -121,9 +132,11 @@ func resolveReqGap(credentialed bool) time.Duration {
 // text for non-2xx responses. A request that still fails after retries comes
 // back wrapped in *upstreamError (errors.Is(err, app.ErrUpstreamUnavailable)
 // is true); a 4xx is a definitive answer from a reachable upstream and
-// surfaces unwrapped after one attempt. Concurrency contract: the rate limit
-// keeps its accounting under c.mu but sleeps unlocked (waitTurn); network
-// execution (retries, backoffs, Retry-After waits) also runs unlocked.
+// surfaces after one attempt — unwrapped, except a tag-limit 422, which is
+// wrapped in *tagLimitError with its text unchanged. Concurrency contract:
+// the rate limit keeps its accounting under c.mu but sleeps unlocked
+// (waitTurn); network execution (retries, backoffs, Retry-After waits) also
+// runs unlocked.
 func (c *Client) Get(ctx context.Context, path string, params url.Values) ([]byte, error) {
 	if params == nil {
 		params = make(url.Values)
@@ -136,7 +149,7 @@ func (c *Client) Get(ctx context.Context, path string, params url.Values) ([]byt
 
 	// Credentials are injected into a copy: mutating the caller's map
 	// would leak them into the next call when params are reused.
-	if c.login != "" && c.apiKey != "" {
+	if c.Authenticated() {
 		signed := make(url.Values, len(params)+2)
 		for k, v := range params {
 			signed[k] = v
@@ -211,13 +224,45 @@ func (e *upstreamError) Unwrap() error { return e.err }
 // errors.Is against the wrapped cause working through Unwrap.
 func (e *upstreamError) Is(target error) bool { return target == app.ErrUpstreamUnavailable }
 
+// tagLimitError marks a 422 whose body carries Danbooru's
+// PostQuery::TagLimitError: the query names more terms (tags plus counting
+// metatags) than the account's level allows. Error() is the cause alone, so
+// the text a tool returns for such a 422 is exactly what it was before the
+// classification existed; Is matches only app.ErrTagLimitExceeded, which lets
+// the service layer tell this one refusal from every other 422 and fall back
+// to its local scan. Like any 4xx it is a definitive answer from a reachable
+// upstream: one attempt, no retry, and never the upstream marker.
+type tagLimitError struct{ err error }
+
+func (e *tagLimitError) Error() string { return e.err.Error() }
+func (e *tagLimitError) Unwrap() error { return e.err }
+
+// Is matches only the app.ErrTagLimitExceeded sentinel.
+func (e *tagLimitError) Is(target error) bool { return target == app.ErrTagLimitExceeded }
+
+// tagLimitRefusal is the class name Danbooru puts in the error field of a
+// tag-limit 422. Live anonymous body (2026-11-28):
+// {"success":false,"error":"PostQuery::TagLimitError","message":"You cannot
+// search for more than 2 tags at a time."}
+const tagLimitRefusal = "TagLimitError"
+
+// isTagLimitRefusal reports whether a non-2xx response is Danbooru refusing a
+// query for its tag limit: status 422 whose body names TagLimitError. It
+// reads the raw body, so the verdict does not depend on the 300-byte shrink
+// of the error text (the class name sits about 40 bytes into the live body,
+// but nothing here relies on that).
+func isTagLimitRefusal(status int, body []byte) bool {
+	return status == http.StatusUnprocessableEntity && bytes.Contains(body, []byte(tagLimitRefusal))
+}
+
 // doWithRetry runs the request attempt loop: up to len(backoffs) retries on
 // 5xx, network errors, and 429/421, waiting the backoff schedule between
 // attempts (a parseable Retry-After, capped, replaces the first wait). Context
 // cancellation returns immediately without retrying. Non-retryable 4xx and
 // fatal errors return after one attempt. When retries are exhausted on a
 // retryable class the last error comes back wrapped in *upstreamError; a 4xx
-// and a cancellation surface unwrapped.
+// and a cancellation surface unwrapped — the 4xx in *tagLimitError when it is
+// a tag-limit refusal, text unchanged.
 func (c *Client) doWithRetry(ctx context.Context, reqURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; ; attempt++ {
@@ -237,7 +282,11 @@ func (c *Client) doWithRetry(ctx context.Context, reqURL string) ([]byte, error)
 		case out.status >= 500:
 			lastErr = &upstreamError{httpStatusError(out.status, out.contentType, out.body)}
 		default: // non-retryable 4xx
-			return nil, httpStatusError(out.status, out.contentType, out.body)
+			err := httpStatusError(out.status, out.contentType, out.body)
+			if isTagLimitRefusal(out.status, out.body) {
+				return nil, &tagLimitError{err}
+			}
+			return nil, err
 		}
 		if attempt >= len(c.backoffs) {
 			return nil, lastErr // retries exhausted
@@ -498,13 +547,29 @@ func (c *Client) FetchWiki(ctx context.Context, title, otherNames string, limit 
 	return c.Get(ctx, "/wiki_pages.json", q)
 }
 
-// FetchPosts sends tags verbatim; no layer of this server injects a rating
-// filter — pinning rating:<x> is the caller's opt-in (see AGENTS.md).
-func (c *Client) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
+// postListFields is the only= parameter of every posts request: exactly the
+// fields the service consumes, so a post shrinks from about 3,499 to 957
+// bytes (verified live 2026-11-28). Sent on direct queries, profile samples
+// and scan pages alike; anything the service starts to read must be added
+// here or it silently arrives as a zero value.
+const postListFields = "id,rating,score,fav_count,preview_file_url,large_file_url," +
+	"tag_string_copyright,tag_string_artist,tag_string_character,tag_string_general,tag_string_meta"
+
+// FetchPosts requests one page of the posts matching tags, which go out
+// verbatim; no layer of this server injects a rating filter — pinning
+// rating:<x> is the caller's opt-in (see AGENTS.md). page is sent only when
+// above 1, so the first page costs no parameter (page <= 0 also means the
+// first page). only= is always sent (postListFields). limit <= 0 omits the
+// parameter and Danbooru answers its default page size.
+func (c *Client) FetchPosts(ctx context.Context, tags string, limit, page int) ([]byte, error) {
 	q := make(url.Values)
 	q.Set("tags", tags)
 	if limit > 0 {
 		q.Set("limit", strconv.Itoa(limit))
+	}
+	q.Set("only", postListFields)
+	if page > 1 {
+		q.Set("page", strconv.Itoa(page))
 	}
 	return c.Get(ctx, "/posts.json", q)
 }

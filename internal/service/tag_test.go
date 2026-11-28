@@ -44,7 +44,9 @@ type mockFetcher struct {
 	lastWikiOther    string
 	lastPostsArg     string
 	lastPostsLim     int
-	postsCalls       int // number of FetchPosts invocations
+	lastPostsPage    int   // page handed to the last FetchPosts
+	postsCalls       int   // number of FetchPosts invocations
+	postsErr         error // returned by FetchPosts instead of a body
 	lastCountArg     string
 }
 
@@ -87,10 +89,14 @@ func (m *mockFetcher) FetchWiki(ctx context.Context, title, otherNames string, l
 	return m.wikiResp, nil
 }
 
-func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error) {
+func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit, page int) ([]byte, error) {
 	m.postsCalls++
 	m.lastPostsArg = tags
 	m.lastPostsLim = limit
+	m.lastPostsPage = page
+	if m.postsErr != nil {
+		return nil, m.postsErr
+	}
 	return m.postsResp, nil
 }
 
@@ -1442,40 +1448,65 @@ func TestSearchPosts_ParsesCategorizedTags(t *testing.T) {
 	}
 }
 
+// TestSearchPosts_RejectsTooManyContentTags pins the local cap on the list
+// path: a query of seven content tokens is refused before any request — no
+// page, no lookup. Up to six tokens is no longer the cap's business: three
+// tags are answered by the scan (see the scan tests).
 func TestSearchPosts_RejectsTooManyContentTags(t *testing.T) {
 	mock := &mockFetcher{postsResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
 
-	_, err := svc.SearchPosts(context.Background(), "1girl blue_hair long_hair", 5, "")
+	_, err := svc.SearchPosts(context.Background(), "1girl blue_hair long_hair solo smile sword aqua_eyes", 5, "")
 	if err == nil || !strings.Contains(err.Error(), "too many content tags") {
 		t.Fatalf("expected too-many-tags error, got: %v", err)
 	}
-	if mock.lastPostsArg != "" {
-		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
+	if mock.postsCalls != 0 || mock.lastNamesArg != nil {
+		t.Errorf("no request should be sent on validation failure, got %d page request(s) and lookup %v", mock.postsCalls, mock.lastNamesArg)
 	}
 }
 
+// TestSearchPosts_MetatagCounting pins how metatags ride the term count on
+// an anonymous account. rating: and status: are free: two content tags plus
+// one are still two terms, which Danbooru answers as-is, so the query goes
+// out verbatim in one request. order: costs a term: the same two tags with
+// it are three terms, which anonymous Danbooru refuses (verified live
+// 2026-11-28), so the query is answered by the scan instead of being
+// rejected locally as it used to be — and never sent as-is.
 func TestSearchPosts_MetatagCounting(t *testing.T) {
 	mock := &mockFetcher{
 		postsResp: []byte(`[{"id":101,"rating":"e","preview_file_url":""}]`),
 	}
 	svc := NewTagService(mock, nil)
 
-	// rating:/status: are exempt from the limit; the query below is 2 content tags.
+	// rating:/status: are free; the query below is 2 terms.
 	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair status:any", 5, ""); err != nil {
-		t.Fatalf("unexpected error for exempt metatag: %v", err)
+		t.Fatalf("unexpected error for free metatag: %v", err)
 	}
-	if !strings.Contains(mock.lastPostsArg, "status:any") {
-		t.Errorf("metatag must be passed through, got: %s", mock.lastPostsArg)
+	if mock.lastPostsArg != "1girl blue_hair status:any" {
+		t.Errorf("free metatag must be passed through verbatim, got: %s", mock.lastPostsArg)
 	}
 
-	// order: counts toward the limit; 2 content tags + order: must be rejected locally.
-	mock.lastPostsArg = ""
-	if _, err := svc.SearchPosts(context.Background(), "1girl blue_hair order:count", 5, ""); err == nil {
-		t.Fatalf("expected too-many-tags error for order: metatag, got nil")
+	// order: takes the third term: 2 content tags + order: is 3 terms, over
+	// the anonymous limit, so the scan answers it. The metatag still rides
+	// the upstream query verbatim, and it costs one of the pair's two tags.
+	lookup := &mockFetcher{
+		namesResp: []byte(`[
+			{"id":1,"name":"1girl","category":0,"post_count":8717103},
+			{"id":2,"name":"blue_hair","category":0,"post_count":1207874}
+		]`),
+		postsResp: []byte(`[]`),
 	}
-	if mock.lastPostsArg != "" {
-		t.Errorf("no request should be sent on validation failure, got: %s", mock.lastPostsArg)
+	svc = NewTagService(lookup, nil)
+	res, err := svc.SearchPosts(context.Background(), "1girl blue_hair order:count", 5, "")
+	if err != nil {
+		t.Fatalf("unexpected error for counting metatag: %v", err)
+	}
+	if lookup.postsCalls != 1 || lookup.lastPostsArg != "blue_hair order:count" {
+		t.Errorf("order: must count: want one scan page of 'blue_hair order:count', got %d request(s) of %q",
+			lookup.postsCalls, lookup.lastPostsArg)
+	}
+	if res == nil || res.UpstreamQuery != "blue_hair order:count" || res.Complete == nil {
+		t.Errorf("the answer must be a split answer naming the upstream query, got: %+v", res)
 	}
 }
 

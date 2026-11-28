@@ -230,7 +230,7 @@ func (s *TagService) profilePair(ctx context.Context, tag, with string, sample i
 
 // fetchProfilePosts fetches and parses one page of posts for the sample.
 func (s *TagService) fetchProfilePosts(ctx context.Context, query string, limit int) ([]danbooruPost, error) {
-	res, err := s.fetcher.FetchPosts(ctx, query, limit)
+	res, err := s.fetcher.FetchPosts(ctx, query, limit, 1)
 	if err != nil {
 		return nil, err
 	}

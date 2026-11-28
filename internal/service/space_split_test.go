@@ -11,16 +11,17 @@ import (
 	"danbooru-tag-mcp/internal/vocab"
 )
 
-// overLimitMessage is the exact text of the local too-many-tags error for a
-// 3-token query, as sent before the space-split diagnostic existed. Every
-// query that names no candidate must keep it byte for byte.
-const overLimitMessage = "too many content tags: 3 (max 2, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query"
+// overLimitMessage is the exact text of the local too-many-tags error for an
+// 8-token query, as it reads since the cap became this server's own (6
+// content tokens) instead of Danbooru's anonymous limit. Every query that
+// names no candidate must keep it byte for byte.
+const overLimitMessage = "too many content tags: 8 (max 6); drop tags or split the query"
 
 // overLimitText builds the expected too-many-tags message for n content tags
-// followed by the given candidate segments, starting from the pinned 3-token
+// followed by the given candidate segments, starting from the pinned 8-token
 // text: only the count and the trailing segments differ.
 func overLimitText(n int, segments ...string) string {
-	msg := strings.Replace(overLimitMessage, "content tags: 3", fmt.Sprintf("content tags: %d", n), 1)
+	msg := strings.Replace(overLimitMessage, "content tags: 8", fmt.Sprintf("content tags: %d", n), 1)
 	return msg + strings.Join(segments, "")
 }
 
@@ -46,7 +47,7 @@ func searchPostsJSON(t *testing.T, query string, store *vocab.Store, modes ...st
 }
 
 // TestSearchPosts_OverLimitMessageIsExact pins the local too-many-tags error
-// byte for byte for every query that names no candidate: the 2-tag cap fires
+// byte for byte for every query that names no candidate: the 6-tag cap fires
 // before any request, and the text must not drift — agents match on it.
 func TestSearchPosts_OverLimitMessageIsExact(t *testing.T) {
 	tests := []struct {
@@ -54,9 +55,9 @@ func TestSearchPosts_OverLimitMessageIsExact(t *testing.T) {
 		query string
 		store *vocab.Store
 	}{
-		{"space-split pair, no vocabulary", "blue hair order:random", nil},
-		{"three content tags", "1girl blue_hair long_hair", vocab.Default()},
-		{"two content tags plus order:", "1girl blue_hair order:count", vocab.Default()},
+		{"eight made-up tokens", "t1 t2 t3 t4 t5 t6 t7 t8", vocab.Default()},
+		{"eight made-up tokens plus a metatag, which does not count", "t1 t2 t3 t4 t5 t6 t7 t8 order:count", vocab.Default()},
+		{"space-split pairs, no vocabulary to name them", "blue hair long hair blue eyes red eyes", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -100,17 +101,18 @@ func TestSearchPosts_EmptyAnswerCostsOneVerbatimRequest(t *testing.T) {
 }
 
 // TestSearchPosts_OverLimitCostsNoRequest pins the request cost of the
-// over-limit path: the query is rejected locally, before any request,
-// whether or not it names a candidate.
+// over-limit path: a query above the 6-tag cap is rejected locally, before
+// any request of any kind — no page, no name lookup — whether or not it
+// names a candidate.
 func TestSearchPosts_OverLimitCostsNoRequest(t *testing.T) {
 	tests := []struct {
 		name  string
 		query string
 		store *vocab.Store
 	}{
-		{"space-split pair", "blue hair order:random", vocab.Default()},
-		{"no candidate", "1girl blue_hair long_hair", vocab.Default()},
-		{"nil vocabulary", "blue hair order:random", nil},
+		{"space-split pairs", "blue hair long hair blue eyes red eyes", vocab.Default()},
+		{"no candidate", "t1 t2 t3 t4 t5 t6 t7 t8", vocab.Default()},
+		{"nil vocabulary", "blue hair long hair blue eyes red eyes", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -120,8 +122,9 @@ func TestSearchPosts_OverLimitCostsNoRequest(t *testing.T) {
 			if _, err := svc.SearchPosts(context.Background(), tt.query, 5, ""); err == nil {
 				t.Fatal("expected the too-many-tags error, got nil")
 			}
-			if mock.postsCalls != 0 {
-				t.Errorf("an over-limit query must be rejected before any request, got %d", mock.postsCalls)
+			if mock.postsCalls != 0 || mock.lastNamesArg != nil || mock.aliasCalls != 0 {
+				t.Errorf("an over-limit query must be rejected before any request, got %d page(s), lookup %v, %d alias lookup(s)",
+					mock.postsCalls, mock.lastNamesArg, mock.aliasCalls)
 			}
 		})
 	}
@@ -129,8 +132,10 @@ func TestSearchPosts_OverLimitCostsNoRequest(t *testing.T) {
 
 // pairTestStore is a synthetic vocabulary carrying exactly the names the
 // candidate table needs, so the logic tests do not depend on the pinned
-// snapshots. The colon-bearing name is there for the metatag rule: only a
-// join the store really carries can prove that the rule skips it.
+// snapshots. The colon-bearing name is there for the classification rule: a
+// token is skipped only when its key is a known metatag, so a space-split
+// colon-bearing tag name is a candidate like any other — but only a join the
+// store really carries can prove it.
 var pairTestStore = vocab.NewStore(vocab.VocabData{Name: "test", CSV: []byte(
 	"tag_id,name,category,count\n" +
 		"1,blue_hair,0,100\n" +
@@ -141,7 +146,7 @@ var pairTestStore = vocab.NewStore(vocab.VocabData{Name: "test", CSV: []byte(
 
 // TestTagPairCandidates_DetectionRules pins the candidate rule on a
 // synthetic vocabulary: adjacent plain tokens only, joined name must be
-// carried, query order, deduped, capped, and never a metatag-looking token.
+// carried, query order, deduped, capped, and never a known metatag.
 func TestTagPairCandidates_DetectionRules(t *testing.T) {
 	pair := func(pairText, joins string) tagPairCandidate {
 		return tagPairCandidate{Pair: pairText, Joins: joins}
@@ -174,21 +179,25 @@ func TestTagPairCandidates_DetectionRules(t *testing.T) {
 			store: pairTestStore,
 			want:  []tagPairCandidate{pair("gold footwear", "gold_footwear"), pair("blue hair", "blue_hair")},
 		},
-		{"metatag-looking token is never joined", "blue rating:g hair", pairTestStore, nil},
+		{"a metatag is never joined", "blue rating:g hair", pairTestStore, nil},
 		{
-			name:  "metatag-looking token is never joined even when its join is a vocabulary name",
+			// The key before the colon is not a known metatag, so this is a
+			// real tag name split by a space — exactly the dead end the
+			// diagnostic exists for. (Until the classification became exact,
+			// any colon suppressed the candidate.)
+			name:  "a colon-bearing tag name split by a space is a candidate",
 			query: "kafka_(honkai: star_rail)",
 			store: pairTestStore,
-			want:  nil,
+			want:  []tagPairCandidate{pair("kafka_(honkai: star_rail)", "kafka_(honkai:_star_rail)")},
 		},
 		{
-			name:  "metatag-looking token does not hide the next pair",
+			name:  "a metatag does not hide the next pair",
 			query: "rating:g blue hair",
 			store: pairTestStore,
 			want:  []tagPairCandidate{pair("blue hair", "blue_hair")},
 		},
 		{
-			name:  "order: is metatag-looking",
+			name:  "order: is a metatag",
 			query: "blue hair order:random",
 			store: pairTestStore,
 			want:  []tagPairCandidate{pair("blue hair", "blue_hair")},
@@ -257,11 +266,16 @@ func TestTagPairCandidates_EmbeddedVocabularyCarriesTheDocumentedExample(t *test
 // the silent dead end: "blue hair" is two 0-post tokens (a space inside one
 // tag name is the multi-tag syntax), so the live answer is empty, and the
 // payload must name the vocabulary-backed join — posts first, then
-// possible_tags.
+// possible_tags. A colon-bearing tag name split by a space is the same dead
+// end: the key before the colon is not a known metatag, so nothing suppresses
+// the candidate.
 func TestSearchPosts_SpaceSplitPairNamedOnEmptyAnswer(t *testing.T) {
 	// Both embedded snapshots carry blue_hair and neither carries bare blue
 	// or hair (verified live), so the pair yields exactly one candidate.
 	if got, want := searchPostsJSON(t, "blue hair", vocab.Default()), `{"posts":[],"possible_tags":["blue_hair"]}`; got != want {
+		t.Errorf("payload:\n got: %s\nwant: %s", got, want)
+	}
+	if got, want := searchPostsJSON(t, "kafka_(honkai: star_rail)", pairTestStore), `{"posts":[],"possible_tags":["kafka_(honkai:_star_rail)"]}`; got != want {
 		t.Errorf("payload:\n got: %s\nwant: %s", got, want)
 	}
 }
@@ -290,9 +304,10 @@ func TestSearchPosts_NoSpaceSplitDiagnosticOnDeadQueries(t *testing.T) {
 		{"single token", "blue", vocab.Default()},
 		{"made-up token", "not_a_real_tag_xyz", vocab.Default()},
 		{"pair that joins to nothing", "blue xyzzy", vocab.Default()},
-		{"metatag-looking token is never joined", "blue rating:g hair", vocab.Default()},
-		{"metatag-looking token whose join is carried", "kafka_(honkai: star_rail)", pairTestStore},
+		{"a metatag is never joined", "blue rating:g hair", vocab.Default()},
 		{"nil vocabulary store", "blue hair", nil},
+		// A query that needs a scan names its candidates too; that answer
+		// and its scan fields are pinned by TestScan_EmptyAnswerKeepsPossibleTags.
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -326,10 +341,10 @@ func TestSearchPosts_NoSpaceSplitDiagnosticOnNonEmptyAnswer(t *testing.T) {
 }
 
 // TestSearchPosts_OverLimitNamesSpaceSplitCandidates pins the hint on the
-// over-limit path: a space-split pair burns both tag slots, so "blue hair
-// order:random" is rejected locally although "blue_hair order:random" is a
-// legal query. The error names each candidate — query order, deduped, at
-// most three — as segments appended to today's message.
+// over-limit path: space-split pairs burn tag slots, so a query of seven or
+// more tokens can be over the cap although its joined tags would not be. The
+// error names each candidate — query order, deduped, at most three — as
+// segments appended to the message.
 func TestSearchPosts_OverLimitNamesSpaceSplitCandidates(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -338,13 +353,13 @@ func TestSearchPosts_OverLimitNamesSpaceSplitCandidates(t *testing.T) {
 	}{
 		{
 			name:  "one candidate",
-			query: "blue hair order:random",
-			want:  overLimitMessage + "; 'blue hair' may be one tag: blue_hair",
+			query: "blue hair t1 t2 t3 t4 t5",
+			want:  overLimitText(7, "; 'blue hair' may be one tag: blue_hair"),
 		},
 		{
 			name:  "several candidates keep query order",
-			query: "blue hair long hair rating:g",
-			want: overLimitText(4,
+			query: "blue hair long hair t1 t2 t3",
+			want: overLimitText(7,
 				"; 'blue hair' may be one tag: blue_hair",
 				"; 'long hair' may be one tag: long_hair"),
 		},
@@ -358,8 +373,8 @@ func TestSearchPosts_OverLimitNamesSpaceSplitCandidates(t *testing.T) {
 		},
 		{
 			name:  "a repeated pair is named once",
-			query: "blue hair Blue Hair rating:g",
-			want:  overLimitText(4, "; 'blue hair' may be one tag: blue_hair"),
+			query: "blue hair Blue Hair t1 t2 t3",
+			want:  overLimitText(7, "; 'blue hair' may be one tag: blue_hair"),
 		},
 	}
 	for _, tt := range tests {

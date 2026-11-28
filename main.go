@@ -149,7 +149,16 @@ func lookupCommand(arg string) (cliCommand, bool) {
 // injected) so it matches what the version / upgrade subcommands report.
 func serve() {
 	client := api.NewClient()
-	svc := service.NewTagService(client, vocab.Default())
+	// The direct tag limit follows the account. Anonymous Danbooru answers
+	// two terms as-is, the service's default. A credentialed account is
+	// tried with the whole local cap first: its real limit depends on its
+	// level (logged-in below Gold 3, Gold and above unlimited), and the
+	// service falls back to its local scan when Danbooru refuses a query.
+	var opts []service.Option
+	if client.Authenticated() {
+		opts = append(opts, service.WithUpstreamTagLimit(service.MaxQueryTags))
+	}
+	svc := service.NewTagService(client, vocab.Default(), opts...)
 
 	s := server.NewMCPServer(
 		"danbooru-tags",
@@ -199,8 +208,10 @@ MCP client config:
 
 Environment variables:
   DANBOORU_LOGIN / DANBOORU_API_KEY   Danbooru API credentials. With both set
-                                      requests are authenticated; otherwise
-                                      the client is anonymous.
+                                      requests are authenticated and
+                                      search_posts tries up to 6 tags directly
+                                      (anonymous: 2); otherwise the client is
+                                      anonymous.
   DANBOORU_REQ_GAP_MS                 Minimum spacing between requests in ms.
                                       Default 1500 anonymous, 500 with
                                       credentials. 0 = no gap; an invalid

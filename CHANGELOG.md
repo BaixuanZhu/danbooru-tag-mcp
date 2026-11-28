@@ -14,9 +14,9 @@ when tagging.
   with no hint. When no posts come back and two adjacent query tokens join
   into a WD14 tagger-vocabulary name, the response adds `possible_tags`:
   `{"posts":[],"possible_tags":["blue_hair"]}`. The same hint rides the
-  local too-many-tags error, because a space-split pair burns both tag
-  slots (`blue hair order:random` is rejected although
-  `blue_hair order:random` is a legal query). The candidates come from the
+  local too-many-tags error, where a space-split pair burns two of the
+  slots (`blue hair one two three four five` is rejected although
+  `blue_hair` alone is a legal query). The candidates come from the
   embedded vocabularies, so the diagnostic costs no request; the server
   never retries or rewrites the query, and every other payload is
   unchanged.
@@ -24,16 +24,43 @@ when tagging.
   `{"query":"arm_up","total":317377}` (how many posts match the tags)
   instead of listing them. The total is Danbooru's own count for the query
   (exact for plain tag queries), taken from `/counts/posts.json` without
-  fetching any post; `limit` and `tags_mode` do not apply, the same 2-tag
+  fetching any post; `limit` and `tags_mode` do not apply, the same tag
   limit is checked locally first, and metatags work as in a post search
-  (`arm_up rating:g` counts only the all-ages posts). Every call is live;
+  (`arm_up rating:g` counts only the all-ages posts). When the query needs
+  the multi-tag scan below, the count runs over the scan and the answer
+  adds `scanned` and `complete` — `total` is a lower bound until
+  `complete` is true. Every call is live;
   nothing is cached. When Danbooru cannot count a query because its count
   timed out (expensive metatags such as `filetype:` can cause this), the
   call returns an error rather than `0`, which would read as "no such
   posts".
+- `search_posts` accepts up to 6 content tags per query (it stopped at 2).
+  Danbooru itself answers only 2 tags anonymously (3 with a login), so a
+  longer query is answered by a local scan: the rarest tags go upstream as
+  one listing request, and the rest are checked against each post's own
+  tag list — which reproduces the query exactly, in Danbooru's order.
+  Split answers add `upstream_query` (the query actually sent), `scanned`
+  (posts examined) and `complete` (false = a prefix, or a lower-bound
+  count); count mode runs the same scan. Metatags that consume Danbooru's
+  term budget (`order:` counts, `rating:` is free) shrink the upstream
+  part to one tag, and tokens a local scan cannot evaluate — `random:`
+  (it caps the listing), wildcards `*`, OR `~` — refuse the query with a
+  clear local error instead of a wrong answer. With credentials the whole
+  query is tried directly first and the scan takes over on Danbooru's
+  tag-limit 422, so a logged-in free account answers 3 tags directly and
+  4-6 by scan.
 
 ### Changed
 
+- Every `/posts.json` request now sends `only=` restricted to the fields
+  the server consumes, shrinking a post from ~3.5 KB to ~1 KB on the wire
+  (direct answers, `get_tag_profile` samples and scan pages alike); the
+  response shape is unchanged. The space-split `possible_tags` diagnostic
+  now recognizes colon-bearing pairs (`kafka_(honkai: star_rail)` names
+  `kafka_(honkai:_star_rail)` where it used to stay a bare empty answer),
+  because the metatag check became an exact key list; with it went the old
+  "rating: and most other metatags do not count" parenthetical from the
+  too-many-tags error — the counting rule is now Danbooru's own.
 - `get_related_tags` now ranks its entries by lift and gives each one a
   `lift` field: how many times more often the tag co-occurs with the query
   tag than its share of all posts predicts (`frequency x site-wide posts /
