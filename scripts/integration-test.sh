@@ -40,10 +40,15 @@ fi
 # response cache was removed in 0.7.0, so every call must reach the network.
 export DANBOORU_MCP_NO_BOOTSTRAP=1
 
+# Anonymous by force: a shell that sourced the local .env for a credentialed
+# test must not turn the online smoke into a logged-in run (other limits,
+# other answers).
+unset DANBOORU_LOGIN DANBOORU_API_KEY
+
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 18 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 21 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -67,6 +72,9 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"search_tags","arguments":{"query":"firefly","category":"character","limit":5}}}'
   req '{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"get_tag_info","arguments":{"name":"sailor_suit"}}}'
   req '{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"1girl","limit":21}}}'
+  req '{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"firefly_(honkai:_star_rail)","sample":20}}}'
+  req '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"firefly_(honkai:_star_rail)","with":"honkai:_star_rail","sample":20}}}'
+  req '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"get_tag_profile","arguments":{"tag":"character:firefly_(honkai:_star_rail)","sample":20}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -294,6 +302,35 @@ err18 = payload(18)
 check(err18.get('error') == 'post_search_failed'
       and 'too many posts requested' in err18.get('message', ''),
       'search_posts: limit over 20 rejected locally')
+
+# 19. get_tag_profile accepts a valid colon-bearing name: a colon inside a
+#     name is not metatag syntax, so the row resolves under the verbatim
+#     name and the sample is drawn live with the tag's variable content.
+#     (Known metatag keys such as order: or rating: stay rejected - pinned
+#     by TestProfile_MetatagRejectionText at the unit layer.)
+prof19 = payload(19)
+check('error' not in prof19
+      and prof19.get('name') == 'firefly_(honkai:_star_rail)'
+      and prof19.get('sample', 0) > 0
+      and bool(prof19.get('co_tags')),
+      'get_tag_profile: colon-bearing tag name profiles live')
+
+# 20. get_tag_profile pair mode applies the same rule to with: the sample
+#     is the most recent joint posts of both colon-bearing names.
+prof20 = payload(20)
+check('error' not in prof20
+      and prof20.get('with', {}).get('tag') == 'honkai:_star_rail'
+      and prof20.get('order') == 'recent'
+      and prof20.get('sample', 0) > 0,
+      'get_tag_profile: pair mode accepts colon-bearing with tag')
+
+# 21. get_tag_profile rejects edit-only syntax locally: artist:/character:
+#     prefixes file a tag during an edit and can never be a tag name, so the
+#     guard answers with the exact message before any request.
+prof21 = payload(21)
+check(prof21.get('error') == 'profile_failed'
+      and prof21.get('message') == "profile takes a single exact tag name (e.g. 'arm_up'); metatags and multi-tag queries are not supported",
+      'get_tag_profile: edit-only prefix rejected locally')
 
 print()
 if failures:

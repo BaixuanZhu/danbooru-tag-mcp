@@ -6,3 +6,8 @@
 
 # ZCode local session data
 /.zcode/
+
+# Local credentials for manual credentialed tests (DANBOORU_LOGIN /
+# DANBOORU_API_KEY). Never commit: the file holds a real API key.
+.env
+.env.*

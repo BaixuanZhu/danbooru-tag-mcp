@@ -4,6 +4,22 @@ Release notes are extracted from the `## [x.y.z]` section matching the tag
 (see `.github/workflows/release.yml`); replace `- Unreleased` with the date
 when tagging.
 
+## [Unreleased]
+
+### Fixed
+
+- `get_tag_profile` no longer rejects valid Danbooru names that contain a
+  colon. The `tag` and `with` arguments used to refuse any input holding a
+  `:`, which turned away real names such as `firefly_(honkai:_star_rail)`
+  and `honkai:_star_rail`: a colon inside a name is not metatag syntax,
+  and `get_tag_info`, `get_tag_wiki` and `search_tags` accept them. The
+  check now mirrors Danbooru's own rule for what a tag name may not begin
+  with: a known metatag key such as `order:` or `rating:`, and edit-only
+  syntax such as `artist:` or `character:` (case-insensitive, an optional
+  leading `-` or `~` included) are still rejected with the same message,
+  and so is whitespace-separated multi-tag input, now for every whitespace
+  character, not only the space.
+
 ## [0.7.0] - 2026-11-28
 
 ### Breaking

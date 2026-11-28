@@ -23,6 +23,9 @@ type mockFetcher struct {
 	aliasCalls int   // number of FetchAlias invocations
 	aliasErr   error // returned by FetchAlias instead of a body
 
+	exactCalls   int    // number of FetchTagExact invocations
+	lastExactArg string // name handed to the last FetchTagExact
+
 	lastTagsArg      string
 	lastTagsCategory int
 	lastNamesArg     []string
@@ -39,6 +42,8 @@ func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit i
 }
 
 func (m *mockFetcher) FetchTagExact(ctx context.Context, name string) ([]byte, error) {
+	m.exactCalls++
+	m.lastExactArg = name
 	return m.exactResp, nil
 }
 
@@ -106,6 +111,23 @@ func TestSearch_ForwardsCategory(t *testing.T) {
 	}
 	if mock.lastTagsCategory != -1 {
 		t.Errorf("expected category -1 (no filter) forwarded, got %d", mock.lastTagsCategory)
+	}
+}
+
+func TestSearch_AcceptsColonNames(t *testing.T) {
+	// search_tags never treated a colon as metatag syntax: the query reaches
+	// the fetcher verbatim, as it does for get_tag_info and get_tag_wiki.
+	// get_tag_profile was the one tool refusing such names.
+	for _, query := range []string{"firefly_(honkai:_star_rail)", "honkai:_star_rail", ":d"} {
+		mock := &mockFetcher{tagsResp: []byte(`[]`)}
+		svc := NewTagService(mock, nil)
+
+		if _, err := svc.Search(context.Background(), query, 10, -1, 0); err != nil {
+			t.Fatalf("search_tags must accept %q, got: %v", query, err)
+		}
+		if mock.lastTagsArg != query {
+			t.Errorf("query must reach the fetcher verbatim, got %q", mock.lastTagsArg)
+		}
 	}
 }
 

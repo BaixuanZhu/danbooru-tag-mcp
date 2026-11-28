@@ -196,6 +196,24 @@ empty profile whose embedded `wd14` verdict (and `renamed_to`, resolved on
 the primary row only) tells the story, mirroring `get_tag_info`'s NotFound
 handling; a missing pair tag returns `*NotFoundError{Name: <missing name>}`
 so the handler's wd14 rider (which uses `nf.Name`) covers the right name.
+Name validation (`tag` and `with` alike): one exact tag name is a single
+whitespace-separated token that does not begin with a reserved prefix
+(`isSingleTagName` in `internal/service/metatag.go`: one optional leading
+`-`/`~` is skipped, the key lookup is case-insensitive). A colon inside a
+name is NOT metatag syntax — `firefly_(honkai:_star_rail)` and
+`honkai:_star_rail` are real tags, which the old any-colon guard wrongly
+rejected. The reserved prefixes mirror both halves of Danbooru's own
+`TagNameValidator`: the post-search keys (`PostQueryBuilder::METATAGS`, 101
+keys; this list is also the exact line between a search metatag and a plain
+token, so reuse `isDanbooruMetatag` when classifying query tokens) and the
+edit-only keys (`PostEdit::METATAGS`, 13 beyond the first list:
+`artist:`/`character:`-style category prefixes, `newpool:`,
+`newfavgroup:`). No tag with posts begins with any of them (verified live
+2026-11-28). The guard is a clear-error path only: sample queries are always
+built from resolved row names, never from caller text
+(`TestProfile_MetatagRejectionText` pins both messages,
+`TestProfile_AcceptsColonNames_*` the accepted names,
+`TestMetatagKeyLists_MatchUpstreamSnapshot` the list sizes).
 
 **Tagger-era detection (WD14 layer, test-enforced, do not break)**:
 `internal/vocab` embeds the WD14 tagger vocabularies (`wd-v1-4-moat-tagger-v2`
@@ -311,6 +329,13 @@ inheritance; this is documented in the plugin README.
   run` temp binary). Prevents ephemeral paths from being written into user PATH.
 - Credentials come from `DANBOORU_LOGIN` / `DANBOORU_API_KEY` env vars; when
   unset the client is anonymous (rate and content limits apply).
+- **Local credentials file**: `.env` at the repo root may hold
+  `DANBOORU_LOGIN` / `DANBOORU_API_KEY` for manual credentialed tests
+  (gitignored through `.env` / `.env.*`). It must never be committed, echoed
+  or printed, and nothing loads it automatically: source it explicitly
+  (`set -a; . ./.env; set +a`), redact both values from any output, and keep
+  test suites anonymous — the integration script unsets both variables so a
+  credentialed shell cannot turn the online smoke into a logged-in run.
 - **CI** (`.github/workflows/ci.yml`): unit tests run on every push/PR; the
   online smoke (`make integration` / `scripts/integration-test.sh` — every
   tool called against the live API plus a tagger-era name whose `wd14`

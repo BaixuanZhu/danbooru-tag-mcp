@@ -722,6 +722,11 @@ const maxPostLimit = 20
 // isMetatagToken reports whether one space-separated query field is a
 // metatag (contains ':': rating:g, order:random, status:deleted, ...)
 // rather than a literal tag name.
+//
+// Deliberately broader than isDanbooruMetatag (known keys only), and it
+// stays that way: here the verdict exempts a token from the 2-tag cap, and
+// exempting is the safe side: an unlisted metatag must never be counted as
+// a content tag. The two predicates differ on purpose.
 func isMetatagToken(field string) bool {
 	return strings.Contains(field, ":")
 }

@@ -107,7 +107,7 @@ type TagProfile struct {
 // sample is clamped to [20, 200] and defaults to 200.
 func (s *TagService) Profile(ctx context.Context, tag string, sample int, opts ProfileOptions) (*TagProfile, error) {
 	raw := strings.TrimSpace(tag)
-	if raw == "" || strings.ContainsAny(raw, " :") {
+	if !isSingleTagName(raw) {
 		return nil, fmt.Errorf("profile takes a single exact tag name (e.g. 'arm_up'); metatags and multi-tag queries are not supported")
 	}
 	rating := strings.ToLower(strings.TrimSpace(opts.Rating))
@@ -120,7 +120,7 @@ func (s *TagService) Profile(ctx context.Context, tag string, sample int, opts P
 	}
 	with := strings.TrimSpace(opts.With)
 	if with != "" {
-		if strings.ContainsAny(with, " :") {
+		if !isSingleTagName(with) {
 			return nil, fmt.Errorf("with takes a single exact tag name (e.g. 'holding_weapon'); metatags and multi-tag queries are not supported")
 		}
 		if strings.EqualFold(with, raw) {

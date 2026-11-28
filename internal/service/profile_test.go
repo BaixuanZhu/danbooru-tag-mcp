@@ -155,6 +155,262 @@ func TestProfile_RejectsQueries(t *testing.T) {
 	}
 }
 
+// The profile guard's exact error texts, pinned by
+// TestProfile_MetatagRejectionText and TestProfile_RejectsAnyWhitespace.
+// They stay literals here on purpose: sharing a constant with profile.go
+// would make the pin follow any edit to the message instead of catching it.
+const (
+	profileTagRejection  = "profile takes a single exact tag name (e.g. 'arm_up'); metatags and multi-tag queries are not supported"
+	profileWithRejection = "with takes a single exact tag name (e.g. 'holding_weapon'); metatags and multi-tag queries are not supported"
+)
+
+// assertNoFetch fails the test when the service reached the fetcher: a guard
+// under test must reject its input before any request.
+func assertNoFetch(t *testing.T, mock *mockFetcher) {
+	t.Helper()
+	if mock.exactCalls != 0 || mock.lastNamesArg != nil || mock.lastPostsArg != "" {
+		t.Errorf("expected no request, got exact=%d names=%v posts=%q",
+			mock.exactCalls, mock.lastNamesArg, mock.lastPostsArg)
+	}
+}
+
+// TestProfile_MetatagRejectionText pins the exact error text of the guard
+// that keeps metatags and multi-tag queries out of the sample query, for
+// both tag and with, and that it fires before any request. It was written
+// and run green against the original guard (any space or colon) BEFORE that
+// guard was narrowed to known metatag keys, so it proves the narrowed guard
+// still rejects every input it was built for, with the same message.
+//
+// The edit-syntax cases (artist:, gen:, newpool:) were added when a review
+// found the second half of Danbooru's TagNameValidator, PostEdit::METATAGS;
+// the original guard rejected them as well, since they carry a colon.
+func TestProfile_MetatagRejectionText(t *testing.T) {
+	tagCases := []struct {
+		name string
+		tag  string
+	}{
+		{"bare order metatag", "order:random"},
+		{"rating metatag", "rating:g"},
+		{"negated metatag", "-rating:e"},
+		{"tilde-prefixed metatag", "~rating:g"},
+		{"status metatag", "status:deleted"},
+		{"id metatag", "id:123"},
+		{"mixed-case metatag", "Order:Random"},
+		{"limit metatag", "limit:5"},
+		{"parent metatag", "parent:1"},
+		{"source metatag", "source:x"},
+		{"comparison metatag", "score:>5"},
+		{"width metatag", "width:100"},
+		{"category counter metatag", "gentags:5"},
+		{"count synonym metatag", "comments:>0"},
+		{"edit category prefix", "character:firefly_(honkai:_star_rail)"},
+		{"short edit category prefix", "gen:1girl"},
+		{"post-creation edit metatag", "newpool:x"},
+		{"two tags", "arm_up 1boy"},
+		{"tag plus order metatag", "arm_up order:random"},
+		{"tag plus rating metatag", "arm_up rating:g"},
+		{"empty tag", ""},
+	}
+	for _, tc := range tagCases {
+		t.Run("tag "+tc.name, func(t *testing.T) {
+			mock := &mockFetcher{}
+			svc := NewTagService(mock, nil)
+
+			_, err := svc.Profile(context.Background(), tc.tag, 200, ProfileOptions{})
+			if err == nil || err.Error() != profileTagRejection {
+				t.Fatalf("expected the exact tag rejection, got: %v", err)
+			}
+			assertNoFetch(t, mock)
+		})
+	}
+
+	withCases := []struct {
+		name string
+		with string
+	}{
+		{"rating metatag", "rating:g"},
+		{"order metatag", "order:score"},
+		{"negated metatag", "-rating:e"},
+		{"edit category prefix", "artist:bkub"},
+		{"two tags", "two words"},
+	}
+	for _, tc := range withCases {
+		t.Run("with "+tc.name, func(t *testing.T) {
+			mock := &mockFetcher{}
+			svc := NewTagService(mock, nil)
+
+			_, err := svc.Profile(context.Background(), "arm_up", 200, ProfileOptions{With: tc.with})
+			if err == nil || err.Error() != profileWithRejection {
+				t.Fatalf("expected the exact with rejection, got: %v", err)
+			}
+			assertNoFetch(t, mock)
+		})
+	}
+}
+
+func TestProfile_AcceptsColonNames_Single(t *testing.T) {
+	// A colon inside a name is not metatag syntax: parenthesized qualifiers
+	// (firefly_(honkai:_star_rail)) and copyrights opening with a word and a
+	// colon (honkai:_star_rail) are real Danbooru names. Only a known metatag
+	// key before the colon makes an input a metatag.
+	tests := []struct {
+		name     string
+		tag      string
+		row      string
+		category int
+		post     string
+	}{
+		{
+			name:     "parenthesized qualifier",
+			tag:      "firefly_(honkai:_star_rail)",
+			row:      `{"id":1,"name":"firefly_(honkai:_star_rail)","category":4,"post_count":9000}`,
+			category: 4,
+			post:     `{"id":11,"rating":"g","tag_string_character":"firefly_(honkai:_star_rail)","tag_string_general":"1girl solo"}`,
+		},
+		{
+			name:     "leading word and colon",
+			tag:      "honkai:_star_rail",
+			row:      `{"id":2,"name":"honkai:_star_rail","category":3,"post_count":9000}`,
+			category: 3,
+			post:     `{"id":12,"rating":"g","tag_string_copyright":"honkai:_star_rail","tag_string_general":"1girl solo"}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := &mockFetcher{
+				exactResp: []byte("[" + tc.row + "]"),
+				postsResp: []byte("[" + tc.post + "]"),
+			}
+			svc := NewTagService(mock, nil)
+
+			p, err := svc.Profile(context.Background(), tc.tag, 50, ProfileOptions{})
+			if err != nil {
+				t.Fatalf("a colon-bearing name must profile, got: %v", err)
+			}
+			// The row resolves under the verbatim name and embeds as-is.
+			if p.Name != tc.tag || p.Category != tc.category || p.PostCount != 9000 {
+				t.Errorf("embedded row must be the resolved tag, got: %+v", p.TagInfo)
+			}
+			if p.Order != "random" || p.Sample != 1 {
+				t.Errorf("expected a random sample of 1 post, got order=%q sample=%d", p.Order, p.Sample)
+			}
+			if mock.exactCalls != 1 || mock.lastExactArg != tc.tag {
+				t.Errorf("expected one exact lookup for %q, got %d calls, last %q", tc.tag, mock.exactCalls, mock.lastExactArg)
+			}
+			// The sample query is exactly "<name> order:random".
+			if mock.lastPostsArg != tc.tag+" order:random" {
+				t.Errorf("sample query must be %q, got %q", tc.tag+" order:random", mock.lastPostsArg)
+			}
+			// The profiled tag itself stays out of the ranked sections.
+			for _, group := range [][]ProfileTag{p.Ubiquitous, p.CoTags} {
+				for _, e := range group {
+					if e.Tag == tc.tag {
+						t.Errorf("profiled tag leaked into the profile: %+v", e)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestProfile_AcceptsColonNames_Pair(t *testing.T) {
+	// Pair mode applies the same rule to both names: the sample query is the
+	// two resolved row names, verbatim, with no order:.
+	mock := &mockFetcher{
+		namesResp: []byte(`[
+			{"id":1,"name":"firefly_(honkai:_star_rail)","category":4,"post_count":9000},
+			{"id":2,"name":"honkai:_star_rail","category":3,"post_count":9000}
+		]`),
+		postsResp: []byte(`[
+			{"id":11,"rating":"g","tag_string_character":"firefly_(honkai:_star_rail)","tag_string_copyright":"honkai:_star_rail","tag_string_general":"1girl solo"},
+			{"id":12,"rating":"g","tag_string_character":"firefly_(honkai:_star_rail)","tag_string_copyright":"honkai:_star_rail","tag_string_general":"1girl smile"}
+		]`),
+	}
+	svc := NewTagService(mock, nil)
+
+	p, err := svc.Profile(context.Background(), "firefly_(honkai:_star_rail)", 50, ProfileOptions{With: "honkai:_star_rail"})
+	if err != nil {
+		t.Fatalf("colon-bearing tag and with must profile as a pair, got: %v", err)
+	}
+	if p.Name != "firefly_(honkai:_star_rail)" || p.Category != 4 || p.PostCount != 9000 {
+		t.Errorf("embedded row must be the primary tag, got: %+v", p.TagInfo)
+	}
+	if p.With == nil || p.With.Tag != "honkai:_star_rail" || p.With.PostCount != 9000 {
+		t.Errorf("with descriptor must carry the second row, got: %+v", p.With)
+	}
+	if p.Order != "recent" {
+		t.Errorf("pair mode must report order=recent, got %q", p.Order)
+	}
+	if p.Sample != 2 {
+		t.Errorf("expected a sample of 2 posts, got %d", p.Sample)
+	}
+	// Exactly "<tag> <with>" with the verbatim row names and no order:.
+	if mock.lastPostsArg != "firefly_(honkai:_star_rail) honkai:_star_rail" {
+		t.Errorf("pair query must be exactly '<tag> <with>', got: %q", mock.lastPostsArg)
+	}
+	// Both query tags stay out of every ranked section.
+	for _, group := range [][]ProfileTag{p.Ubiquitous, p.CoTags} {
+		for _, e := range group {
+			if e.Tag == "firefly_(honkai:_star_rail)" || e.Tag == "honkai:_star_rail" {
+				t.Errorf("query tag leaked into ranked sections: %+v", e)
+			}
+		}
+	}
+}
+
+func TestProfile_ColonFirstNameReachesTheApi(t *testing.T) {
+	// ":d" is not a metatag: no key precedes the colon. Validation must let
+	// it through so Danbooru decides; the answer is a plain not-found for
+	// the name, not a usage error, and the lookup itself did happen.
+	mock := &mockFetcher{exactResp: []byte(`[]`)}
+	svc := NewTagService(mock, nil)
+
+	_, err := svc.Profile(context.Background(), ":d", 50, ProfileOptions{})
+	var nf *NotFoundError
+	if !errors.As(err, &nf) || nf.Name != ":d" {
+		t.Fatalf("expected *NotFoundError{:d} (validation passed, Danbooru decides), got: %v", err)
+	}
+	if mock.exactCalls != 1 || mock.lastExactArg != ":d" {
+		t.Errorf("the exact lookup must be attempted with the verbatim name, got %d calls, last %q", mock.exactCalls, mock.lastExactArg)
+	}
+}
+
+func TestProfile_RejectsAnyWhitespace(t *testing.T) {
+	// Whitespace is Danbooru's tag separator and never part of a name, so
+	// "arm_up<TAB>1boy" is a two-tag query whatever the whitespace character.
+	// It must fail locally: normalizing it into arm_up_1boy would only turn a
+	// usage mistake into a misleading "tag not found".
+	spaces := []struct {
+		name string
+		ws   string
+	}{
+		{"tab", "\t"},
+		{"newline", "\n"},
+	}
+	for _, sp := range spaces {
+		t.Run("tag separated by "+sp.name, func(t *testing.T) {
+			mock := &mockFetcher{}
+			svc := NewTagService(mock, nil)
+
+			_, err := svc.Profile(context.Background(), "arm_up"+sp.ws+"1boy", 200, ProfileOptions{})
+			if err == nil || err.Error() != profileTagRejection {
+				t.Fatalf("expected the exact tag rejection, got: %v", err)
+			}
+			assertNoFetch(t, mock)
+		})
+		t.Run("with separated by "+sp.name, func(t *testing.T) {
+			mock := &mockFetcher{}
+			svc := NewTagService(mock, nil)
+
+			_, err := svc.Profile(context.Background(), "arm_up", 200, ProfileOptions{With: "holding_weapon" + sp.ws + "1boy"})
+			if err == nil || err.Error() != profileWithRejection {
+				t.Fatalf("expected the exact with rejection, got: %v", err)
+			}
+			assertNoFetch(t, mock)
+		})
+	}
+}
+
 func TestProfile_NotFoundPropagates(t *testing.T) {
 	mock := &mockFetcher{exactResp: []byte(`[]`)}
 	svc := NewTagService(mock, nil)
