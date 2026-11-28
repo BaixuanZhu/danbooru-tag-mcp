@@ -6,6 +6,8 @@ when tagging.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-28
+
 ### Added
 
 - `search_posts` now names a likely space-split miss instead of answering a
