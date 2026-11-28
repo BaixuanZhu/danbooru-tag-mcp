@@ -66,7 +66,10 @@ result-mapping branch on `errors.Is` / `errors.As`, never on `err != nil`.
 
 **Prevention**: any new fallback or masking path must answer "which error
 classes may trigger me?" before review. See
-[Resilience Guidelines](./resilience.md) §4.
+[Resilience Guidelines](./resilience.md) §4. An explicit `null` inside a 2xx
+body is the same class of definitive answer: `counts.posts: null` (Danbooru's
+count timed out) maps to an unmarked error, never to a default value and
+never to an outage — see [Tool Contracts](./tool-contracts.md).
 
 ### Common Mistake: unbounded error bodies from upstream HTML pages
 

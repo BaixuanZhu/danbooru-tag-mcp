@@ -28,6 +28,9 @@ type TagService interface {
 	Alias(ctx context.Context, name string) (*service.AliasResult, error)
 	Wiki(ctx context.Context, title, otherNames string, limit int, includeDescription bool) (*service.WikiResult, error)
 	SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*service.PostsResult, error)
+	// CountPosts answers how many posts tags match without listing any
+	// (search_posts count mode).
+	CountPosts(ctx context.Context, tags string) (*service.PostCount, error)
 	Profile(ctx context.Context, tag string, sample int, opts service.ProfileOptions) (*service.TagProfile, error)
 }
 
@@ -180,7 +183,7 @@ var (
 	)
 
 	SearchPostsTool = mcp.NewTool("search_posts",
-		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta). tags_mode=none drops tag lists; diff keeps only tags not already in the query. On an empty result, possible_tags lists WD14 vocab names formed by joining two adjacent query tokens ('blue hair' -> blue_hair) without retrying the query"),
+		mcp.WithDescription("Search posts by tags; no rating filter is applied, add a rating:g/s/q/e metatag to narrow (g=all-ages, s=swimwear/borderline, q=suggestive, e=R-18). Max 2 content tags per query (order: counts; other metatags don't). Each post carries score, fav_count, large_file_url, and its tag list split by category (copyright/artist/character/general/meta). tags_mode=none drops tag lists; diff keeps only tags not already in the query. count_only=true answers {query,total} from the post count instead of listing posts. On an empty result, possible_tags lists WD14 vocab names formed by joining two adjacent query tokens ('blue hair' -> blue_hair) without retrying the query"),
 		mcp.WithString("tags",
 			mcp.Required(),
 			mcp.Description("space-separated tags"),
@@ -191,6 +194,9 @@ var (
 		mcp.WithString("tags_mode",
 			mcp.Enum("full", "none", "diff"),
 			mcp.Description("tag-list mode: full (default), none (drop tag lists), diff (drop tags already in the query)"),
+		),
+		mcp.WithBoolean("count_only",
+			mcp.Description("answer {query,total} from the post count instead of listing posts (limit and tags_mode do not apply)"),
 		),
 	)
 
@@ -348,6 +354,16 @@ func Register(s *server.MCPServer, svc TagService) {
 		tags := getStringArg(args, "tags")
 		if tags == "" {
 			return mcp.NewToolResultText(errResp("post_search_failed", "tags parameter is required")), nil
+		}
+
+		// Count mode lists nothing, so the post-mode arguments (limit,
+		// tags_mode) are neither read nor validated on this path.
+		if getBoolArg(args, "count_only") {
+			count, err := svc.CountPosts(ctx, tags)
+			if err != nil {
+				return failResult(err, "post_search_failed")
+			}
+			return jsonResult(count)
 		}
 		limit := getIntArg(args, "limit", 5)
 

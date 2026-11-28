@@ -128,6 +128,32 @@ locally (max 2; content tags and `order:` metatags count, `rating:`/
 `status:`/`id:` style metatags are exempt — verified empirically) so
 over-limit queries fail with a clear error instead of a Danbooru 422.
 
+**Post count mode (search_posts `count_only`, test-enforced, do not break)**:
+`count_only: true` switches `search_posts` from listing to counting: one
+`GET /counts/posts.json?tags=<tags>` through `Client.Get`
+(`FetchPostCount`; an empty `tags` omits the parameter and counts the whole
+site, which the related-tags lift reuses), answered as
+`{"query":<tags as sent, trimmed>,"total":<n>}` and always live. It runs the
+SAME local tag-count validation as `SearchPosts` (both call
+`checkPostQuery`, so the error text, space-split hint included, cannot
+drift) while `limit` and `tags_mode` are neither read nor validated; metatags
+are not rejected (verified live: the four `rating:` slices of `arm_up` sum
+exactly to its unfiltered total) and no layer injects a rating filter. Three
+outcomes stay distinct: an integer is the answer; an explicit
+`{"counts":{"posts":null}}` — Danbooru's count timed out, a definitive
+answer from a reachable upstream — is `service.ErrPostCountTimedOut`,
+delivered unmarked as `post_search_failed` ("danbooru could not count this
+query (count timed out); simplify the query or retry later"), never `0` and
+never `upstream_unavailable`; a missing `posts` key or a non-integer is
+upstream shape drift reported as a parse error, so drift is never dressed up
+as a retryable timeout. A transport/5xx/429 failure of the counts request is
+the uniform `upstream_unavailable` result; a 422 is the shrunken unmarked
+error after one attempt. Pinned by `TestFetchPostCount_*`,
+`TestChain_CountModeReachesTheClient`, `TestCountPosts_*` and
+`TestSearchPostsHandler_CountModePayloadBytes` (plus its `_CountOnly…`
+siblings); integration check 25 compares the count with the tag row's
+`post_count` within 10.
+
 **Result shaping (inspiration discovery, the product's weak spot turned
 strength)**: `SearchPosts` returns each post's full tag list split by category
 (`PostTags`, parsed from the API's `tag_string_*` fields — no extra request)

@@ -255,11 +255,15 @@ as plain text, for character appearance descriptions.
 
 `tags` (required, space-separated) · `limit` (5, max 20) · `tags_mode`
 (`full` default, `none` drops the per-post tag lists, `diff` keeps only tags
-not already in the query)
+not already in the query) · `count_only` (false)
 
 No rating filter by default; add a `rating:g/s/q/e` metatag to narrow. Each
 post carries `score`, `fav_count`, `large_file_url` and `tags` split by
 category: `copyright` / `artist` / `character` / `general` / `meta`.
+
+With `count_only: true` the call answers `{"query": <tags>, "total": <count>}`
+(how many posts match) instead of listing posts; `limit` and `tags_mode` do
+not apply, and the count is always live.
 
 When no posts come back and two adjacent tokens join into a WD14 vocabulary
 name (`blue hair` -> `blue_hair`), the response adds `possible_tags` with the

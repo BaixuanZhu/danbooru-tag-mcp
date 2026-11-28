@@ -498,3 +498,18 @@ func (c *Client) FetchPosts(ctx context.Context, tags string, limit int) ([]byte
 	}
 	return c.Get(ctx, "/posts.json", q)
 }
+
+// FetchPostCount asks Danbooru how many posts match tags without fetching
+// any post: one request to /counts/posts.json, which answers uncapped totals
+// anonymously. The tags go out verbatim like FetchPosts (no layer injects a
+// rating filter); an empty tags omits the parameter and counts every post on
+// the site. The body is returned raw ({"counts":{"posts":N}}, or null in
+// place of N when Danbooru's count timed out) because only the service layer
+// can tell that null from a 0.
+func (c *Client) FetchPostCount(ctx context.Context, tags string) ([]byte, error) {
+	q := make(url.Values)
+	if tags != "" {
+		q.Set("tags", tags)
+	}
+	return c.Get(ctx, "/counts/posts.json", q)
+}

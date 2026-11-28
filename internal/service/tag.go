@@ -88,6 +88,9 @@ type TagFetcher interface {
 	FetchAlias(ctx context.Context, name string) ([]byte, error)
 	FetchWiki(ctx context.Context, title, otherNames string, limit int) ([]byte, error)
 	FetchPosts(ctx context.Context, tags string, limit int) ([]byte, error)
+	// FetchPostCount fetches the raw /counts/posts.json body for tags; an
+	// empty tags counts every post on the site.
+	FetchPostCount(ctx context.Context, tags string) ([]byte, error)
 }
 
 // WD14 status values: how a name stands relative to current Danbooru and
@@ -896,6 +899,21 @@ func tagPairHint(candidates []tagPairCandidate) string {
 	return b.String()
 }
 
+// checkPostQuery validates a posts query against Danbooru's per-account tag
+// limit before any request and returns it trimmed, exactly as it is sent.
+// SearchPosts and CountPosts share this one function so the two modes cannot
+// drift: the limit is the same on /posts.json and /counts/posts.json
+// (verified live: three content tags answer 422 on both), so an over-limit
+// query fails locally with the same message, space-split hint included.
+func (s *TagService) checkPostQuery(tags string) (string, error) {
+	query := strings.TrimSpace(tags)
+	if n := countContentTags(query); n > maxContentTags {
+		return "", fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query%s",
+			n, maxContentTags, tagPairHint(tagPairCandidates(query, s.vocab)))
+	}
+	return query, nil
+}
+
 // SearchPosts sends the tags out verbatim: no layer injects a rating
 // filter. The caller pins rating:<x> when they want one (rating: metatags
 // are exempt from the tag-count limit), so an unfiltered query describes
@@ -913,10 +931,9 @@ func tagPairHint(candidates []tagPairCandidate) string {
 // decides. Both diagnostics are local, cost no request, and are omitted
 // when there is no candidate, so every other payload stays byte-identical.
 func (s *TagService) SearchPosts(ctx context.Context, tags string, limit int, tagsMode string) (*PostsResult, error) {
-	query := strings.TrimSpace(tags)
-	if n := countContentTags(query); n > maxContentTags {
-		return nil, fmt.Errorf("too many content tags: %d (max %d, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query%s",
-			n, maxContentTags, tagPairHint(tagPairCandidates(query, s.vocab)))
+	query, err := s.checkPostQuery(tags)
+	if err != nil {
+		return nil, err
 	}
 	if limit > maxPostLimit {
 		return nil, fmt.Errorf("too many posts requested: %d (max %d); a post carries its full tag list, so keep pages small", limit, maxPostLimit)

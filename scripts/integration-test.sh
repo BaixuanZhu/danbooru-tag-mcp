@@ -48,7 +48,7 @@ unset DANBOORU_LOGIN DANBOORU_API_KEY
 OUT="$(mktemp)"
 trap 'rm -f "$OUT"' EXIT
 
-echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 24 tool calls)"
+echo "[integration] exe: $EXE (holding stdin open ${SLEEP}s for 25 tool calls)"
 
 req() { printf '%s\n' "$1"; }
 
@@ -78,6 +78,7 @@ req() { printf '%s\n' "$1"; }
   req '{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue hair"}}}'
   req '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue hair order:random"}}}'
   req '{"jsonrpc":"2.0","id":24,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue xyzzy"}}}'
+  req '{"jsonrpc":"2.0","id":25,"method":"tools/call","params":{"name":"search_posts","arguments":{"tags":"blue_hair","count_only":true}}}'
   sleep "$SLEEP"
 } | "$EXE" > "$OUT"
 
@@ -357,6 +358,19 @@ check(err23.get('error') == 'post_search_failed'
 r24 = payload(24)
 check(r24.get('posts') == [] and 'possible_tags' not in r24,
       'search_posts: dead query stays a bare empty array')
+
+# 25. search_posts count mode: one /counts/posts.json request answers
+#     {query,total} instead of listing posts. The total is Danbooru's own
+#     count for the tag, so it must match the post_count check 4 read from
+#     the tag row; posts are uploaded between the two calls, hence the
+#     tolerance of 10. (The timed-out-count error and the local tag-limit
+#     rejection are pinned at the unit layer.)
+r25 = payload(25)
+check(r25.get('query') == 'blue_hair'
+      and isinstance(r25.get('total'), int)
+      and r25['total'] > 0
+      and abs(r25['total'] - tag.get('post_count', -1)) <= 10,
+      'search_posts: count_only answers {query,total} matching the tag post_count')
 
 print()
 if failures:

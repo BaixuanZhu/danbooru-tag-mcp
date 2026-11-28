@@ -29,7 +29,7 @@ var ErrUpstreamUnavailable = errors.New("danbooru unavailable")
 
 // internal/api
 type upstreamError struct{ err error } // Is(app.ErrUpstreamUnavailable) == true
-// Get(ctx, path, params) ([]byte, error); the seven Fetch* likewise
+// Get(ctx, path, params) ([]byte, error); the eight Fetch* likewise
 // doWithRetry(ctx, reqURL) ([]byte, error)
 
 // internal/tools

@@ -20,6 +20,17 @@ when tagging.
   embedded vocabularies, so the diagnostic costs no request; the server
   never retries or rewrites the query, and every other payload is
   unchanged.
+- `search_posts` gains a count mode: `count_only: true` answers
+  `{"query":"arm_up","total":317377}` (how many posts match the tags)
+  instead of listing them. The total is Danbooru's own count for the query
+  (exact for plain tag queries), taken from `/counts/posts.json` without
+  fetching any post; `limit` and `tags_mode` do not apply, the same 2-tag
+  limit is checked locally first, and metatags work as in a post search
+  (`arm_up rating:g` counts only the all-ages posts). Every call is live;
+  nothing is cached. When Danbooru cannot count a query because its count
+  timed out (expensive metatags such as `filetype:` can cause this), the
+  call returns an error rather than `0`, which would read as "no such
+  posts".
 
 ### Fixed
 

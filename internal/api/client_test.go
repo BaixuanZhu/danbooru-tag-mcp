@@ -893,3 +893,280 @@ func TestChain_UpstreamFailureReachesTheClient(t *testing.T) {
 		t.Errorf("the wd14 verdict must ride the not-found payload, got: %v", nf["wd14"])
 	}
 }
+
+// TestFetchPostCount_BuildsCorrectURL pins the one request count mode needs:
+// GET /counts/posts.json carrying the tags as typed and nothing else — no
+// rating filter, no limit. An empty tags omits the parameter, which asks for
+// the whole-site count.
+func TestFetchPostCount_BuildsCorrectURL(t *testing.T) {
+	tests := []struct {
+		name      string
+		tags      string
+		wantQuery string // url.Values.Encode of the query the server must see
+	}{
+		{"no filter is injected", "arm_up", "tags=arm_up"},
+		{"tags go out as typed", "arm_up rating:g", "tags=arm_up+rating%3Ag"},
+		{"empty tags omit the parameter", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath, gotMethod, gotQuery string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath, gotMethod = r.URL.Path, r.Method
+				// The whole query is compared, which pins "tags and nothing
+				// else". Credentials are stripped first: when the shell
+				// carries DANBOORU_LOGIN / DANBOORU_API_KEY, NewClient injects
+				// them, and the comparison would fail and print them.
+				q := r.URL.Query()
+				q.Del("login")
+				q.Del("api_key")
+				gotQuery = q.Encode()
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(`{"counts":{"posts":317377}}`))
+			}))
+			defer srv.Close()
+
+			cli := newTestClient(srv.URL)
+			if _, err := cli.FetchPostCount(context.Background(), tt.tags); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if gotPath != "/counts/posts.json" {
+				t.Errorf("expected /counts/posts.json, got %q", gotPath)
+			}
+			if gotMethod != http.MethodGet {
+				t.Errorf("expected GET, got %s", gotMethod)
+			}
+			if gotQuery != tt.wantQuery {
+				t.Errorf("query = %q, want %q", gotQuery, tt.wantQuery)
+			}
+		})
+	}
+}
+
+// TestFetchPostCount_ReturnsBodyVerbatim pins that the body reaches the
+// service untouched: the service tells an explicit null (Danbooru's count
+// timed out) from a 0 by the raw bytes, so the api layer must not parse,
+// rewrite or trim the payload.
+func TestFetchPostCount_ReturnsBodyVerbatim(t *testing.T) {
+	for _, body := range []string{`{"counts":{"posts":null}}`, `{"counts":{"posts":0}}`, `{"counts":{"posts":317377}}`} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(body))
+		}))
+		defer srv.Close()
+
+		cli := newTestClient(srv.URL)
+		got, err := cli.FetchPostCount(context.Background(), "arm_up")
+		if err != nil {
+			t.Fatalf("body %s: unexpected error: %v", body, err)
+		}
+		if string(got) != body {
+			t.Errorf("body %s: must come back verbatim, got %s", body, got)
+		}
+	}
+}
+
+// TestFetchPostCount_UpstreamFailureIsMarked pins R4 for the counts request:
+// it goes through Client.Get like every other request, so a 503 is retried
+// and, once the retries are spent, comes back carrying the upstream marker
+// with the shrunken cause — the handler turns that into the uniform
+// upstream_unavailable result.
+func TestFetchPostCount_UpstreamFailureIsMarked(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("<html><head><title>Downbooru</title></head><body>" + strings.Repeat("maintenance padding ", 100) + "</body></html>"))
+	}))
+	defer srv.Close()
+
+	cli := newFastTestClient(srv.URL)
+	_, err := cli.FetchPostCount(context.Background(), "arm_up")
+	if err == nil || err.Error() != "danbooru 503 (Downbooru)" {
+		t.Fatalf("expected 'danbooru 503 (Downbooru)', got: %v", err)
+	}
+	if !errors.Is(err, app.ErrUpstreamUnavailable) {
+		t.Errorf("a retries-exhausted 503 must carry the upstream marker, got: %v", err)
+	}
+	if n := atomic.LoadInt32(&hits); n != 1+maxRetries {
+		t.Errorf("5xx must be retried before erroring: expected %d attempts, got %d", 1+maxRetries, n)
+	}
+}
+
+// TestFetchPostCount_422IsUnmarkedSingleAttempt pins that a 422 on the counts
+// request (an over-limit query the local check did not catch) is a
+// definitive answer: one attempt, shrunken text, no upstream marker.
+func TestFetchPostCount_422IsUnmarkedSingleAttempt(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		w.Write([]byte(`{"error":"TagLimitError: tag limit exceeded"}`))
+	}))
+	defer srv.Close()
+
+	cli := newFastTestClient(srv.URL)
+	_, err := cli.FetchPostCount(context.Background(), "1girl blue_hair long_hair")
+	if err == nil {
+		t.Fatal("expected the 422 to surface")
+	}
+	if !strings.Contains(err.Error(), "danbooru 422") {
+		t.Errorf("expected the shrunken danbooru 422 error, got: %v", err)
+	}
+	if errors.Is(err, app.ErrUpstreamUnavailable) {
+		t.Error("a 4xx is definitive and must not carry the upstream-unavailable marker")
+	}
+	if n := atomic.LoadInt32(&hits); n != 1 {
+		t.Errorf("a 4xx must not retry: expected 1 attempt, got %d", n)
+	}
+}
+
+// newChainClient wires the real api -> service -> tools chain to a test
+// server and returns a started in-process MCP client, so a test sees exactly
+// what an MCP client gets from every layer combined. Retry backoffs are
+// zeroed so an outage costs no real sleeps.
+func newChainClient(t *testing.T, handler http.Handler) *client.Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	svc := service.NewTagService(newFastTestClient(srv.URL), vocab.Default())
+	s := server.NewMCPServer("test", "0.0.0.0", server.WithToolCapabilities(true))
+	tools.Register(s, svc)
+
+	cli, err := client.NewInProcessClient(s)
+	if err != nil {
+		t.Fatalf("in-process client: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	if err := cli.Start(context.Background()); err != nil {
+		t.Fatalf("client start: %v", err)
+	}
+	initReq := mcp.InitializeRequest{}
+	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ClientInfo = mcp.Implementation{Name: "chain-test", Version: "0.0.1"}
+	if _, err := cli.Initialize(context.Background(), initReq); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	return cli
+}
+
+// callToolText calls one tool on cli and returns its result together with
+// the text of its single content item, i.e. the wire payload.
+func callToolText(t *testing.T, cli *client.Client, name string, args map[string]any) (*mcp.CallToolResult, string) {
+	t.Helper()
+	req := mcp.CallToolRequest{}
+	req.Params.Name = name
+	req.Params.Arguments = args
+	res, err := cli.CallTool(context.Background(), req)
+	if err != nil {
+		t.Fatalf("CallTool %s: %v", name, err)
+	}
+	if len(res.Content) != 1 {
+		t.Fatalf("%s: expected 1 content item, got %d", name, len(res.Content))
+	}
+	tc, ok := res.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("%s: expected text content, got %T", name, res.Content[0])
+	}
+	return res, tc.Text
+}
+
+// TestChain_CountModeReachesTheClient runs the whole api -> service -> tools
+// chain for search_posts count mode against one local server that answers
+// /counts/posts.json from switchable knobs and /posts.json with a plain
+// page. It pins what the layers contribute together: a live count arrives as
+// {"query":...,"total":...}; a null count as the unmarked post_search_failed
+// result; a 503 on the counts request as the uniform marked
+// upstream_unavailable result after the retry budget; a 422 unmarked after
+// one attempt. /posts.json is never touched: count mode has no fallback to
+// listing posts, whatever goes wrong with the count.
+func TestChain_CountModeReachesTheClient(t *testing.T) {
+	var mu sync.Mutex // guards the knobs between calls
+	countStatus, countContentType, countBody := http.StatusOK, "application/json", `{"counts":{"posts":317377}}`
+	var countHits, postsHits int32
+	cli := newChainClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/counts/posts.json":
+			atomic.AddInt32(&countHits, 1)
+			mu.Lock()
+			status, contentType, body := countStatus, countContentType, countBody
+			mu.Unlock()
+			w.Header().Set("Content-Type", contentType)
+			w.WriteHeader(status)
+			w.Write([]byte(body))
+		case "/posts.json":
+			atomic.AddInt32(&postsHits, 1)
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`[]`))
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	serveCount := func(status int, contentType, body string) {
+		mu.Lock()
+		defer mu.Unlock()
+		countStatus, countContentType, countBody = status, contentType, body
+	}
+	countArgs := map[string]any{"tags": "arm_up", "count_only": true}
+
+	// A live count: the marshaled PostCount, query first.
+	res, text := callToolText(t, cli, "search_posts", countArgs)
+	if want := `{"query":"arm_up","total":317377}`; text != want {
+		t.Errorf("live count:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError {
+		t.Errorf("a live count must not be flagged at the protocol level, got: %+v", res)
+	}
+
+	// A null count: definitive, so the tool's own code as an unmarked result.
+	serveCount(http.StatusOK, "application/json", `{"counts":{"posts":null}}`)
+	before := atomic.LoadInt32(&countHits)
+	res, text = callToolText(t, cli, "search_posts", countArgs)
+	want := `{"error":"post_search_failed","message":"danbooru could not count this query (count timed out); simplify the query or retry later"}`
+	if text != want {
+		t.Errorf("null count:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError {
+		t.Errorf("a null count is not a protocol-level error, got: %+v", res)
+	}
+	if got := atomic.LoadInt32(&countHits) - before; got != 1 {
+		t.Errorf("a null count must cost one request, got %d", got)
+	}
+
+	// A 422 on the counts request: one attempt, unmarked, shrunken text.
+	serveCount(http.StatusUnprocessableEntity, "application/json", `{"error":"TagLimitError: tag limit exceeded"}`)
+	before = atomic.LoadInt32(&countHits)
+	res, text = callToolText(t, cli, "search_posts", countArgs)
+	if res.IsError {
+		t.Errorf("a 422 is definitive and must stay unmarked, got: %+v", res)
+	}
+	if !strings.HasPrefix(text, `{"error":"post_search_failed","message":"danbooru 422`) || strings.Contains(text, "upstream_unavailable") {
+		t.Errorf("a 422 must be the plain post_search_failed result, got: %s", text)
+	}
+	if got := atomic.LoadInt32(&countHits) - before; got != 1 {
+		t.Errorf("a 422 must cost one attempt, got %d", got)
+	}
+
+	// An outage on the counts request: retried, then the uniform marked result.
+	serveCount(http.StatusServiceUnavailable, "text/html", `<html><head><title>Downbooru</title></head></html>`)
+	before = atomic.LoadInt32(&countHits)
+	res, text = callToolText(t, cli, "search_posts", countArgs)
+	if !res.IsError {
+		t.Errorf("the outage must be flagged at the protocol level, got: %+v", res)
+	}
+	want = `{"error":"upstream_unavailable","message":"Danbooru is not answering right now: danbooru 503 (Downbooru). All tools of this server are affected; retry later."}`
+	if text != want {
+		t.Errorf("outage:\n got: %s\nwant: %s", text, want)
+	}
+	if got := atomic.LoadInt32(&countHits) - before; got != 1+maxRetries {
+		t.Errorf("a 5xx must be retried before the marked result, expected %d attempts, got %d", 1+maxRetries, got)
+	}
+
+	if n := atomic.LoadInt32(&postsHits); n != 0 {
+		t.Errorf("count mode must never list posts, got %d /posts.json requests", n)
+	}
+}

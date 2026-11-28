@@ -19,9 +19,13 @@ type mockFetcher struct {
 	aliasResp   []byte
 	wikiResp    []byte
 	postsResp   []byte
+	countResp   []byte // raw /counts/posts.json body
 
 	aliasCalls int   // number of FetchAlias invocations
 	aliasErr   error // returned by FetchAlias instead of a body
+
+	countCalls int   // number of FetchPostCount invocations
+	countErr   error // returned by FetchPostCount instead of a body
 
 	exactCalls   int    // number of FetchTagExact invocations
 	lastExactArg string // name handed to the last FetchTagExact
@@ -34,6 +38,7 @@ type mockFetcher struct {
 	lastPostsArg     string
 	lastPostsLim     int
 	postsCalls       int // number of FetchPosts invocations
+	lastCountArg     string
 }
 
 func (m *mockFetcher) FetchTags(ctx context.Context, namePattern string, limit int, orderByCount bool, category int) ([]byte, error) {
@@ -76,6 +81,12 @@ func (m *mockFetcher) FetchPosts(ctx context.Context, tags string, limit int) ([
 	m.lastPostsArg = tags
 	m.lastPostsLim = limit
 	return m.postsResp, nil
+}
+
+func (m *mockFetcher) FetchPostCount(ctx context.Context, tags string) ([]byte, error) {
+	m.countCalls++
+	m.lastCountArg = tags
+	return m.countResp, m.countErr
 }
 
 func TestSearch_ParsesTags(t *testing.T) {

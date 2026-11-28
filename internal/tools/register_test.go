@@ -98,6 +98,7 @@ func TestToolSchemas_PropertiesExist(t *testing.T) {
 		{"get_tag_wiki", GetTagWikiTool, "include_description"},
 		{"search_posts", SearchPostsTool, "limit"},
 		{"search_posts", SearchPostsTool, "tags_mode"},
+		{"search_posts", SearchPostsTool, "count_only"},
 		{"get_tag_profile", GetTagProfileTool, "sample"},
 		{"get_tag_profile", GetTagProfileTool, "with"},
 		{"get_tag_profile", GetTagProfileTool, "rating"},
@@ -188,24 +189,36 @@ func (s *brokenService) SearchPosts(ctx context.Context, tags string, limit int,
 	return nil, s.upstreamErr()
 }
 
+func (s *brokenService) CountPosts(ctx context.Context, tags string) (*service.PostCount, error) {
+	return nil, s.upstreamErr()
+}
+
 func (s *brokenService) Profile(ctx context.Context, tag string, sample int, opts service.ProfileOptions) (*service.TagProfile, error) {
 	return nil, s.upstreamErr()
 }
 
 // postsMockService is a mock TagService for the search_posts handler: its
-// SearchPosts answers from the canned posts/err fields and records the call.
-// Every other method keeps brokenService's upstream failure; the tests that
-// use this mock never call them.
+// SearchPosts answers from the canned posts/err fields and records the call,
+// its CountPosts from count/countErr the same way. Every other method keeps
+// brokenService's upstream failure; the tests that use this mock never call
+// them. The two methods count their calls separately, so a test can prove
+// which mode the handler routed a call to.
 type postsMockService struct {
 	brokenService
 
 	posts *service.PostsResult
 	err   error
 
+	count    *service.PostCount
+	countErr error
+
 	calls    int
 	gotTags  string
 	gotLimit int
 	gotMode  string
+
+	countCalls   int
+	gotCountTags string
 }
 
 // SearchPosts records the call and answers from the canned fields.
@@ -213,6 +226,13 @@ func (s *postsMockService) SearchPosts(ctx context.Context, tags string, limit i
 	s.calls++
 	s.gotTags, s.gotLimit, s.gotMode = tags, limit, tagsMode
 	return s.posts, s.err
+}
+
+// CountPosts records the call and answers from the canned fields.
+func (s *postsMockService) CountPosts(ctx context.Context, tags string) (*service.PostCount, error) {
+	s.countCalls++
+	s.gotCountTags = tags
+	return s.count, s.countErr
 }
 
 // inProcessClient wires a real MCP server around svc and returns a started
@@ -269,6 +289,22 @@ func callText(t *testing.T, cli *client.Client, name string, args map[string]any
 // server, which is the wrong lesson for a malformed query. Each call must
 // reach the service exactly once, with the tags as typed.
 func TestSearchPostsHandler_PayloadBytesUnchanged(t *testing.T) {
+	checkListModeBytes(t, nil)
+}
+
+// TestSearchPostsHandler_CountOnlyFalseKeepsListModeBytes pins the other
+// side of the count-mode switch: an explicit count_only:false is list mode,
+// so the pinned answers must come back byte for byte. Count mode is opt-in;
+// a client that sends the flag as false must never be switched over.
+func TestSearchPostsHandler_CountOnlyFalseKeepsListModeBytes(t *testing.T) {
+	checkListModeBytes(t, map[string]any{"count_only": false})
+}
+
+// checkListModeBytes runs the pinned list-mode payloads of the search_posts
+// handler, with extraArgs added to every call: one table serves the bare
+// call and any call that carries an argument list mode must ignore.
+func checkListModeBytes(t *testing.T, extraArgs map[string]any) {
+	t.Helper()
 	fullPost := service.Post{
 		ID:       900,
 		Rating:   "e",
@@ -317,7 +353,14 @@ func TestSearchPostsHandler_PayloadBytesUnchanged(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			res, text := callText(t, inProcessClient(t, tt.svc), "search_posts", tt.args)
+			args := make(map[string]any, len(tt.args)+len(extraArgs))
+			for k, v := range tt.args {
+				args[k] = v
+			}
+			for k, v := range extraArgs {
+				args[k] = v
+			}
+			res, text := callText(t, inProcessClient(t, tt.svc), "search_posts", args)
 			if text != tt.want {
 				t.Errorf("payload:\n got: %s\nwant: %s", text, tt.want)
 			}
@@ -330,6 +373,9 @@ func TestSearchPostsHandler_PayloadBytesUnchanged(t *testing.T) {
 			if tt.svc.calls != 1 {
 				t.Errorf("the handler must call the service exactly once (no retry), got %d", tt.svc.calls)
 			}
+			if tt.svc.countCalls != 0 {
+				t.Errorf("list mode must never ask for a count, got %d CountPosts call(s)", tt.svc.countCalls)
+			}
 			if tt.svc.gotTags != tt.args["tags"] {
 				t.Errorf("tags must reach the service as typed, got %q", tt.svc.gotTags)
 			}
@@ -337,10 +383,138 @@ func TestSearchPostsHandler_PayloadBytesUnchanged(t *testing.T) {
 	}
 }
 
+// TestSearchPostsHandler_CountModePayloadBytes pins the wire bytes of the
+// count-mode switch. count_only routes the call to CountPosts — never to
+// SearchPosts — and marshals its answer as is: {"query":...,"total":...}.
+// The post-mode arguments are neither read nor validated on that path, so a
+// limit over the cap and an unknown tags_mode still get their count. Errors
+// keep failResult's mapping: a timed-out count and an over-limit query are
+// the plain post_search_failed result, an outage the uniform marked result.
+func TestSearchPostsHandler_CountModePayloadBytes(t *testing.T) {
+	overLimit := errors.New("too many content tags: 3 (max 2, free/anonymous Danbooru limit; rating: and most other metatags do not count, order: does); drop tags or split the query")
+	count := &service.PostCount{Query: "blue_hair", Total: 317377}
+
+	tests := []struct {
+		name        string
+		svc         *postsMockService
+		args        map[string]any
+		want        string
+		wantIsError bool
+	}{
+		{
+			name: "count answers query then total",
+			svc:  &postsMockService{count: count},
+			args: map[string]any{"tags": "blue_hair", "count_only": true},
+			want: `{"query":"blue_hair","total":317377}`,
+		},
+		{
+			// No post is listed, so the post-mode arguments are nothing to
+			// validate: the handler must not even look at them.
+			name: "post-mode arguments are not validated",
+			svc:  &postsMockService{count: count},
+			args: map[string]any{"tags": "blue_hair", "count_only": true, "limit": 21, "tags_mode": "bogus"},
+			want: `{"query":"blue_hair","total":317377}`,
+		},
+		{
+			name: "timed-out count is an unmarked tool error",
+			svc:  &postsMockService{countErr: service.ErrPostCountTimedOut},
+			args: map[string]any{"tags": "arm_up filetype:png", "count_only": true},
+			want: `{"error":"post_search_failed","message":"danbooru could not count this query (count timed out); simplify the query or retry later"}`,
+		},
+		{
+			name: "over-limit query is the plain validation result",
+			svc:  &postsMockService{countErr: overLimit},
+			args: map[string]any{"tags": "1girl blue_hair long_hair", "count_only": true},
+			want: `{"error":"post_search_failed","message":"` + overLimit.Error() + `"}`,
+		},
+		{
+			// SearchPosts answers fine here, so the marked result can only
+			// come from CountPosts: this row proves the routing as well.
+			name:        "outage is the uniform marked result",
+			svc:         &postsMockService{posts: &service.PostsResult{Posts: []service.Post{}}, countErr: &upstreamMockError{}},
+			args:        map[string]any{"tags": "blue_hair", "count_only": true},
+			want:        `{"error":"upstream_unavailable","message":"Danbooru is not answering right now: danbooru 503 (Downbooru). All tools of this server are affected; retry later."}`,
+			wantIsError: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			res, text := callText(t, inProcessClient(t, tt.svc), "search_posts", tt.args)
+			if text != tt.want {
+				t.Errorf("payload:\n got: %s\nwant: %s", text, tt.want)
+			}
+			if res.IsError != tt.wantIsError {
+				t.Errorf("IsError = %v, want %v", res.IsError, tt.wantIsError)
+			}
+			if !tt.wantIsError && strings.Contains(text, "upstream_unavailable") {
+				t.Errorf("a non-outage result must never be marked upstream_unavailable, got: %s", text)
+			}
+			if tt.svc.calls != 0 {
+				t.Errorf("count mode must never list posts: SearchPosts was called %d time(s)", tt.svc.calls)
+			}
+			if tt.svc.countCalls != 1 {
+				t.Errorf("the handler must call CountPosts exactly once (no retry), got %d", tt.svc.countCalls)
+			}
+			if tt.svc.gotCountTags != tt.args["tags"] {
+				t.Errorf("tags must reach CountPosts as typed, got %q", tt.svc.gotCountTags)
+			}
+		})
+	}
+}
+
+// TestSearchPostsHandler_CountOnlyEmptyTagsIsStillRejected pins that count
+// mode keeps the handler's own required-argument check: tags is required in
+// both modes, and the rejection costs no service call at all.
+func TestSearchPostsHandler_CountOnlyEmptyTagsIsStillRejected(t *testing.T) {
+	svc := &postsMockService{count: &service.PostCount{Query: "", Total: 12592609}}
+
+	res, text := callText(t, inProcessClient(t, svc), "search_posts", map[string]any{"tags": "", "count_only": true})
+	if want := `{"error":"post_search_failed","message":"tags parameter is required"}`; text != want {
+		t.Errorf("payload:\n got: %s\nwant: %s", text, want)
+	}
+	if res.IsError {
+		t.Errorf("a validation error must not be flagged at the protocol level, got: %+v", res)
+	}
+	if svc.calls != 0 || svc.countCalls != 0 {
+		t.Errorf("the rejection must happen before the service, got %d SearchPosts and %d CountPosts call(s)", svc.calls, svc.countCalls)
+	}
+}
+
+// TestSearchPostsTool_CountOnlyIsAnOptionalBoolean pins count mode's switch:
+// a boolean that is never required, so every existing caller keeps list mode.
+func TestSearchPostsTool_CountOnlyIsAnOptionalBoolean(t *testing.T) {
+	prop, exists := SearchPostsTool.InputSchema.Properties["count_only"]
+	if !exists {
+		t.Fatal("search_posts missing count_only property")
+	}
+	schema, ok := prop.(map[string]any)
+	if !ok {
+		t.Fatalf("count_only property is not an object, got: %#v", prop)
+	}
+	if schema["type"] != "boolean" {
+		t.Errorf("count_only type = %v, want boolean", schema["type"])
+	}
+	for _, field := range SearchPostsTool.InputSchema.Required {
+		if field == "count_only" {
+			t.Error("count_only must stay optional: list mode is the default")
+		}
+	}
+}
+
+// TestSearchPostsTool_DescriptionNamesCountOnlyOnce pins R5: count mode
+// costs exactly one clause of the tool description, like possible_tags.
+func TestSearchPostsTool_DescriptionNamesCountOnlyOnce(t *testing.T) {
+	if got := strings.Count(SearchPostsTool.Description, "count_only"); got != 1 {
+		t.Errorf("search_posts description must mention count_only exactly once, got %d: %s", got, SearchPostsTool.Description)
+	}
+}
+
 // TestHandlers_UpstreamFailureIsUniform pins PRD R10: during an outage every
 // one of the eight tools answers the same protocol-level marked result with
 // the same upstream_unavailable code and message — so an agent needs a
 // single rule (stop calling this server) instead of eight per-tool codes.
+// search_posts is listed twice: count mode is the same tool on another
+// endpoint, and its failures must be just as uniform.
 func TestHandlers_UpstreamFailureIsUniform(t *testing.T) {
 	s := server.NewMCPServer("test", "0.0.0.0", server.WithToolCapabilities(true))
 	Register(s, &brokenService{})
@@ -362,19 +536,25 @@ func TestHandlers_UpstreamFailureIsUniform(t *testing.T) {
 
 	const wantMessage = "Danbooru is not answering right now: danbooru 503 (Downbooru). All tools of this server are affected; retry later."
 	for _, tt := range []struct {
-		name string
-		args map[string]any
+		name    string
+		args    map[string]any
+		subtest string // names the subtest when two rows share a tool
 	}{
-		{"search_tags", map[string]any{"query": "blue_hair"}},
-		{"get_tag_info", map[string]any{"name": "blue_hair"}},
-		{"get_tags_info", map[string]any{"names": []any{"blue_hair"}}},
-		{"get_related_tags", map[string]any{"tag": "blue_hair"}},
-		{"get_tag_alias", map[string]any{"name": "blue_hair"}},
-		{"get_tag_wiki", map[string]any{"title": "blue_hair"}},
-		{"search_posts", map[string]any{"tags": "blue_hair"}},
-		{"get_tag_profile", map[string]any{"tag": "blue_hair"}},
+		{"search_tags", map[string]any{"query": "blue_hair"}, ""},
+		{"get_tag_info", map[string]any{"name": "blue_hair"}, ""},
+		{"get_tags_info", map[string]any{"names": []any{"blue_hair"}}, ""},
+		{"get_related_tags", map[string]any{"tag": "blue_hair"}, ""},
+		{"get_tag_alias", map[string]any{"name": "blue_hair"}, ""},
+		{"get_tag_wiki", map[string]any{"title": "blue_hair"}, ""},
+		{"search_posts", map[string]any{"tags": "blue_hair"}, ""},
+		{"search_posts", map[string]any{"tags": "blue_hair", "count_only": true}, "search_posts count mode"},
+		{"get_tag_profile", map[string]any{"tag": "blue_hair"}, ""},
 	} {
-		t.Run(tt.name, func(t *testing.T) {
+		subtest := tt.subtest
+		if subtest == "" {
+			subtest = tt.name
+		}
+		t.Run(subtest, func(t *testing.T) {
 			req := mcp.CallToolRequest{}
 			req.Params.Name = tt.name
 			req.Params.Arguments = tt.args
